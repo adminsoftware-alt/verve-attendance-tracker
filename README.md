@@ -301,3 +301,17 @@ gcloud run services logs read breakout-room-calibrator --region us-central1 --li
 | `breakout-calibrator/src/components/CalibrationPanel.jsx` | Calibration UI |
 | `attendance_report_with_room_names.sql` | Report query |
 | `bigquery_schemas.sql` | Table definitions |
+
+
+ curl -X POST "https://breakout-room-calibrator-1041741270489.us-central1.run.app/report/generate" -H "Content-Type: application/json" -d          '{"date": "2026-02-25"}'
+
+
+
+  For any date:
+  curl -X POST "https://breakout-room-calibrator-1041741270489.us-central1.run.app/report/generate" -H "Content-Type: application/json" -d
+  '{"date": "YYYY-MM-DD"}'
+
+  Without date (defaults to yesterday):
+  curl -X POST "https://breakout-room-calibrator-1041741270489.us-central1.run.app/report/generate" -H "Content-Type: application/json" -d '{}'   
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

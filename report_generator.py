@@ -5,8 +5,8 @@ Generates CSV report with ONE ROW PER PARTICIPANT
 All times in IST (Indian Standard Time)
 
 Format:
-- Name, Email, Main Join IST, Main Left IST, Camera On, Camera Off
-- Room History: RoomName [JoinTime-LeaveTime Duration] | NextRoom [...]
+- Name, Email, Main Join IST, Main Left IST, Total Duration
+- Room History: RoomName [Joined: HH:MM | Left: HH:MM | Duration: Xmin] -> NextRoom [...]
 
 Triggered by Cloud Scheduler daily or /generate-report endpoint
 """
@@ -17,6 +17,23 @@ import os
 import csv
 import io
 import json
+
+# ==============================================================================
+# IST TIMEZONE HELPERS (UTC+5:30 - India Standard Time)
+# ==============================================================================
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
+def get_ist_now():
+    """Get current datetime in IST"""
+    return datetime.utcnow() + IST_OFFSET
+
+def get_ist_date():
+    """Get current date in IST (YYYY-MM-DD)"""
+    return get_ist_now().strftime('%Y-%m-%d')
+
+def get_yesterday_ist():
+    """Get yesterday's date in IST"""
+    return (get_ist_now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # SendGrid for email
 try:
@@ -53,138 +70,159 @@ def generate_daily_report(report_date=None):
         Dictionary with report data and CSV content
     """
     if report_date is None:
-        # Default to yesterday
-        report_date = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+        # Default to yesterday in IST
+        report_date = get_yesterday_ist()
 
-    print(f"[Report] Generating report for {report_date}")
+    # Calculate previous day for mapping fallback (overnight meetings)
+    prev_date = (datetime.strptime(report_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    print(f"[Report] Generating report for {report_date} (IST), mapping fallback: {prev_date}")
 
     client = get_bq_client()
 
     # =============================================
     # MAIN QUERY - ONE ROW PER PARTICIPANT
-    # With room history, all times in IST
+    # Room history: RoomName [HH:MM-HH:MM] -> NextRoom [HH:MM-HH:MM]
+    # Total time = sum of all room visit durations
     # =============================================
     main_query = f"""
-    WITH participant_main AS (
-      SELECT
-        participant_email,
-        participant_name,
-        MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as joined_utc,
-        MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as left_utc
+    WITH
+    -- Get room name mappings - ONE name per UUID
+    -- Priority: same-day mapping > previous-day mapping (for overnight meetings 9AM-9AM)
+    -- Within same day: webhook_calibration > zoom_sdk_app
+    -- Get distinct meeting IDs for this report date to scope mappings
+    report_meetings AS (
+      SELECT DISTINCT meeting_id
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
       WHERE event_date = '{report_date}'
-      GROUP BY participant_email, participant_name
+        AND meeting_id IS NOT NULL AND meeting_id != ''
     ),
-    room_joins AS (
-      SELECT
-        pe.participant_email,
-        pe.participant_name,
-        COALESCE(rm.room_name, pe.room_name) as room_name,
-        pe.event_timestamp as join_time,
-        pe.room_uuid
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
-      LEFT JOIN `{GCP_PROJECT_ID}.{BQ_DATASET}.room_mappings` rm
-        ON pe.room_uuid LIKE CONCAT(SUBSTR(rm.room_uuid, 1, 8), '%')
-        AND rm.source = 'webhook_calibration'
-        AND rm.mapping_date = pe.event_date
-      WHERE pe.event_date = '{report_date}'
-        AND pe.event_type = 'breakout_room_joined'
+    room_name_map AS (
+      SELECT room_uuid, room_name
+      FROM (
+        SELECT rm.room_uuid, rm.room_name,
+          ROW_NUMBER() OVER (
+            PARTITION BY rm.room_uuid
+            ORDER BY
+              CASE WHEN rm.mapping_date = '{report_date}' THEN 0 ELSE 1 END,
+              CASE WHEN rm.source = 'webhook_calibration' THEN 0 ELSE 1 END,
+              rm.mapped_at DESC
+          ) as rn
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_mappings` rm
+        INNER JOIN report_meetings rpt ON rm.meeting_id = rpt.meeting_id
+        WHERE rm.mapping_date IN ('{report_date}', '{prev_date}')
+          AND rm.source = 'webhook_calibration'  -- Only use webhook UUIDs (SDK UUIDs are different format)
+      )
+      WHERE rn = 1
     ),
-    room_leaves AS (
+    -- All breakout room events for the day - deduplicated by participant + timestamp
+    breakout_events AS (
       SELECT
+        participant_id,
         participant_email,
         participant_name,
         room_uuid,
-        MIN(event_timestamp) as leave_time
+        room_name as event_room_name,  -- Room name stored directly in event
+        event_type,
+        event_timestamp,
+        PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', event_timestamp) as event_ts,
+        ROW_NUMBER() OVER (
+          PARTITION BY participant_id, event_type, event_timestamp
+          ORDER BY inserted_at
+        ) as dup_rank
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
       WHERE event_date = '{report_date}'
-        AND event_type = 'breakout_room_left'
-      GROUP BY participant_email, participant_name, room_uuid
+        AND event_type IN ('breakout_room_joined', 'breakout_room_left')
     ),
-    camera_on AS (
+    -- Deduplicated events - ONE event per participant per timestamp
+    breakout_events_dedup AS (
+      SELECT * FROM breakout_events WHERE dup_rank = 1
+    ),
+    -- Pair each JOIN with its corresponding LEAVE (same room, same participant, leave after join)
+    room_visits_paired AS (
       SELECT
-        participant_email,
-        participant_name,
-        MIN(event_timestamp) as cam_on_time
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.camera_events`
-      WHERE event_date = '{report_date}' AND camera_on = true
-      GROUP BY participant_email, participant_name
+        j.participant_id,
+        j.participant_email,
+        j.participant_name,
+        j.room_uuid,
+        j.event_room_name,  -- Carry forward room name from event
+        j.event_ts as join_ts,
+        (
+          SELECT MIN(l.event_ts)
+          FROM breakout_events_dedup l
+          WHERE l.participant_id = j.participant_id
+            AND l.room_uuid = j.room_uuid
+            AND l.event_type = 'breakout_room_left'
+            AND l.event_ts > j.event_ts
+        ) as leave_ts
+      FROM breakout_events_dedup j
+      WHERE j.event_type = 'breakout_room_joined'
     ),
-    camera_off AS (
-      SELECT
-        participant_email,
-        participant_name,
-        MAX(event_timestamp) as cam_off_time
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.camera_events`
-      WHERE event_date = '{report_date}' AND camera_on = false
-      GROUP BY participant_email, participant_name
-    ),
-    qos_camera AS (
-      SELECT
-        participant_name,
-        participant_email,
-        MAX(camera_on_count) as camera_on_intervals,
-        MAX(duration_minutes) as qos_duration_min
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.qos_data`
-      WHERE event_date = '{report_date}'
-      GROUP BY participant_name, participant_email
-    ),
+    -- Add room names and calculate durations
+    -- Priority: 1) event_room_name (if actually resolved, not "Room-XXXX" placeholder)
+    --           2) room_mappings table
+    --           3) Fallback to Room-{uuid}
     room_visits AS (
       SELECT
-        rj.participant_email,
-        rj.participant_name,
-        rj.room_name,
-        -- Convert to IST (UTC + 5:30 = 330 minutes)
-        SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', rj.join_time), INTERVAL 330 MINUTE) AS STRING), 12, 5) as join_ist,
-        SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', rl.leave_time), INTERVAL 330 MINUTE) AS STRING), 12, 5) as leave_ist,
-        ROUND(TIMESTAMP_DIFF(
-          PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', rl.leave_time),
-          PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', rj.join_time),
-          MINUTE
-        ), 0) as duration_mins,
-        rj.join_time as sort_time
-      FROM room_joins rj
-      LEFT JOIN room_leaves rl
-        ON rj.participant_email = rl.participant_email
-        AND rj.participant_name = rl.participant_name
-        AND rj.room_uuid = rl.room_uuid
-        AND rl.leave_time > rj.join_time
+        rv.participant_email,
+        rv.participant_name,
+        COALESCE(
+          -- First: use room_name from event if it's a real name (not Room-XXXX placeholder)
+          CASE WHEN rv.event_room_name IS NOT NULL
+                AND rv.event_room_name != ''
+                AND NOT STARTS_WITH(rv.event_room_name, 'Room-')
+               THEN rv.event_room_name END,
+          rm.room_name,                     -- Second: lookup from room_mappings table
+          rv.event_room_name,               -- Third: use event room_name even if Room-XXXX
+          CONCAT('Room-', SUBSTR(rv.room_uuid, 1, 8))  -- Last fallback
+        ) as room_name,
+        rv.join_ts,
+        rv.leave_ts,
+        -- IST times (UTC + 5:30)
+        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.join_ts, INTERVAL 330 MINUTE)) as join_ist,
+        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.leave_ts, INTERVAL 330 MINUTE)) as leave_ist,
+        TIMESTAMP_DIFF(rv.leave_ts, rv.join_ts, MINUTE) as duration_mins
+      FROM room_visits_paired rv
+      LEFT JOIN room_name_map rm ON rv.room_uuid = rm.room_uuid
     ),
+    -- Build room history string per participant
     room_history AS (
       SELECT
         participant_email,
         participant_name,
         STRING_AGG(
-          CONCAT(room_name, ' [', COALESCE(join_ist,'?'), '-', COALESCE(leave_ist,'?'), ' ', CAST(COALESCE(duration_mins,0) AS STRING), 'min]'),
-          ' | ' ORDER BY sort_time
-        ) as rooms
+          CONCAT(room_name, ' [', join_ist, '-', COALESCE(leave_ist, '?'), ']'),
+          ' -> ' ORDER BY join_ts
+        ) as rooms,
+        SUM(COALESCE(duration_mins, 0)) as total_room_mins
       FROM room_visits
+      GROUP BY participant_email, participant_name
+    ),
+    -- Main meeting join/leave (first join, last leave across ALL sessions)
+    participant_main AS (
+      SELECT
+        participant_email,
+        participant_name,
+        MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as first_join,
+        MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as last_leave
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+      WHERE event_date = '{report_date}'
       GROUP BY participant_email, participant_name
     )
     SELECT
       pm.participant_name as Name,
       pm.participant_email as Email,
-      -- Main room times in IST
-      SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.joined_utc), INTERVAL 330 MINUTE) AS STRING), 12, 5) as Main_Joined_IST,
-      SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.left_utc), INTERVAL 330 MINUTE) AS STRING), 12, 5) as Main_Left_IST,
-      -- Total duration
-      ROUND(TIMESTAMP_DIFF(
-        PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.left_utc),
-        PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.joined_utc),
-        MINUTE
-      ), 0) as Total_Duration_Min,
-      -- QoS duration
-      COALESCE(qc.qos_duration_min, 0) as QoS_Duration_Min,
-      -- Camera ON intervals (from QoS API)
-      COALESCE(qc.camera_on_intervals, 0) as Camera_On_Intervals,
-      -- Room history
+      -- Main room times in IST (first join to last leave)
+      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.first_join), INTERVAL 330 MINUTE)) as Main_Joined_IST,
+      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.last_leave), INTERVAL 330 MINUTE)) as Main_Left_IST,
+      -- Total duration from room visits (more accurate than join-leave diff)
+      COALESCE(rh.total_room_mins, 0) as Total_Duration_Min,
+      -- Room history: RoomName [HH:MM-HH:MM] -> NextRoom [HH:MM-HH:MM]
       COALESCE(rh.rooms, '-') as Room_History
     FROM participant_main pm
     LEFT JOIN room_history rh
       ON pm.participant_email = rh.participant_email
       AND pm.participant_name = rh.participant_name
-    LEFT JOIN qos_camera qc
-      ON pm.participant_name = qc.participant_name
     WHERE pm.participant_name NOT LIKE '%Scout%'
     ORDER BY pm.participant_name
     """
@@ -213,33 +251,47 @@ def generate_daily_report(report_date=None):
     return report
 
 
+def format_minutes_to_hhmm(minutes):
+    """Format minutes as Xh Ym"""
+    if not minutes or minutes <= 0:
+        return '0m'
+    try:
+        minutes = int(minutes)
+        hours = minutes // 60
+        mins = minutes % 60
+        if hours > 0:
+            return f"{hours}h {mins}m"
+        return f"{mins}m"
+    except (ValueError, TypeError):
+        return '0m'
+
+
 def generate_csv(report):
     """Generate CSV content from report data"""
     output = io.StringIO()
     writer = csv.writer(output)
 
-    # Header - matches query output
+    # Header
     writer.writerow([
         'Name',
         'Email',
         'Main_Joined_IST',
         'Main_Left_IST',
-        'Total_Duration_Min',
-        'QoS_Duration_Min',
-        'Camera_On_Intervals',
+        'Total_Duration',
         'Room_History'
     ])
 
     # Data rows
     for p in report['participants']:
+        # Format durations as Xh Ym
+        total_mins = p.get('Total_Duration_Min', 0) or 0
+
         writer.writerow([
             p.get('Name', '') or '',
             p.get('Email', '') or '',
             p.get('Main_Joined_IST', '') or '',
             p.get('Main_Left_IST', '') or '',
-            p.get('Total_Duration_Min', '') or '',
-            p.get('QoS_Duration_Min', 0) or 0,
-            p.get('Camera_On_Intervals', 0) or 0,
+            format_minutes_to_hhmm(total_mins),
             p.get('Room_History', '-') or '-'
         ])
 
@@ -295,7 +347,6 @@ def send_report_email(report, report_date):
                     <th>Joined IST</th>
                     <th>Left IST</th>
                     <th>Duration</th>
-                    <th>Camera ON</th>
                     <th>Room History</th>
                 </tr>
         """
@@ -303,10 +354,8 @@ def send_report_email(report, report_date):
         for p in report['participants'][:30]:  # Limit to 30 in email
             room_history = p.get('Room_History', '-') or '-'
             # Truncate long room history for email
-            if len(room_history) > 80:
-                room_history = room_history[:80] + '...'
-
-            camera_intervals = p.get('Camera_On_Intervals', 0) or 0
+            if len(room_history) > 120:
+                room_history = room_history[:120] + '...'
 
             html_content += f"""
                 <tr>
@@ -315,7 +364,6 @@ def send_report_email(report, report_date):
                     <td>{p.get('Main_Joined_IST', '')}</td>
                     <td>{p.get('Main_Left_IST', '')}</td>
                     <td>{p.get('Total_Duration_Min', '')} min</td>
-                    <td>{camera_intervals}</td>
                     <td style="font-size:10px;">{room_history}</td>
                 </tr>
             """
@@ -326,7 +374,7 @@ def send_report_email(report, report_date):
             <div class="footer">
                 <p><strong>Full attendance data is in the attached CSV file.</strong></p>
                 <p>CSV Format: One row per participant with complete room visit history</p>
-                <p>Room History Format: RoomName [JoinTime-LeaveTime Duration] | NextRoom [...]</p>
+                <p>Room History Format: RoomName [Joined: HH:MM | Left: HH:MM | Duration: Xmin] -> NextRoom [...]</p>
                 <p>Generated by Zoom Breakout Room Tracker</p>
             </div>
         </body>
@@ -334,9 +382,11 @@ def send_report_email(report, report_date):
         """
 
         # Create email
+        # Support both comma and semicolon as email delimiters
+        to_emails = [e.strip() for e in REPORT_EMAIL_TO.replace(';', ',').split(',') if e.strip()]
         message = Mail(
             from_email=REPORT_EMAIL_FROM,
-            to_emails=REPORT_EMAIL_TO.split(','),
+            to_emails=to_emails,
             subject=f"Daily Zoom Attendance Report - {report_date}",
             html_content=html_content
         )
@@ -393,8 +443,8 @@ def generate_report_handler(report_date=None):
     Returns report data and optionally sends email
     """
     if report_date is None:
-        # Default to yesterday
-        report_date = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+        # Default to yesterday in IST
+        report_date = get_yesterday_ist()
 
     try:
         report = generate_daily_report(report_date)
@@ -427,7 +477,7 @@ if __name__ == '__main__':
     if len(sys.argv) > 1:
         date = sys.argv[1]
     else:
-        date = datetime.utcnow().strftime('%Y-%m-%d')
+        date = get_ist_date()  # Use IST date
 
     print(f"Generating report for {date}...")
     report = generate_daily_report(date)

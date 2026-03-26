@@ -20,7 +20,7 @@ HR Scout Bot Flow:
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from google.cloud import bigquery
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import threading
 import requests
 import hmac
@@ -32,29 +32,66 @@ import uuid as uuid_lib
 import traceback
 
 # ==============================================================================
+# IST TIMEZONE HELPERS (UTC+5:30 - India Standard Time)
+# ==============================================================================
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
+def get_ist_now():
+    """Get current datetime in IST"""
+    return datetime.utcnow() + IST_OFFSET
+
+def get_ist_date():
+    """Get current date in IST (YYYY-MM-DD)"""
+    return get_ist_now().strftime('%Y-%m-%d')
+
+def utc_to_ist(utc_dt):
+    """Convert UTC datetime to IST datetime"""
+    if utc_dt is None:
+        return None
+    return utc_dt + IST_OFFSET
+
+def get_ist_date_from_utc(utc_dt):
+    """Get IST date string from UTC datetime"""
+    if utc_dt is None:
+        return get_ist_date()
+    ist_dt = utc_to_ist(utc_dt)
+    return ist_dt.strftime('%Y-%m-%d')
+
+# ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 
 REACT_BUILD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'breakout-calibrator', 'build')
 STATIC_PATH = os.path.join(REACT_BUILD_PATH, 'static')
 app = Flask(__name__, static_folder=STATIC_PATH, static_url_path='/app/static')
-CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
+import re
+CORS(app, resources={r"/*": {"origins": re.compile(r"https://.*\.(zoom\.us|zoom\.com)$"), "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
 
 
 # Headers for Zoom Apps - allow embedding
 @app.after_request
 def add_zoom_headers(response):
-    # Do NOT set X-Frame-Options - allow any site to embed
-    # CORS headers
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    # Do NOT set X-Frame-Options - allow Zoom to embed
+    # CORS headers - restrict to Zoom domains (flask-cors handles per-request origin matching)
+    origin = request.headers.get('Origin', '')
+    if origin and ('.zoom.us' in origin or '.zoom.com' in origin):
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+
+    # OWASP Security Headers (required by Zoom Apps)
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Content-Security-Policy'] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; frame-ancestors https://*.zoom.us https://*.zoom.com"
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+
     return response
 
-# Zoom Credentials
-ZOOM_WEBHOOK_SECRET = os.environ.get('ZOOM_WEBHOOK_SECRET', 'HyA8GYp6Spy9WWSjW4_pjA')
-ZOOM_ACCOUNT_ID = os.environ.get('ZOOM_ACCOUNT_ID', 'xhKbAsmnSM6pNYYYurmqIA')
-ZOOM_CLIENT_ID = os.environ.get('ZOOM_CLIENT_ID', 'TqtBGqTAS3W1Jgf9a41w')
+# Zoom Credentials - MUST be set via environment variables
+# No default values to prevent accidental deployment without proper configuration
+ZOOM_WEBHOOK_SECRET = os.environ.get('ZOOM_WEBHOOK_SECRET', '').strip()
+ZOOM_ACCOUNT_ID = os.environ.get('ZOOM_ACCOUNT_ID', '')
+ZOOM_CLIENT_ID = os.environ.get('ZOOM_CLIENT_ID', '')
 ZOOM_CLIENT_SECRET = os.environ.get('ZOOM_CLIENT_SECRET', '')
 
 # Scout Bot Configuration
@@ -93,8 +130,12 @@ class MeetingState:
     """State for current meeting - resets when new meeting starts"""
 
     def __init__(self):
+        self._lock = threading.Lock()  # Thread safety for concurrent webhook requests
         self.previous_meeting_uuid = None  # Store previous meeting for QoS collection
         self.previous_meeting_id = None
+        self.event_dedup_cache = {}  # Deduplication cache: hash -> timestamp
+        self.dedup_ttl_seconds = 60  # Events with same hash within 60s are duplicates
+        self._last_cache_cleanup = time.time()  # For periodic cache cleanup
         self.reset()
 
     def reset(self):
@@ -113,11 +154,35 @@ class MeetingState:
         self.calibration_mode = 'scout_bot'  # 'scout_bot' or 'self'
         self.calibration_participant_name = None  # Name of participant doing calibration
         self.calibration_participant_uuid = None  # UUID of participant doing calibration
+        # Note: Don't reset dedup cache on meeting reset - keep it for cross-meeting dedup
         print("[MeetingState] Reset for new meeting")
+
+    def is_duplicate_event(self, participant_id, event_type, event_timestamp):
+        """Check if this event is a duplicate (same event received twice from Zoom)"""
+        # Create a hash of the event
+        event_hash = f"{participant_id}:{event_type}:{event_timestamp}"
+        now = time.time()
+
+        with self._lock:
+            # Clean old entries from cache periodically (every 60 seconds, not on every event)
+            # This prevents memory issues with high-frequency events
+            if now - self._last_cache_cleanup > 60:
+                self.event_dedup_cache = {k: v for k, v in self.event_dedup_cache.items()
+                                           if now - v < self.dedup_ttl_seconds}
+                self._last_cache_cleanup = now
+
+            # Check if we've seen this event recently
+            if event_hash in self.event_dedup_cache:
+                print(f"  -> DUPLICATE detected, skipping: {event_hash}")
+                return True
+
+            # Mark as seen
+            self.event_dedup_cache[event_hash] = now
+            return False
 
     def set_meeting(self, meeting_id, meeting_uuid=None):
         """Set current meeting, reset if different from previous"""
-        today = datetime.utcnow().strftime('%Y-%m-%d')
+        today = get_ist_date()  # Use IST date for consistency with India timezone
 
         # Check if this is a new meeting
         if self.meeting_id != meeting_id or self.meeting_date != today:
@@ -135,13 +200,27 @@ class MeetingState:
                 # Trigger async QoS collection
                 self._collect_previous_meeting_qos(old_uuid, old_id)
 
+            # Check if this is a NEW DAY (different from stored meeting_date)
+            # Only delete old mappings when transitioning to a NEW day
+            if old_id and self.meeting_date and self.meeting_date != today:
+                print(f"[MeetingState] New day detected ({self.meeting_date} -> {today}), cleaning up old mappings")
+                self._cleanup_old_mappings()  # Clean mappings > 7 days old
+            # NOTE: NEVER delete today's mappings - they persist for the report
+
             self.reset()
             self.meeting_id = meeting_id
             self.meeting_uuid = meeting_uuid
             self.meeting_date = today
 
-            # Delete old mappings from BigQuery for this meeting date
-            self._delete_old_mappings(today)
+            # Always load existing mappings from BigQuery after reset
+            # This handles: server restart, container scaling, meeting switch
+            # Pass meeting_id to avoid loading mappings from different meetings on same day
+            print(f"[MeetingState] Loading existing mappings from BigQuery for meeting {meeting_id}...")
+            loaded = self.load_mappings_from_bigquery(today, meeting_id=meeting_id)
+            if loaded > 0:
+                print(f"[MeetingState] Successfully loaded {loaded} mappings")
+            else:
+                print(f"[MeetingState] No mappings found in BigQuery for today/yesterday")
 
         if meeting_uuid and not self.meeting_uuid:
             self.meeting_uuid = meeting_uuid
@@ -158,15 +237,27 @@ class MeetingState:
             # First, collect camera QoS data (Dashboard API - only available shortly after meeting)
             camera_data_map = {}
             try:
-                print(f"[AutoQoS] Collecting camera data via Dashboard QoS API...")
-                camera_participants = zoom_api.get_meeting_participants_qos(meeting_id or meeting_uuid)
+                # MUST use numeric meeting_id for Dashboard API - UUID does NOT work!
+                if not meeting_id or not str(meeting_id).replace('-', '').isdigit():
+                    print(f"[AutoQoS] WARNING: No numeric meeting_id available, skipping camera QoS")
+                    camera_participants = []
+                else:
+                    print(f"[AutoQoS] Collecting camera data via Dashboard QoS API using numeric ID: {meeting_id}")
+                    camera_participants = zoom_api.get_meeting_participants_qos(meeting_id)
                 for cp in camera_participants:
                     user_name = cp.get('user_name', '')
                     email = cp.get('email', '')
                     camera_on_count = cp.get('camera_on_count', 0)
+                    camera_on_minutes = cp.get('camera_on_minutes', 0)
+                    camera_on_timestamps = cp.get('camera_on_timestamps', [])
                     # Key by name+email for matching
                     key = f"{user_name}|{email}".lower()
-                    camera_data_map[key] = camera_on_count
+                    camera_data_map[key] = {
+                        'count': camera_on_count,
+                        'minutes': camera_on_minutes,
+                        'timestamps': camera_on_timestamps,
+                        'intervals': format_camera_intervals(camera_on_timestamps)
+                    }
                 print(f"[AutoQoS] Got camera data for {len(camera_data_map)} participants")
             except Exception as ce:
                 print(f"[AutoQoS] Camera collection error (non-fatal): {ce}")
@@ -200,9 +291,11 @@ class MeetingState:
                         duration_seconds = safe_int(p.get('duration', 0))
                         duration_minutes = duration_seconds // 60 if duration_seconds > 0 else 0
 
-                        # Look up camera data
-                        camera_key = f"{participant_name}|{participant_email}".lower()
-                        camera_on_count = camera_data_map.get(camera_key, 0)
+                        # Look up camera data using fuzzy matching
+                        camera_info = find_camera_data(camera_data_map, participant_name, participant_email)
+                        camera_on_count = camera_info.get('count', 0)
+                        camera_on_minutes = camera_info.get('minutes', 0)
+                        camera_on_intervals = camera_info.get('intervals', '')
 
                         qos_data = {
                             'qos_id': str(uuid_lib.uuid4()),
@@ -215,8 +308,10 @@ class MeetingState:
                             'duration_minutes': duration_minutes,
                             'attentiveness_score': str(p.get('attentiveness_score', '')),
                             'camera_on_count': camera_on_count,
+                            'camera_on_minutes': camera_on_minutes,
+                            'camera_on_intervals': camera_on_intervals,
                             'recorded_at': datetime.utcnow().isoformat(),
-                            'event_date': datetime.utcnow().strftime('%Y-%m-%d')
+                            'event_date': get_ist_date()
                         }
 
                         if insert_qos_data(qos_data):
@@ -238,33 +333,50 @@ class MeetingState:
         thread.start()
         print(f"[AutoQoS] Background thread started for previous meeting QoS")
 
-    def _delete_old_mappings(self, date):
-        """Delete old mappings from BigQuery for today"""
+    def _cleanup_old_mappings(self):
+        """Clean up mappings older than 7 days (keep recent for reports)"""
         try:
             client = get_bq_client()
+            cutoff_date = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d')
             query = f"""
             DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
-            WHERE mapping_date = '{date}'
+            WHERE mapping_date < '{cutoff_date}'
             """
             client.query(query).result()
-            print(f"[MeetingState] Deleted old mappings for {date}")
+            print(f"[MeetingState] Cleaned up mappings older than {cutoff_date}")
         except Exception as e:
-            print(f"[MeetingState] Error deleting old mappings: {e}")
+            print(f"[MeetingState] Error cleaning up old mappings: {e}")
 
-    def load_mappings_from_bigquery(self, date=None):
-        """Load today's mappings from BigQuery (after server restart)"""
+    def load_mappings_from_bigquery(self, date=None, meeting_id=None):
+        """Load today's mappings from BigQuery (after server restart).
+        If meeting_id is provided, only load mappings for that specific meeting.
+        """
         if date is None:
-            date = datetime.utcnow().strftime('%Y-%m-%d')
+            date = get_ist_date()
+
+        # Also check yesterday (handles overnight meetings - meeting 9AM to 9AM next day)
+        yesterday = (get_ist_now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
         try:
             client = get_bq_client()
+            # Query both today and yesterday to handle timezone edge cases
+            # Filter by meeting_id if provided (prevents cross-meeting mapping contamination)
+            query_params = [
+                bigquery.ScalarQueryParameter("date", "STRING", date),
+                bigquery.ScalarQueryParameter("yesterday", "STRING", yesterday),
+            ]
+            meeting_filter = ""
+            if meeting_id:
+                meeting_filter = " AND meeting_id = @meeting_id"
+                query_params.append(bigquery.ScalarQueryParameter("meeting_id", "STRING", str(meeting_id)))
             query = f"""
-            SELECT room_uuid, room_name, meeting_id
+            SELECT room_uuid, room_name, meeting_id, mapping_date
             FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
-            WHERE mapping_date = '{date}'
-            ORDER BY mapped_at DESC
+            WHERE mapping_date IN (@date, @yesterday){meeting_filter}
+            ORDER BY mapping_date DESC, mapped_at DESC
             """
-            results = client.query(query).result()
+            job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+            results = client.query(query, job_config=job_config).result()
 
             count = 0
             for row in results:
@@ -285,35 +397,38 @@ class MeetingState:
             if count > 0:
                 self.calibration_complete = True
                 self.meeting_date = date
-                print(f"[MeetingState] Loaded {count} mappings from BigQuery for {date}")
+                print(f"[MeetingState] Loaded {count} mappings from BigQuery for {date}/{yesterday}")
 
             return count
         except Exception as e:
             print(f"[MeetingState] Error loading mappings: {e}")
+            traceback.print_exc()
             return 0
 
     def add_room_mapping(self, room_uuid, room_name):
         """Add a room mapping"""
-        self.uuid_to_name[room_uuid] = room_name
-        self.name_to_uuid[room_name] = room_uuid
+        with self._lock:
+            self.uuid_to_name[room_uuid] = room_name
+            self.name_to_uuid[room_name] = room_uuid
 
-        # Also store without braces
-        stripped = room_uuid.replace('{', '').replace('}', '')
-        if stripped != room_uuid:
-            self.uuid_to_name[stripped] = room_name
+            # Also store without braces
+            stripped = room_uuid.replace('{', '').replace('}', '')
+            if stripped != room_uuid:
+                self.uuid_to_name[stripped] = room_name
 
-        # Store lowercase version too
-        self.uuid_to_name[room_uuid.lower()] = room_name
-        self.uuid_to_name[stripped.lower()] = room_name
+            # Store lowercase version too
+            self.uuid_to_name[room_uuid.lower()] = room_name
+            self.uuid_to_name[stripped.lower()] = room_name
 
     def add_webhook_room_mapping(self, webhook_uuid, room_name):
         """Add a webhook UUID to room name mapping (different format from SDK)"""
         if webhook_uuid and room_name:
-            self.uuid_to_name[webhook_uuid] = room_name
-            # Also store first 8 chars as key
-            short_key = webhook_uuid[:8] if len(webhook_uuid) >= 8 else webhook_uuid
-            if short_key not in self.uuid_to_name:
-                self.uuid_to_name[short_key] = room_name
+            with self._lock:
+                self.uuid_to_name[webhook_uuid] = room_name
+                # Also store first 8 chars as key
+                short_key = webhook_uuid[:8] if len(webhook_uuid) >= 8 else webhook_uuid
+                if short_key not in self.uuid_to_name:
+                    self.uuid_to_name[short_key] = room_name
 
     def get_room_name(self, room_uuid):
         """Get room name from UUID"""
@@ -540,6 +655,142 @@ def insert_room_mappings(mappings):
         return False
 
 
+def find_camera_data(camera_data_map, participant_name, participant_email):
+    """
+    Find camera data for a participant using fuzzy matching.
+
+    Handles cases where:
+    - Email is empty on one side
+    - Name format differs (with/without middle name, Guest suffix)
+    - Case differences
+    """
+    if not camera_data_map:
+        return {}
+
+    # Clean name - remove (Guest), (Host), etc. suffixes
+    import re
+    name_lower = (participant_name or '').lower().strip()
+    name_lower = re.sub(r'\s*\([^)]*\)\s*$', '', name_lower).strip()  # Remove trailing (...)
+
+    email_lower = (participant_email or '').lower().strip()
+
+    # Try exact match first
+    exact_key = f"{name_lower}|{email_lower}"
+    if exact_key in camera_data_map:
+        return camera_data_map[exact_key]
+
+    # Try name-only match (email might be empty on one side)
+    for key, data in camera_data_map.items():
+        parts = key.split('|')
+        key_name = parts[0] if parts else ''
+        key_name = re.sub(r'\s*\([^)]*\)\s*$', '', key_name).strip()  # Remove (Guest) etc.
+        key_email = parts[1] if len(parts) > 1 else ''
+
+        # Exact name match with either side having empty email
+        if key_name == name_lower:
+            if not key_email or not email_lower or key_email == email_lower:
+                return data
+
+        # Partial name match (first name)
+        if key_name and name_lower:
+            key_first = key_name.split()[0] if key_name else ''
+            name_first = name_lower.split()[0] if name_lower else ''
+            if key_first == name_first and len(key_first) > 2:
+                # First names match, check email
+                if key_email == email_lower or not key_email or not email_lower:
+                    return data
+
+        # Email match (names might differ)
+        if key_email and email_lower and key_email == email_lower:
+            return data
+
+    return {}
+
+
+def format_camera_intervals(timestamps):
+    """
+    Format camera ON timestamps into IST time intervals.
+
+    Input: List of UTC timestamp strings like ['2026-02-22T10:15:00Z', '2026-02-22T10:16:00Z', ...]
+    Output: IST formatted intervals like '15:45-16:30, 17:00-18:15'
+
+    Consecutive timestamps (within 2 min) are merged into intervals.
+    """
+    if not timestamps:
+        return ''
+
+    try:
+        from datetime import timedelta
+        import pytz
+
+        ist = pytz.timezone('Asia/Kolkata')
+        utc = pytz.UTC
+
+        # Parse and sort timestamps
+        parsed = []
+        for ts in timestamps:
+            try:
+                if isinstance(ts, str):
+                    # Handle various formats
+                    ts = ts.replace('Z', '+00:00')
+                    if '.' in ts:
+                        dt = datetime.fromisoformat(ts.split('.')[0] + '+00:00')
+                    else:
+                        dt = datetime.fromisoformat(ts)
+                    if dt.tzinfo is None:
+                        dt = utc.localize(dt)
+                    parsed.append(dt)
+            except Exception:
+                continue
+
+        if not parsed:
+            return ''
+
+        parsed.sort()
+
+        # Merge consecutive timestamps into intervals (gap > 2 min = new interval)
+        intervals = []
+        current_start = parsed[0]
+        current_end = parsed[0]
+
+        for dt in parsed[1:]:
+            if (dt - current_end).total_seconds() <= 120:  # Within 2 minutes
+                current_end = dt
+            else:
+                intervals.append((current_start, current_end))
+                current_start = dt
+                current_end = dt
+
+        # Don't forget the last interval
+        intervals.append((current_start, current_end))
+
+        # Format as IST time ranges
+        formatted = []
+        for start, end in intervals:
+            start_ist = start.astimezone(ist)
+            end_ist = end.astimezone(ist)
+            # Add 1 minute to end to account for sample duration
+            end_ist = end_ist + timedelta(minutes=1)
+            formatted.append(f"{start_ist.strftime('%H:%M')}-{end_ist.strftime('%H:%M')}")
+
+        return ', '.join(formatted)
+
+    except Exception as e:
+        print(f"[CameraFormat] Error formatting intervals: {e}")
+        return ''
+
+
+def format_minutes_as_hhmm(minutes):
+    """Format minutes as Xh Ym format"""
+    if not minutes or minutes <= 0:
+        return '0m'
+    hours = minutes // 60
+    mins = minutes % 60
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
 def insert_qos_data(qos_data):
     """Insert QoS data into BigQuery with validation"""
     try:
@@ -559,6 +810,19 @@ def insert_qos_data(qos_data):
                 cleaned_data['duration_minutes'] = int(val) if val is not None and val != '' else 0
             except (ValueError, TypeError):
                 cleaned_data['duration_minutes'] = 0
+
+        # Ensure camera_on_minutes is int
+        if 'camera_on_minutes' in cleaned_data:
+            try:
+                val = cleaned_data['camera_on_minutes']
+                cleaned_data['camera_on_minutes'] = int(val) if val is not None and val != '' else 0
+            except (ValueError, TypeError):
+                cleaned_data['camera_on_minutes'] = 0
+
+        # Ensure camera_on_intervals is string
+        if 'camera_on_intervals' in cleaned_data:
+            if cleaned_data['camera_on_intervals'] is None:
+                cleaned_data['camera_on_intervals'] = ''
 
         client = get_bq_client()
         table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_QOS_TABLE}"
@@ -601,7 +865,8 @@ class ZoomAPI:
         response = requests.post(
             url,
             auth=(ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET),
-            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=30
         )
 
         if response.status_code != 200:
@@ -611,6 +876,20 @@ class ZoomAPI:
         self.access_token = data['access_token']
         self.token_expires = now + data.get('expires_in', 3600)
         return self.access_token
+
+    def _api_get_with_retry(self, url, headers, params, max_retries=3):
+        """Make a GET request with rate limit (429) retry and exponential backoff."""
+        for attempt in range(max_retries):
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 1))
+                wait_time = max(retry_after, 2 ** attempt)
+                print(f"[ZoomAPI] Rate limited (429), retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            return response
+        # Return last response even if still 429
+        return response
 
     def get_past_meeting_participants(self, meeting_uuid, page_size=300):
         """
@@ -677,7 +956,7 @@ class ZoomAPI:
                             params['next_page_token'] = next_page_token
 
                         print(f"[ZoomAPI] Trying {method_name} (page {page_count + 1})...")
-                        response = requests.get(base_url, headers=headers, params=params)
+                        response = self._api_get_with_retry(base_url, headers, params)
 
                         if response.status_code == 200:
                             data = response.json()
@@ -741,13 +1020,18 @@ class ZoomAPI:
             traceback.print_exc()
             return []
 
-    def get_meeting_participants_qos(self, meeting_id):
+    def get_meeting_participants_qos(self, meeting_id, max_pages=200):
         """
         Get QoS data for meeting participants using Dashboard Metrics API.
         This includes video_output data which indicates camera status.
 
         IMPORTANT: Requires Business/Education/Enterprise plan and
         dashboard_meetings:read:admin scope.
+
+        Args:
+            meeting_id: The meeting ID
+            max_pages: Maximum pages to fetch (default 200 = 2000 participants)
+                       Use smaller value for quick searches
 
         Returns list of participants with video_output stats.
         When camera is ON: video_output has bitrate, resolution, etc.
@@ -766,7 +1050,6 @@ class ZoomAPI:
 
             next_page_token = None
             page_count = 0
-            max_pages = 200  # Increased to handle large meetings (2000 participants)
 
             print(f"[ZoomAPI] Fetching QoS data for meeting {meeting_id}...")
 
@@ -775,30 +1058,118 @@ class ZoomAPI:
                 if next_page_token:
                     params['next_page_token'] = next_page_token
 
-                response = requests.get(base_url, headers=headers, params=params)
+                response = self._api_get_with_retry(base_url, headers, params)
 
                 if response.status_code == 200:
                     data = response.json()
                     participants = data.get('participants', [])
 
                     if participants:
-                        # Extract camera status from video_output
+                        # Log first participant's raw QoS structure for debugging
+                        if page_count == 0 and participants:
+                            first_p = participants[0]
+                            print(f"[ZoomAPI] Participant fields: {list(first_p.keys())}")
+                            user_qos_sample = first_p.get('user_qos', [])
+                            if user_qos_sample:
+                                print(f"[ZoomAPI] QoS entry fields: {list(user_qos_sample[0].keys())}")
+                                print(f"[ZoomAPI] FULL QoS entry: {json.dumps(user_qos_sample[0], indent=2)}")
+                            else:
+                                print(f"[ZoomAPI] WARNING: No user_qos data in participant")
+
+                        # Extract camera status from video_output with timestamps
                         for p in participants:
                             user_qos = p.get('user_qos', [])
                             camera_on_periods = []
+                            camera_on_timestamps = []  # List of datetime strings when camera was ON
+
+                            # Debug: Log first participant's QoS structure
+                            if page_count == 0 and participants.index(p) == 0 and user_qos:
+                                sample_qos = user_qos[0]
+                                print(f"[ZoomAPI] Sample QoS date_time: {sample_qos.get('date_time', 'NOT FOUND')}")
+                                print(f"[ZoomAPI] Sample QoS video_output: {sample_qos.get('video_output', 'NOT FOUND')}")
 
                             for qos_entry in user_qos:
                                 video_output = qos_entry.get('video_output', {})
-                                if video_output and video_output.get('bitrate'):
+                                # Try multiple field names for timestamp
+                                datetime_qos = (
+                                    qos_entry.get('date_time') or
+                                    qos_entry.get('datetime') or
+                                    qos_entry.get('time') or
+                                    qos_entry.get('timestamp') or
+                                    ''
+                                )
+
+                                # FIX: Check if video_output exists with resolution OR bitrate > 0
+                                # bitrate can be 0 or "0" which would fail truthiness check
+                                camera_is_on = False
+                                if video_output:
+                                    resolution = video_output.get('resolution', '')
+                                    bitrate = video_output.get('bitrate', 0)
+                                    # Camera ON if resolution exists OR bitrate > 0
+                                    try:
+                                        bitrate_val = int(bitrate) if bitrate else 0
+                                    except (ValueError, TypeError):
+                                        bitrate_val = 0
+                                    camera_is_on = bool(resolution) or bitrate_val > 0
+
+                                if camera_is_on:
                                     # Camera was ON during this period
                                     camera_on_periods.append({
+                                        'datetime': datetime_qos,
                                         'bitrate': video_output.get('bitrate'),
                                         'resolution': video_output.get('resolution'),
                                         'frame_rate': video_output.get('frame_rate')
                                     })
+                                    if datetime_qos:
+                                        camera_on_timestamps.append(datetime_qos)
 
                             p['camera_on_periods'] = camera_on_periods
                             p['camera_on_count'] = len(camera_on_periods)
+                            p['camera_on_timestamps'] = camera_on_timestamps
+
+                            # Debug: Log first participant with camera data
+                            if camera_on_periods and page_count == 0:
+                                user_name = p.get('user_name', 'Unknown')
+                                print(f"[ZoomAPI] {user_name}: {len(camera_on_periods)} camera periods, {len(camera_on_timestamps)} timestamps")
+                                if camera_on_timestamps:
+                                    print(f"[ZoomAPI] Sample timestamp: {camera_on_timestamps[0]}")
+
+                            # Calculate actual camera ON duration from timestamps
+                            camera_on_minutes = 0
+                            if camera_on_timestamps and len(camera_on_timestamps) >= 2:
+                                try:
+                                    # Parse timestamps and calculate duration from intervals
+                                    from datetime import datetime as dt
+                                    parsed_times = []
+                                    for ts in camera_on_timestamps:
+                                        if isinstance(ts, str):
+                                            ts = ts.replace('Z', '+00:00')
+                                            if '.' in ts:
+                                                parsed_times.append(dt.fromisoformat(ts.split('.')[0]))
+                                            else:
+                                                parsed_times.append(dt.fromisoformat(ts.replace('+00:00', '')))
+                                    if parsed_times:
+                                        parsed_times.sort()
+                                        # Calculate total duration considering gaps > 2 min as breaks
+                                        total_seconds = 0
+                                        interval_start = parsed_times[0]
+                                        prev_time = parsed_times[0]
+                                        for curr_time in parsed_times[1:]:
+                                            gap = (curr_time - prev_time).total_seconds()
+                                            if gap > 120:  # Gap > 2 min = new interval
+                                                total_seconds += (prev_time - interval_start).total_seconds() + 60  # Add 1 min for last sample
+                                                interval_start = curr_time
+                                            prev_time = curr_time
+                                        # Add final interval
+                                        total_seconds += (prev_time - interval_start).total_seconds() + 60
+                                        camera_on_minutes = max(1, int(total_seconds / 60))
+                                except Exception as e:
+                                    print(f"[ZoomAPI] Error calculating camera duration: {e}")
+                                    camera_on_minutes = len(camera_on_periods)  # Fallback
+                            elif camera_on_periods:
+                                camera_on_minutes = len(camera_on_periods)  # Fallback if only 1 sample
+
+                            p['camera_on_minutes'] = camera_on_minutes
 
                         all_participants.extend(participants)
                         print(f"[ZoomAPI] QoS Page {page_count + 1}: {len(participants)} participants")
@@ -829,7 +1200,10 @@ class ZoomAPI:
                     print(f"[ZoomAPI] QoS API: {response.status_code} - {response.text[:200]}")
                     break
 
-            print(f"[ZoomAPI] QoS: Got {len(all_participants)} participants with camera data")
+            # Count participants with camera data and timestamps
+            with_camera = sum(1 for p in all_participants if p.get('camera_on_count', 0) > 0)
+            with_timestamps = sum(1 for p in all_participants if p.get('camera_on_timestamps'))
+            print(f"[ZoomAPI] QoS: Got {len(all_participants)} participants, {with_camera} with camera, {with_timestamps} with timestamps")
             return all_participants
 
         except Exception as e:
@@ -953,6 +1327,11 @@ def extract_participant_data(data):
     else:
         event_dt = datetime.utcnow()
 
+    # Convert event_dt to IST for consistent date calculation
+    # Cloud Run uses UTC, but reports use IST dates. Storing event_date in IST
+    # ensures events between 00:00-05:30 UTC (05:30-11:00 IST) aren't assigned to wrong day.
+    event_dt_ist = event_dt + IST_OFFSET
+
     return {
         'participant_id': str(participant_id) if participant_id else '',
         'participant_name': str(participant_name) if participant_name else 'Unknown',
@@ -960,7 +1339,8 @@ def extract_participant_data(data):
         'meeting_id': meeting_id,
         'meeting_uuid': meeting_uuid,
         'room_uuid': room_uuid,
-        'event_dt': event_dt
+        'event_dt': event_dt,        # UTC - used for event_timestamp
+        'event_date_ist': event_dt_ist.strftime('%Y-%m-%d')  # IST - used for event_date
     }
 
 
@@ -982,6 +1362,10 @@ def handle_participant_joined(data):
         print(f"  -> Raw data: {json.dumps(data, indent=2)[:500]}")
         return
 
+    # Check for duplicate event (Zoom sometimes sends same webhook twice)
+    if meeting_state.is_duplicate_event(p['participant_id'], 'participant_joined', p['event_dt'].isoformat()):
+        return
+
     # Set current meeting
     meeting_state.set_meeting(p['meeting_id'], p['meeting_uuid'])
 
@@ -989,7 +1373,7 @@ def handle_participant_joined(data):
         'event_id': str(uuid_lib.uuid4()),
         'event_type': 'participant_joined',
         'event_timestamp': p['event_dt'].isoformat(),
-        'event_date': p['event_dt'].strftime('%Y-%m-%d'),
+        'event_date': p['event_date_ist'],
         'meeting_id': p['meeting_id'],
         'meeting_uuid': p['meeting_uuid'],
         'participant_id': p['participant_id'],
@@ -1024,11 +1408,15 @@ def handle_participant_left(data):
         print(f"  -> ERROR: Missing meeting_id")
         return
 
+    # Check for duplicate event
+    if meeting_state.is_duplicate_event(p['participant_id'], 'participant_left', p['event_dt'].isoformat()):
+        return
+
     event_data = {
         'event_id': str(uuid_lib.uuid4()),
         'event_type': 'participant_left',
         'event_timestamp': p['event_dt'].isoformat(),
-        'event_date': p['event_dt'].strftime('%Y-%m-%d'),
+        'event_date': p['event_date_ist'],
         'meeting_id': p['meeting_id'],
         'meeting_uuid': p['meeting_uuid'],
         'participant_id': p['participant_id'],
@@ -1067,57 +1455,56 @@ def handle_breakout_room_join(data):
         print(f"  -> Pending room moves: {len(meeting_state.pending_room_moves)}")
 
         # Scout Bot is moving during calibration
-        # Find the oldest unmatched pending room move
+        # Find the oldest unmatched OR matched-but-not-verified pending room move
+        # (matched-but-not-verified means we're retrying after a mismatch)
         room_name = None
         matched_move = None
 
+        # First, look for completely unmatched entries
         for move in meeting_state.pending_room_moves:
-            if not move['matched']:
+            if not move.get('matched'):
                 room_name = move['room_name']
                 matched_move = move
                 break
+
+        # If all entries are matched, look for matched-but-not-verified (retry scenario)
+        # This handles the case where bot went to wrong room, webhook arrived, but SDK detected mismatch
+        # IMPORTANT: Iterate in REVERSE to find the MOST RECENT unverified room (the one being retried)
+        if not matched_move:
+            for move in reversed(meeting_state.pending_room_moves):
+                if move.get('matched') and not move.get('verified'):
+                    room_name = move['room_name']
+                    matched_move = move
+                    print(f"  -> RETRY: Updating webhook_uuid for unverified room: {room_name}")
+                    break
 
         # Fallback to scout_bot_current_room if no pending moves
         if not room_name and hasattr(meeting_state, 'scout_bot_current_room'):
             room_name = meeting_state.scout_bot_current_room
 
         if room_name and room_uuid:
-            # Mark the move as matched
+            # Mark the move as matched (but NOT verified yet - frontend must confirm)
             if matched_move:
                 matched_move['matched'] = True
                 matched_move['webhook_uuid'] = room_uuid
-                print(f"  -> MATCHED pending move: {room_name}")
+                matched_move['verified'] = False  # Will be set True by frontend after SDK verification
+                print(f"  -> MATCHED pending move: {room_name} (awaiting frontend verification)")
 
-            # Store webhook UUID -> room name mapping in memory
+            # Store webhook UUID -> room name mapping in memory (temporary)
             meeting_state.add_webhook_room_mapping(room_uuid, room_name)
             print(f"  -> CALIBRATION: Learned webhook UUID {room_uuid[:20]}... = {room_name}")
+            print(f"  -> NOTE: Mapping will be saved to BigQuery after frontend verification")
 
-            # Also store in BigQuery for persistence
-            try:
-                today = datetime.utcnow().strftime('%Y-%m-%d')
-                mapping_row = {
-                    'mapping_id': str(uuid_lib.uuid4()),
-                    'meeting_id': str(p['meeting_id']),
-                    'meeting_uuid': p['meeting_uuid'] or '',
-                    'room_uuid': room_uuid,
-                    'room_name': room_name,
-                    'room_index': len([m for m in meeting_state.pending_room_moves if m['matched']]),
-                    'mapping_date': today,
-                    'mapped_at': datetime.utcnow().isoformat(),
-                    'source': 'webhook_calibration'
-                }
-                success = insert_room_mappings([mapping_row])
-                if success:
-                    print(f"  -> SAVED webhook mapping to BigQuery!")
-                else:
-                    print(f"  -> WARNING: BigQuery insert returned false")
-            except Exception as e:
-                print(f"  -> WARNING: Could not save webhook mapping: {e}")
-                traceback.print_exc()
+            # DON'T save to BigQuery yet - wait for frontend to verify via /calibration/verify
+            # This prevents saving wrong mappings when bot ends up in wrong room
         else:
             print(f"  -> WARNING: Could not match webhook UUID - room_name={room_name}, room_uuid={room_uuid[:20] if room_uuid else 'None'}")
 
         print(f"  -> Calibration participant in breakout room, skipping event storage")
+        return
+
+    # Check for duplicate event
+    if meeting_state.is_duplicate_event(p['participant_id'], 'breakout_room_joined', p['event_dt'].isoformat()):
         return
 
     # Get room name from mapping
@@ -1131,7 +1518,7 @@ def handle_breakout_room_join(data):
         'event_id': str(uuid_lib.uuid4()),
         'event_type': 'breakout_room_joined',
         'event_timestamp': p['event_dt'].isoformat(),
-        'event_date': p['event_dt'].strftime('%Y-%m-%d'),
+        'event_date': p['event_date_ist'],
         'meeting_id': p['meeting_id'],
         'meeting_uuid': p['meeting_uuid'],
         'participant_id': p['participant_id'],
@@ -1165,6 +1552,10 @@ def handle_breakout_room_leave(data):
         print(f"  -> ERROR: Missing meeting_id")
         return
 
+    # Check for duplicate event
+    if meeting_state.is_duplicate_event(p['participant_id'], 'breakout_room_left', p['event_dt'].isoformat()):
+        return
+
     room_uuid = p['room_uuid']
     room_name = meeting_state.get_room_name(room_uuid) if room_uuid else 'Unknown Room'
     if not room_name and room_uuid:
@@ -1174,7 +1565,7 @@ def handle_breakout_room_leave(data):
         'event_id': str(uuid_lib.uuid4()),
         'event_type': 'breakout_room_left',
         'event_timestamp': p['event_dt'].isoformat(),
-        'event_date': p['event_dt'].strftime('%Y-%m-%d'),
+        'event_date': p['event_date_ist'],
         'meeting_id': p['meeting_id'],
         'meeting_uuid': p['meeting_uuid'],
         'participant_id': p['participant_id'],
@@ -1229,7 +1620,7 @@ def handle_camera_event(data, camera_on):
         'event_id': str(uuid_lib.uuid4()),
         'event_type': 'camera_on' if camera_on else 'camera_off',
         'event_timestamp': event_dt.isoformat(),
-        'event_date': event_dt.strftime('%Y-%m-%d'),
+        'event_date': p['event_date_ist'],
         'event_time': event_dt.strftime('%H:%M:%S'),
         'meeting_id': p['meeting_id'],
         'meeting_uuid': p['meeting_uuid'],
@@ -1280,12 +1671,39 @@ def handle_meeting_ended(data):
 
     # Collect QoS data in background
     def collect_qos():
-        time.sleep(30)  # Wait for Zoom to finalize data
+        time.sleep(45)  # Wait 45 seconds for Zoom to finalize QoS data (30-60s optimal)
         collected_count = 0
         error_count = 0
 
         try:
-            # Try multiple methods to get participant data
+            # FIRST: Collect camera data from Dashboard QoS API (must do this quickly!)
+            camera_data_map = {}
+            try:
+                # MUST use numeric meeting_id for Dashboard API - UUID does NOT work!
+                if not meeting_id or not str(meeting_id).replace('-', '').isdigit():
+                    print(f"[QoS] WARNING: No numeric meeting_id available, skipping camera QoS")
+                    camera_participants = []
+                else:
+                    print(f"[QoS] Collecting camera data via Dashboard QoS API using numeric ID: {meeting_id}")
+                    camera_participants = zoom_api.get_meeting_participants_qos(meeting_id)
+                for cp in camera_participants:
+                    user_name = cp.get('user_name', '')
+                    email = cp.get('email', '')
+                    camera_on_count = cp.get('camera_on_count', 0)
+                    camera_on_minutes = cp.get('camera_on_minutes', 0)
+                    camera_on_timestamps = cp.get('camera_on_timestamps', [])
+                    key = f"{user_name}|{email}".lower()
+                    camera_data_map[key] = {
+                        'count': camera_on_count,
+                        'minutes': camera_on_minutes,
+                        'timestamps': camera_on_timestamps,
+                        'intervals': format_camera_intervals(camera_on_timestamps)
+                    }
+                print(f"[QoS] Got camera data for {len(camera_data_map)} participants")
+            except Exception as ce:
+                print(f"[QoS] Camera collection error (non-fatal): {ce}")
+
+            # Then get participant list
             participants = zoom_api.get_past_meeting_participants(meeting_uuid)
 
             if not participants:
@@ -1337,6 +1755,12 @@ def handle_meeting_ended(data):
                     else:
                         attentiveness_score = safe_str(attentiveness)
 
+                    # Look up camera data using fuzzy matching
+                    camera_info = find_camera_data(camera_data_map, participant_name, participant_email)
+                    camera_on_count = camera_info.get('count', 0)
+                    camera_on_minutes = camera_info.get('minutes', 0)
+                    camera_on_intervals = camera_info.get('intervals', '')
+
                     qos_data = {
                         'qos_id': str(uuid_lib.uuid4()),
                         'meeting_uuid': safe_str(meeting_uuid),
@@ -1347,12 +1771,16 @@ def handle_meeting_ended(data):
                         'leave_time': leave_time,
                         'duration_minutes': duration_minutes,
                         'attentiveness_score': attentiveness_score,
+                        'camera_on_count': camera_on_count,
+                        'camera_on_minutes': camera_on_minutes,
+                        'camera_on_intervals': camera_on_intervals,
                         'recorded_at': datetime.utcnow().isoformat(),
-                        'event_date': datetime.utcnow().strftime('%Y-%m-%d')
+                        'event_date': get_ist_date()
                     }
 
                     # Log each insert for debugging
-                    print(f"[QoS] Inserting: {participant_name} - duration={duration_minutes}min (raw={duration_seconds}s)")
+                    camera_str = f", camera={camera_on_minutes}min" if camera_on_minutes > 0 else ""
+                    print(f"[QoS] Inserting: {participant_name} - duration={duration_minutes}min{camera_str}")
 
                     if insert_qos_data(qos_data):
                         collected_count += 1
@@ -1401,11 +1829,68 @@ def health_check():
     })
 
 
+# Rate limiter for signature error logging
+_sig_error_state = {'count': 0, 'last_log': 0}
+
+def validate_webhook_signature(request_obj):
+    """
+    Validate Zoom webhook signature using HMAC-SHA256.
+    Returns (valid, error_message) tuple.
+    """
+    if not ZOOM_WEBHOOK_SECRET:
+        # If no secret configured, skip validation (dev mode)
+        print("[Webhook] WARNING: ZOOM_WEBHOOK_SECRET not set, skipping signature validation")
+        return True, None
+
+    signature = request_obj.headers.get('x-zm-signature', '')
+    timestamp = request_obj.headers.get('x-zm-request-timestamp', '')
+
+    if not signature or not timestamp:
+        # URL validation events don't have these headers
+        return True, None
+
+    # Zoom signature format: v0=HMAC-SHA256(secret, timestamp + payload)
+    raw_body = request_obj.data.decode('utf-8') if request_obj.data else ''
+    message = f"v0:{timestamp}:{raw_body}"
+
+    expected_sig = 'v0=' + hmac.new(
+        key=ZOOM_WEBHOOK_SECRET.encode('utf-8'),
+        msg=message.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature, expected_sig):
+        # Rate-limited logging - only log once per minute
+        _sig_error_state['count'] += 1
+        now = time.time()
+        if now - _sig_error_state['last_log'] > 60:
+            print(f"[Webhook] Signature mismatch: {_sig_error_state['count']} errors (likely duplicate webhook subscription)")
+            _sig_error_state['last_log'] = now
+            _sig_error_state['count'] = 0
+        return False, "Invalid webhook signature"
+
+    # Check timestamp freshness (within 5 minutes)
+    try:
+        ts = int(timestamp)
+        now = int(time.time())
+        if abs(now - ts) > 300:
+            return False, "Webhook timestamp too old"
+    except ValueError:
+        return False, "Invalid timestamp format"
+
+    return True, None
+
+
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     """Main Zoom webhook endpoint"""
     if request.method == 'GET':
         return jsonify({'status': 'Webhook ready'})
+
+    # Validate webhook signature (security)
+    valid, error = validate_webhook_signature(request)
+    if not valid:
+        return jsonify({'error': error}), 401
 
     # Get raw data for logging
     try:
@@ -1564,7 +2049,7 @@ def calibration_mapping():
             print(f"[Calibration] Scout Bot moving to: {room_name} (pending webhook match)")
 
     # Store in BigQuery
-    today = datetime.utcnow().strftime('%Y-%m-%d')
+    today = get_ist_date()
     bq_rows = [{
         'mapping_id': str(uuid_lib.uuid4()),
         'meeting_id': str(meeting_id),
@@ -1591,6 +2076,44 @@ def calibration_mapping():
         'mappings_received': len(room_mapping),
         'total_stored': len(meeting_state.uuid_to_name),
         'pending_webhook_matches': len([m for m in meeting_state.pending_room_moves if not m['matched']])
+    })
+
+
+@app.route('/calibration/pending', methods=['GET'])
+def calibration_pending():
+    """
+    Get pending room moves and their match status.
+    Used by React app to poll and wait for webhook confirmation.
+    """
+    room_name = request.args.get('room_name')
+
+    pending_moves = []
+    for move in meeting_state.pending_room_moves:
+        move_info = {
+            'room_name': move.get('room_name'),
+            'sdk_uuid': move.get('sdk_uuid'),
+            'matched': move.get('matched', False),
+            'webhook_uuid': move.get('webhook_uuid') if move.get('matched') else None
+        }
+        pending_moves.append(move_info)
+
+    # If room_name is specified, check if that specific room is matched
+    if room_name:
+        room_matched = any(
+            m.get('room_name') == room_name and m.get('matched')
+            for m in meeting_state.pending_room_moves
+        )
+        return jsonify({
+            'room_name': room_name,
+            'matched': room_matched,
+            'total_pending': len([m for m in meeting_state.pending_room_moves if not m['matched']]),
+            'total_matched': len([m for m in meeting_state.pending_room_moves if m['matched']])
+        })
+
+    return jsonify({
+        'pending_moves': pending_moves,
+        'total_pending': len([m for m in meeting_state.pending_room_moves if not m['matched']]),
+        'total_matched': len([m for m in meeting_state.pending_room_moves if m['matched']])
     })
 
 
@@ -1627,6 +2150,87 @@ def calibration_complete():
     })
 
 
+@app.route('/calibration/verify', methods=['POST'])
+def calibration_verify():
+    """
+    Frontend calls this AFTER SDK verification confirms bot is in correct room.
+    This saves the webhook UUID mapping to BigQuery.
+    """
+    data = request.json or {}
+    room_name = data.get('room_name')
+    meeting_id = data.get('meeting_id')
+
+    if not room_name:
+        return jsonify({'error': 'room_name required'}), 400
+
+    # Find the matched pending move for this room
+    matched_move = None
+    for move in meeting_state.pending_room_moves:
+        if move.get('room_name') == room_name and move.get('matched') and not move.get('verified'):
+            matched_move = move
+            break
+
+    if not matched_move:
+        print(f"[Calibration] Verify called but no unverified match found for: {room_name}")
+        return jsonify({
+            'success': False,
+            'error': f'No unverified match found for room: {room_name}'
+        }), 404
+
+    webhook_uuid = matched_move.get('webhook_uuid')
+    if not webhook_uuid:
+        print(f"[Calibration] Verify called but no webhook UUID for: {room_name}")
+        return jsonify({
+            'success': False,
+            'error': f'No webhook UUID captured for room: {room_name}'
+        }), 404
+
+    # Mark as verified
+    matched_move['verified'] = True
+    print(f"[Calibration] VERIFIED: {room_name} = {webhook_uuid[:20]}...")
+
+    # NOW save to BigQuery (only after frontend verification)
+    try:
+        today = get_ist_date()
+        mapping_row = {
+            'mapping_id': str(uuid_lib.uuid4()),
+            'meeting_id': str(meeting_id or meeting_state.meeting_id),
+            'meeting_uuid': meeting_state.meeting_uuid or '',
+            'room_uuid': webhook_uuid,
+            'room_name': room_name,
+            'room_index': len([m for m in meeting_state.pending_room_moves if m.get('verified')]) - 1,
+            'mapping_date': today,
+            'mapped_at': datetime.utcnow().isoformat(),
+            'source': 'webhook_calibration'  # Webhook UUID verified by SDK
+        }
+        success = insert_room_mappings([mapping_row])
+        if success:
+            print(f"[Calibration] SAVED verified mapping to BigQuery: {room_name}")
+        else:
+            print(f"[Calibration] WARNING: BigQuery insert returned false for {room_name}")
+
+        # Prune old verified entries to prevent list from growing indefinitely
+        # Keep only entries that are either unverified or verified within last 5 minutes
+        now = datetime.utcnow()
+        meeting_state.pending_room_moves = [
+            m for m in meeting_state.pending_room_moves
+            if not m.get('verified') or (now - m.get('timestamp', now)).total_seconds() < 300
+        ]
+        print(f"[Calibration] Pending moves after prune: {len(meeting_state.pending_room_moves)}")
+
+    except Exception as e:
+        print(f"[Calibration] ERROR saving verified mapping: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+    return jsonify({
+        'success': True,
+        'room_name': room_name,
+        'webhook_uuid': webhook_uuid,
+        'verified': True
+    })
+
+
 @app.route('/calibration/status', methods=['GET'])
 def calibration_status():
     """Get current calibration status"""
@@ -1637,6 +2241,75 @@ def calibration_status():
         'rooms_mapped': len(meeting_state.uuid_to_name),
         'room_names': list(meeting_state.name_to_uuid.keys())[:20]
     })
+
+
+@app.route('/debug/bq-mappings', methods=['GET'])
+def debug_bq_mappings():
+    """Debug endpoint to check BigQuery mappings directly"""
+    try:
+        client = get_bq_client()
+        today = get_ist_date()
+        yesterday = (get_ist_now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+        # Query for today AND yesterday (timezone edge case)
+        query = f"""
+        SELECT mapping_date, room_uuid, room_name, meeting_id, source, mapped_at
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date IN ('{today}', '{yesterday}')
+        ORDER BY mapped_at DESC
+        LIMIT 100
+        """
+        results = list(client.query(query).result())
+
+        mappings = []
+        for row in results:
+            mappings.append({
+                'date': row.mapping_date,
+                'room_name': row.room_name,
+                'room_uuid': row.room_uuid[:20] + '...' if len(row.room_uuid) > 20 else row.room_uuid,
+                'meeting_id': row.meeting_id,
+                'source': row.source,
+                'mapped_at': row.mapped_at
+            })
+
+        # Also count total mappings ever
+        count_query = f"""
+        SELECT mapping_date, COUNT(*) as cnt
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        GROUP BY mapping_date
+        ORDER BY mapping_date DESC
+        LIMIT 10
+        """
+        count_results = list(client.query(count_query).result())
+        date_counts = {str(row.mapping_date): row.cnt for row in count_results}
+
+        return jsonify({
+            'today_utc': today,
+            'yesterday_utc': yesterday,
+            'in_memory_count': len(meeting_state.uuid_to_name),
+            'in_memory_rooms': list(meeting_state.name_to_uuid.keys())[:30],
+            'bigquery_mappings': mappings,
+            'bigquery_count': len(mappings),
+            'mappings_by_date': date_counts
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/calibration/reload', methods=['POST'])
+def calibration_reload():
+    """Force reload mappings from BigQuery"""
+    try:
+        today = get_ist_date()
+        count = meeting_state.load_mappings_from_bigquery(today)
+        return jsonify({
+            'success': True,
+            'mappings_loaded': count,
+            'in_memory_count': len(meeting_state.uuid_to_name),
+            'room_names': list(meeting_state.name_to_uuid.keys())[:30]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/mappings', methods=['GET'])
@@ -1659,27 +2332,31 @@ def get_mappings():
 
 @app.route('/report/generate', methods=['POST'])
 def generate_report():
-    """Manually trigger report generation"""
+    """Manually trigger report generation - defaults to YESTERDAY's data"""
     data = request.json or {}
-    report_date = data.get('date', datetime.utcnow().strftime('%Y-%m-%d'))
+    # Default to yesterday (not today) - report_generator handles this correctly
+    report_date = data.get('date')  # None = yesterday in report_generator
 
     try:
-        from report_generator import generate_daily_report, send_report_email
+        from report_generator import generate_daily_report, send_report_email, get_yesterday_ist
 
+        # If no date provided, use yesterday (via report_generator default)
         report = generate_daily_report(report_date)
+        # Get actual date used for response
+        actual_date = report_date or get_yesterday_ist()
 
         if SENDGRID_API_KEY and REPORT_EMAIL_TO:
-            send_report_email(report, report_date)
+            send_report_email(report, actual_date)
             return jsonify({
                 'success': True,
                 'message': f'Report generated and sent to {REPORT_EMAIL_TO}',
-                'date': report_date
+                'date': actual_date
             })
         else:
             return jsonify({
                 'success': True,
                 'message': 'Report generated (email not configured)',
-                'date': report_date,
+                'date': actual_date,
                 'report': report
             })
 
@@ -1727,6 +2404,33 @@ def collect_qos_manual():
     participants_data = []
 
     try:
+        # First, collect camera data via Dashboard QoS API
+        camera_data_map = {}
+        try:
+            # Use numeric meeting_id for Dashboard API
+            qos_meeting_id = meeting_id if meeting_id and str(meeting_id).replace('-', '').isdigit() else None
+            if qos_meeting_id:
+                print(f"[QoS] Collecting camera data via Dashboard QoS API...")
+                camera_participants = zoom_api.get_meeting_participants_qos(qos_meeting_id)
+                for cp in camera_participants:
+                    user_name = cp.get('user_name', '')
+                    email = cp.get('email', '')
+                    camera_on_count = cp.get('camera_on_count', 0)
+                    camera_on_minutes = cp.get('camera_on_minutes', 0)
+                    camera_on_timestamps = cp.get('camera_on_timestamps', [])
+                    key = f"{user_name}|{email}".lower()
+                    camera_data_map[key] = {
+                        'count': camera_on_count,
+                        'minutes': camera_on_minutes,
+                        'timestamps': camera_on_timestamps,
+                        'intervals': format_camera_intervals(camera_on_timestamps)
+                    }
+                print(f"[QoS] Got camera data for {len(camera_data_map)} participants")
+            else:
+                print(f"[QoS] No numeric meeting_id - skipping camera data collection")
+        except Exception as ce:
+            print(f"[QoS] Camera collection error (non-fatal): {ce}")
+
         # Try with meeting_uuid first
         participants = []
         if meeting_uuid:
@@ -1768,6 +2472,12 @@ def collect_qos_manual():
                 join_time = safe_str(p.get('join_time', ''))
                 leave_time = safe_str(p.get('leave_time', ''))
 
+                # Look up camera data using fuzzy matching
+                camera_info = find_camera_data(camera_data_map, participant_name, participant_email)
+                camera_on_count = camera_info.get('count', 0)
+                camera_on_minutes = camera_info.get('minutes', 0)
+                camera_on_intervals = camera_info.get('intervals', '')
+
                 qos_data = {
                     'qos_id': str(uuid_lib.uuid4()),
                     'meeting_uuid': safe_str(meeting_uuid or meeting_id),
@@ -1778,8 +2488,11 @@ def collect_qos_manual():
                     'leave_time': leave_time,
                     'duration_minutes': duration_minutes,
                     'attentiveness_score': safe_str(p.get('attentiveness_score', '')),
+                    'camera_on_count': camera_on_count,
+                    'camera_on_minutes': camera_on_minutes,
+                    'camera_on_intervals': camera_on_intervals,
                     'recorded_at': datetime.utcnow().isoformat(),
-                    'event_date': datetime.utcnow().strftime('%Y-%m-%d')
+                    'event_date': get_ist_date()
                 }
 
                 if insert_qos_data(qos_data):
@@ -1835,6 +2548,137 @@ def qos_status():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/qos/delete', methods=['POST'])
+def qos_delete():
+    """Delete QoS data for a specific date to allow recollection"""
+    data = request.json or {}
+    target_date = data.get('date')
+
+    if not target_date:
+        return jsonify({'error': 'date required'}), 400
+
+    try:
+        client = get_bq_client()
+        query = f"""
+        DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_QOS_TABLE}`
+        WHERE event_date = '{target_date}'
+        """
+        job = client.query(query)
+        job.result()
+
+        return jsonify({
+            'success': True,
+            'message': f'Deleted QoS data for {target_date}',
+            'rows_deleted': job.num_dml_affected_rows
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/qos/update-camera', methods=['POST'])
+def qos_update_camera():
+    """Update camera_on_count for existing QoS records from Dashboard API"""
+    data = request.json or {}
+    target_date = data.get('date')
+    meeting_uuid = data.get('meeting_uuid')
+
+    if not target_date:
+        return jsonify({'error': 'date required'}), 400
+
+    try:
+        client = get_bq_client()
+
+        # Get meeting UUID and ID if not provided
+        meeting_id = data.get('meeting_id')
+        if not meeting_uuid:
+            query = f"""
+            SELECT DISTINCT meeting_uuid, meeting_id
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}`
+            WHERE event_date = '{target_date}'
+              AND meeting_uuid IS NOT NULL
+            LIMIT 1
+            """
+            results = list(client.query(query).result())
+            if not results:
+                return jsonify({'error': f'No meeting found for {target_date}'}), 404
+            meeting_uuid = results[0].meeting_uuid
+            meeting_id = results[0].meeting_id
+
+        # MUST use numeric meeting_id for Dashboard API - UUID does NOT work!
+        if not meeting_id or not str(meeting_id).replace('-', '').isdigit():
+            return jsonify({'error': 'No numeric meeting_id available - Dashboard QoS API requires numeric ID'}), 400
+
+        print(f"[UpdateCamera] Fetching camera data for meeting using numeric ID: {meeting_id}")
+
+        # Get camera data from Dashboard QoS API
+        camera_data_map = {}
+        try:
+            camera_participants = zoom_api.get_meeting_participants_qos(meeting_id)
+            for cp in camera_participants:
+                user_name = cp.get('user_name', '')
+                email = cp.get('email', '')
+                camera_on_count = cp.get('camera_on_count', 0)
+                camera_on_minutes = cp.get('camera_on_minutes', 0)
+                camera_on_timestamps = cp.get('camera_on_timestamps', [])
+                key = f"{user_name}|{email}".lower()
+                camera_data_map[key] = {
+                    'count': camera_on_count,
+                    'minutes': camera_on_minutes,
+                    'intervals': format_camera_intervals(camera_on_timestamps)
+                }
+            print(f"[UpdateCamera] Got camera data for {len(camera_data_map)} participants")
+        except Exception as ce:
+            return jsonify({'error': f'Camera API error: {ce}'}), 500
+
+        # Update each participant's camera data
+        updated = 0
+        for key, camera_info in camera_data_map.items():
+            count = camera_info.get('count', 0)
+            minutes = camera_info.get('minutes', 0)
+            intervals = camera_info.get('intervals', '').replace("'", "''")  # Escape quotes for SQL
+
+            if count > 0 or minutes > 0:
+                parts = key.split('|')
+                name = parts[0] if parts else ''
+                email = parts[1] if len(parts) > 1 else ''
+
+                update_query = f"""
+                UPDATE `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_QOS_TABLE}`
+                SET camera_on_count = @count,
+                    camera_on_minutes = @minutes,
+                    camera_on_intervals = @intervals
+                WHERE event_date = @target_date
+                  AND LOWER(participant_name) = @name
+                  AND LOWER(participant_email) = @email
+                """
+                job_config = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("count", "INT64", count),
+                        bigquery.ScalarQueryParameter("minutes", "FLOAT64", minutes),
+                        bigquery.ScalarQueryParameter("intervals", "STRING", intervals),
+                        bigquery.ScalarQueryParameter("target_date", "STRING", target_date),
+                        bigquery.ScalarQueryParameter("name", "STRING", name.lower()),
+                        bigquery.ScalarQueryParameter("email", "STRING", email.lower()),
+                    ]
+                )
+                try:
+                    job = client.query(update_query, job_config=job_config)
+                    job.result()
+                    updated += job.num_dml_affected_rows or 0
+                except Exception as ue:
+                    print(f"[UpdateCamera] Update error for {name}: {ue}")
+
+        return jsonify({
+            'success': True,
+            'message': f'Updated camera data for {target_date}',
+            'meeting_uuid': meeting_uuid,
+            'participants_with_camera': len([k for k, v in camera_data_map.items() if v.get('count', 0) > 0]),
+            'rows_updated': updated
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/qos/scheduled', methods=['POST'])
 def qos_scheduled_collection():
     """
@@ -1857,9 +2701,9 @@ def qos_scheduled_collection():
     try:
         client = get_bq_client()
 
-        # Find meeting UUID(s) from participant_events for that date
+        # Find meeting UUID(s) and ID(s) from participant_events for that date
         query = f"""
-        SELECT DISTINCT meeting_uuid
+        SELECT DISTINCT meeting_uuid, meeting_id
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}`
         WHERE event_date = '{target_date}'
           AND meeting_uuid IS NOT NULL
@@ -1875,8 +2719,9 @@ def qos_scheduled_collection():
                 'date': target_date
             }), 404
 
-        meeting_uuids = [row.meeting_uuid for row in results]
-        print(f"[ScheduledQoS] Found {len(meeting_uuids)} meeting(s): {meeting_uuids}")
+        # Store both UUID and numeric ID
+        meetings = [(row.meeting_uuid, row.meeting_id) for row in results]
+        print(f"[ScheduledQoS] Found {len(meetings)} meeting(s)")
 
         # Check if QoS already collected for this date
         check_query = f"""
@@ -1901,10 +2746,37 @@ def qos_scheduled_collection():
         total_errors = 0
         results_detail = []
 
-        for meeting_uuid in meeting_uuids:
-            print(f"[ScheduledQoS] Collecting for meeting: {meeting_uuid}")
+        for meeting_uuid, meeting_id in meetings:
+            print(f"[ScheduledQoS] Collecting for meeting: {meeting_uuid} (ID: {meeting_id})")
 
             try:
+                # First, collect camera data from Dashboard QoS API
+                camera_data_map = {}
+                try:
+                    # MUST use numeric meeting_id for Dashboard API - UUID does NOT work!
+                    if not meeting_id or not str(meeting_id).replace('-', '').isdigit():
+                        print(f"[ScheduledQoS] WARNING: No numeric meeting_id for {meeting_uuid}, skipping camera QoS")
+                        camera_participants = []
+                    else:
+                        print(f"[ScheduledQoS] Collecting camera data via Dashboard QoS API using numeric ID: {meeting_id}")
+                        camera_participants = zoom_api.get_meeting_participants_qos(meeting_id)
+                    for cp in camera_participants:
+                        user_name = cp.get('user_name', '')
+                        email = cp.get('email', '')
+                        camera_on_count = cp.get('camera_on_count', 0)
+                        camera_on_minutes = cp.get('camera_on_minutes', 0)
+                        camera_on_timestamps = cp.get('camera_on_timestamps', [])
+                        key = f"{user_name}|{email}".lower()
+                        camera_data_map[key] = {
+                            'count': camera_on_count,
+                            'minutes': camera_on_minutes,
+                            'timestamps': camera_on_timestamps,
+                            'intervals': format_camera_intervals(camera_on_timestamps)
+                        }
+                    print(f"[ScheduledQoS] Got camera data for {len(camera_data_map)} participants")
+                except Exception as ce:
+                    print(f"[ScheduledQoS] Camera collection error (non-fatal): {ce}")
+
                 participants = zoom_api.get_past_meeting_participants(meeting_uuid)
 
                 if not participants:
@@ -1934,6 +2806,13 @@ def qos_scheduled_collection():
                         duration_seconds = safe_int(p.get('duration', 0))
                         duration_minutes = duration_seconds // 60 if duration_seconds > 0 else 0
 
+                        # Look up camera data (now a dict with count, minutes, intervals)
+                        # Look up camera data using fuzzy matching
+                        camera_info = find_camera_data(camera_data_map, participant_name, participant_email)
+                        camera_on_count = camera_info.get('count', 0)
+                        camera_on_minutes = camera_info.get('minutes', 0)
+                        camera_on_intervals = camera_info.get('intervals', '')
+
                         qos_data = {
                             'qos_id': str(uuid_lib.uuid4()),
                             'meeting_uuid': safe_str(meeting_uuid),
@@ -1944,6 +2823,9 @@ def qos_scheduled_collection():
                             'leave_time': safe_str(p.get('leave_time', '')),
                             'duration_minutes': duration_minutes,
                             'attentiveness_score': str(p.get('attentiveness_score', '')),
+                            'camera_on_count': camera_on_count,
+                            'camera_on_minutes': camera_on_minutes,
+                            'camera_on_intervals': camera_on_intervals,
                             'recorded_at': datetime.utcnow().isoformat(),
                             'event_date': target_date  # Use target date, not today
                         }
@@ -1993,7 +2875,7 @@ def qos_scheduled_collection():
         return jsonify({
             'success': True,
             'date': target_date,
-            'meetings_processed': len(meeting_uuids),
+            'meetings_processed': len(meetings),
             'total_collected': total_collected,
             'total_errors': total_errors,
             'cleanup_deleted': cleanup_deleted,
@@ -2073,6 +2955,68 @@ def debug_state():
     })
 
 
+@app.route('/debug/rooms', methods=['GET'])
+def debug_rooms():
+    """Get all participants grouped by room with names - for accuracy verification"""
+    today = get_ist_date()
+
+    # Query BigQuery for latest room each participant is in
+    query = f"""
+    WITH latest_room_events AS (
+      SELECT
+        participant_name,
+        participant_email,
+        room_name,
+        event_type,
+        event_timestamp,
+        ROW_NUMBER() OVER (
+          PARTITION BY participant_id
+          ORDER BY event_timestamp DESC
+        ) as rn
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+      WHERE event_date = '{today}'
+        AND event_type IN ('breakout_room_joined', 'breakout_room_left')
+        AND participant_name NOT LIKE '%Scout%'
+    ),
+    current_rooms AS (
+      SELECT
+        participant_name,
+        CASE
+          WHEN event_type = 'breakout_room_joined' THEN room_name
+          ELSE 'Main Room'
+        END as current_room
+      FROM latest_room_events
+      WHERE rn = 1
+    )
+    SELECT current_room, STRING_AGG(participant_name, ', ' ORDER BY participant_name) as participants
+    FROM current_rooms
+    GROUP BY current_room
+    ORDER BY current_room
+    """
+
+    try:
+        client = get_bq_client()
+        results = list(client.query(query).result())
+
+        rooms = {}
+        total = 0
+        for row in results:
+            room = row.current_room or 'Unknown'
+            participants = row.participants.split(', ') if row.participants else []
+            rooms[room] = participants
+            total += len(participants)
+
+        return jsonify({
+            'meeting_id': meeting_state.meeting_id,
+            'date': today,
+            'total_rooms': len(rooms),
+            'total_participants': total,
+            'rooms': rooms
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/debug/reset', methods=['POST'])
 def debug_reset():
     """Reset meeting state (for testing)"""
@@ -2103,7 +3047,7 @@ def test_bigquery():
         client = get_bq_client()
 
         # Test each table - use partition filter for tables that require it
-        today = datetime.utcnow().strftime('%Y-%m-%d')
+        today = get_ist_date()
 
         for table_name, table_var in [
             ('participant_events', BQ_EVENTS_TABLE),
@@ -2145,7 +3089,7 @@ def test_webhook_insert():
         'event_id': str(uuid_lib.uuid4()),
         'event_type': test_data.get('event_type', 'test_event'),
         'event_timestamp': datetime.utcnow().isoformat(),
-        'event_date': datetime.utcnow().strftime('%Y-%m-%d'),
+        'event_date': get_ist_date(),
         'meeting_id': test_data.get('meeting_id', 'test_meeting_123'),
         'meeting_uuid': test_data.get('meeting_uuid', 'test_uuid_123'),
         'participant_id': test_data.get('participant_id', 'test_participant'),
@@ -2187,7 +3131,7 @@ def test_qos_insert():
         'duration_minutes': test_data.get('duration_minutes', 45),
         'attentiveness_score': test_data.get('attentiveness_score', '95'),
         'recorded_at': datetime.utcnow().isoformat(),
-        'event_date': datetime.utcnow().strftime('%Y-%m-%d')
+        'event_date': get_ist_date()
     }
 
     print(f"[TEST] Inserting test QoS: {json.dumps(qos_event, indent=2)}")
@@ -2225,13 +3169,15 @@ def test_camera_qos():
             'hint': 'POST with {"meeting_id": "your_meeting_id"}'
         }), 400
 
-    print(f"[TestCameraQoS] Fetching camera data for meeting: {meeting_id}")
+    # Page limit for quick searches (default 20 pages = 200 participants)
+    page_limit = data.get('page_limit', 20)
+    print(f"[TestCameraQoS] Fetching camera data for meeting: {meeting_id} (max {page_limit} pages)")
 
     try:
         # Optional search parameter
         search_name = data.get('search', '').lower()
 
-        participants = zoom_api.get_meeting_participants_qos(meeting_id)
+        participants = zoom_api.get_meeting_participants_qos(meeting_id, max_pages=page_limit)
 
         if not participants:
             return jsonify({
@@ -2240,9 +3186,20 @@ def test_camera_qos():
                 'meeting_id': meeting_id
             }), 404
 
+        # Get sample raw QoS entry for debugging
+        sample_raw_qos = None
+        if participants and participants[0].get('user_qos'):
+            sample_raw_qos = participants[0]['user_qos'][0]
+
         # Format results
         camera_data = []
         for p in participants:
+            camera_on_timestamps = p.get('camera_on_timestamps', [])
+            user_qos = p.get('user_qos', [])
+
+            # Check if any video_output exists in user_qos
+            has_video_output = any(qe.get('video_output') for qe in user_qos)
+
             camera_data.append({
                 'user_id': p.get('user_id'),
                 'user_name': p.get('user_name'),
@@ -2251,7 +3208,11 @@ def test_camera_qos():
                 'leave_time': p.get('leave_time'),
                 'camera_on_periods': p.get('camera_on_periods', []),
                 'camera_on_count': p.get('camera_on_count', 0),
-                'raw_user_qos_count': len(p.get('user_qos', []))
+                'camera_on_minutes': p.get('camera_on_minutes', 0),
+                'camera_on_timestamps': camera_on_timestamps,
+                'camera_on_intervals_ist': format_camera_intervals(camera_on_timestamps),
+                'raw_user_qos_count': len(user_qos),
+                'has_video_output': has_video_output
             })
 
         # Filter by search if provided
@@ -2270,6 +3231,7 @@ def test_camera_qos():
             'success': True,
             'meeting_id': meeting_id,
             'total_participants': len(camera_data),
+            'sample_raw_qos_entry': sample_raw_qos,  # For debugging - see actual Zoom response
             'participants_with_camera': sum(1 for p in camera_data if p['camera_on_count'] > 0),
             'camera_data': camera_data[:50],  # Return 50 for preview, use search for specific
             'note': 'Use {"search": "name"} to find specific participant'
@@ -2302,6 +3264,7 @@ if __name__ == '__main__':
     print(f"GCP Project: {GCP_PROJECT_ID}")
     print(f"BigQuery Dataset: {BQ_DATASET}")
     print(f"Scout Bot Name: {SCOUT_BOT_NAME}")
+    print(f"Webhook Secret: {'configured (' + str(len(ZOOM_WEBHOOK_SECRET)) + ' chars)' if ZOOM_WEBHOOK_SECRET else 'NOT SET'}")
     print()
     print("FLOW:")
     print("1. Start meeting at 9 AM")

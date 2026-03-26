@@ -4,7 +4,9 @@ import { runCalibration } from '../services/zoomService';
 import {
   notifyCalibrationStart,
   sendRoomMapping,
-  notifyCalibrationComplete
+  notifyCalibrationComplete,
+  verifyRoomMapping,
+  waitForWebhookConfirmation
 } from '../services/apiService';
 import StatusMessage from './StatusMessage';
 import ProgressIndicator from './ProgressIndicator';
@@ -41,6 +43,7 @@ function CalibrationPanel() {
   const [totalRooms, setTotalRooms] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
   const [debugLogs, setDebugLogs] = useState([]);
+  const [failedVerifications, setFailedVerifications] = useState([]);  // Rooms that failed backend verification
 
   const handleStartCalibration = useCallback(async () => {
     if (!isConfigured) {
@@ -62,6 +65,7 @@ function CalibrationPanel() {
       setCurrentRoom(-1);
       setErrorMessage('');
       setDebugLogs([]);
+      setFailedVerifications([]);
 
       // Get meeting info
       const meetingUUID = await getMeetingUUID();
@@ -143,6 +147,31 @@ function CalibrationPanel() {
           // Log first room mapped (SDK response)
           if (progress.step === 'room_mapped' && progress.currentRoom === 1) {
             setDebugLogs(prev => [...prev, `SDK RESPONSE: ${JSON.stringify(progress.mapping)}`]);
+          }
+          // CRITICAL: After SDK verification succeeds, notify backend to save mapping to BigQuery
+          if (progress.step === 'room_mapped' && progress.verified) {
+            const verifyResult = await verifyRoomMapping(meetingInfo.meetingId, progress.mapping.roomName);
+            if (verifyResult.success) {
+              setDebugLogs(prev => [...prev, `✓ VERIFIED & SAVED: ${progress.mapping.roomName}`]);
+            } else {
+              // This can happen if webhook didn't arrive in time - track for potential retry
+              setDebugLogs(prev => [...prev, `⚠️ SDK verified but webhook missing: ${progress.mapping.roomName} (${verifyResult.error || 'unknown error'})`]);
+              setFailedVerifications(prev => [...prev, {
+                roomName: progress.mapping.roomName,
+                roomUUID: progress.mapping.roomUUID,
+                error: verifyResult.error || 'Webhook not received in time'
+              }]);
+            }
+          }
+          // Log verification steps
+          if (progress.step === 'verifying_location') {
+            setDebugLogs(prev => [...prev, `VERIFYING: ${progress.message}`]);
+          }
+          if (progress.step === 'verification_mismatch') {
+            setDebugLogs(prev => [...prev, `⚠️ MISMATCH: ${progress.message}`]);
+          }
+          if (progress.step === 'verification_failed') {
+            setDebugLogs(prev => [...prev, `❌ VERIFY FAILED: ${progress.message}`]);
           }
         },
         onRoomMapped: (mapping) => {
@@ -254,8 +283,13 @@ function CalibrationPanel() {
           mappings.push({ roomUUID: cleanUUID, roomName, roomIndex: i });
           setMappedRooms([...mappings]);
 
-          // Wait 5 seconds for webhook to arrive and be processed
-          await new Promise(resolve => setTimeout(resolve, 5000));
+          // Poll for webhook confirmation instead of fixed wait
+          const confirmation = await waitForWebhookConfirmation(roomName, 15000, 1000);
+          if (confirmation.confirmed) {
+            setDebugLogs(prev => [...prev, `Webhook confirmed for: ${roomName}`]);
+          } else {
+            setDebugLogs(prev => [...prev, `Webhook timeout for: ${roomName} (will continue)`]);
+          }
         } catch (moveErr) {
           setDebugLogs(prev => [...prev, `ERROR moving to room ${i + 1}: ${moveErr.message}`]);
         }
@@ -282,6 +316,54 @@ function CalibrationPanel() {
     }
   }, [isConfigured, meetingContext, userContext, getMeetingUUID, getBreakoutRooms, changeMyBreakoutRoom]);
 
+  // Retry only the rooms that failed backend verification
+  const handleRetryFailed = useCallback(async () => {
+    if (failedVerifications.length === 0) return;
+
+    const meetingId = meetingContext?.meetingID;
+    setStatusMessage(`Retrying ${failedVerifications.length} failed room(s)...`);
+    setDebugLogs(prev => [...prev, `=== RETRYING ${failedVerifications.length} FAILED ROOMS ===`]);
+
+    const stillFailed = [];
+    for (const failed of failedVerifications) {
+      try {
+        // Re-send the mapping to backend
+        const mapping = {
+          roomUUID: failed.roomUUID,
+          roomName: failed.roomName,
+          roomIndex: 0,
+          timestamp: new Date().toISOString()
+        };
+        const meetingUUID = await getMeetingUUID();
+        await sendRoomMapping(meetingId, meetingUUID, [mapping]);
+
+        // Wait for webhook confirmation
+        const confirmation = await waitForWebhookConfirmation(failed.roomName, 10000, 1000);
+        if (confirmation.confirmed) {
+          // Try verification again
+          const verifyResult = await verifyRoomMapping(meetingId, failed.roomName);
+          if (verifyResult.success) {
+            setDebugLogs(prev => [...prev, `RETRY SUCCESS: ${failed.roomName}`]);
+            continue;
+          }
+        }
+        // Still failed
+        stillFailed.push(failed);
+        setDebugLogs(prev => [...prev, `RETRY FAILED: ${failed.roomName}`]);
+      } catch (err) {
+        stillFailed.push(failed);
+        setDebugLogs(prev => [...prev, `RETRY ERROR: ${failed.roomName}: ${err.message}`]);
+      }
+    }
+
+    setFailedVerifications(stillFailed);
+    if (stillFailed.length === 0) {
+      setStatusMessage('All retries succeeded!');
+    } else {
+      setStatusMessage(`${stillFailed.length} room(s) still failed after retry`);
+    }
+  }, [failedVerifications, meetingContext, getMeetingUUID]);
+
   const handleReset = useCallback(() => {
     setUiState(UI_STATES.IDLE);
     setStatusMessage('');
@@ -290,6 +372,7 @@ function CalibrationPanel() {
     setCurrentRoom(-1);
     setTotalRooms(0);
     setErrorMessage('');
+    setFailedVerifications([]);
   }, []);
 
   // SDK not ready yet
@@ -450,6 +533,36 @@ function CalibrationPanel() {
         </div>
       )}
 
+      {/* Failed Verifications Warning */}
+      {failedVerifications.length > 0 && (
+        <div style={styles.warningSection}>
+          <h3 style={{...styles.sectionTitle, color: '#ffaa00'}}>
+            ⚠️ {failedVerifications.length} Room(s) Missing Backend Verification
+          </h3>
+          <p style={styles.warningText}>
+            These rooms were verified by SDK but webhook UUID wasn't saved to BigQuery.
+            The report may show room UUIDs instead of names for these rooms.
+          </p>
+          <ul style={styles.warningList}>
+            {failedVerifications.map((f, i) => (
+              <li key={i}>{f.roomName}: {f.error}</li>
+            ))}
+          </ul>
+          <button
+            style={{...styles.secondaryButton, borderColor: '#ffaa00', color: '#ffaa00', marginRight: '8px'}}
+            onClick={handleRetryFailed}
+          >
+            Retry Failed Only
+          </button>
+          <button
+            style={{...styles.secondaryButton, borderColor: '#666', color: '#888'}}
+            onClick={handleStartCalibration}
+          >
+            Re-run All
+          </button>
+        </div>
+      )}
+
       {/* Debug Logs */}
       {debugLogs.length > 0 && (
         <div style={styles.section}>
@@ -548,6 +661,26 @@ const styles = {
     overflow: 'auto',
     maxHeight: '200px',
     fontFamily: 'Monaco, monospace'
+  },
+  warningSection: {
+    backgroundColor: 'rgba(255, 170, 0, 0.1)',
+    border: '1px solid #ffaa00',
+    borderRadius: '8px',
+    padding: '12px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px'
+  },
+  warningText: {
+    color: '#ccc',
+    fontSize: '12px',
+    margin: 0
+  },
+  warningList: {
+    color: '#ffaa00',
+    fontSize: '12px',
+    margin: 0,
+    paddingLeft: '20px'
   }
 };
 

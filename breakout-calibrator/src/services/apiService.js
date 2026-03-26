@@ -137,10 +137,69 @@ export async function checkBackendHealth() {
   }
 }
 
+/**
+ * Check if a specific room's webhook has been received
+ * Used to confirm webhook before moving to next room
+ */
+export async function checkRoomWebhookReceived(roomName) {
+  try {
+    const response = await api.get(`/calibration/pending?room_name=${encodeURIComponent(roomName)}`);
+    return response.data;
+  } catch (err) {
+    console.error('Failed to check room webhook:', err);
+    return { matched: false };
+  }
+}
+
+/**
+ * Poll until webhook is received for a room (with timeout)
+ * @param {string} roomName - Room name to check
+ * @param {number} timeoutMs - Maximum time to wait (default 15 seconds)
+ * @param {number} pollIntervalMs - Poll interval (default 1 second)
+ */
+export async function waitForWebhookConfirmation(roomName, timeoutMs = 15000, pollIntervalMs = 1000) {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeoutMs) {
+    const result = await checkRoomWebhookReceived(roomName);
+    if (result.matched) {
+      console.log(`Webhook confirmed for room: ${roomName}`);
+      return { confirmed: true, ...result };
+    }
+    // Wait before next poll
+    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+  }
+
+  console.warn(`Webhook timeout for room: ${roomName}`);
+  return { confirmed: false, timeout: true };
+}
+
+/**
+ * Notify backend that a room mapping has been VERIFIED by SDK
+ * This triggers BigQuery save (only verified mappings are saved)
+ */
+export async function verifyRoomMapping(meetingId, roomName) {
+  try {
+    const response = await api.post('/calibration/verify', {
+      meeting_id: meetingId,
+      room_name: roomName
+    });
+    console.log(`[API] Verified mapping for room: ${roomName}`);
+    return response.data;
+  } catch (err) {
+    console.error(`[API] Failed to verify mapping for ${roomName}:`, err);
+    // Don't throw - verification can continue without backend confirmation
+    return { success: false, error: err.message };
+  }
+}
+
 export default {
   notifyCalibrationStart,
   sendRoomMapping,
   notifyCalibrationComplete,
   getExistingMappings,
-  checkBackendHealth
+  checkBackendHealth,
+  checkRoomWebhookReceived,
+  waitForWebhookConfirmation,
+  verifyRoomMapping
 };

@@ -15,6 +15,9 @@ google-cloud-storage==2.14.0
 # HTTP Requests (Zoom API)
 requests==2.31.0
 
+# Timezone handling
+pytz==2024.1
+
 # Email Reports (SendGrid)
 sendgrid==6.10.0
 
