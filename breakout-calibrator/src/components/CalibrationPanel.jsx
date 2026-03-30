@@ -1,12 +1,16 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import useZoomSdk from '../hooks/useZoomSdk';
 import { runCalibration } from '../services/zoomService';
 import {
   notifyCalibrationStart,
-  sendRoomMapping,
   notifyCalibrationComplete,
-  verifyRoomMapping,
-  waitForWebhookConfirmation
+  abortCalibration,
+  waitForWebhookConfirmation,
+  resetCalibration,
+  getLiveRooms,
+  getMappingSummary,
+  prepareRoomRecalibration,
+  completeRoomRecalibration
 } from '../services/apiService';
 import StatusMessage from './StatusMessage';
 import ProgressIndicator from './ProgressIndicator';
@@ -17,24 +21,31 @@ const UI_STATES = {
   CHECKING: 'checking',
   CALIBRATING: 'calibrating',
   COMPLETE: 'complete',
-  ERROR: 'error'
+  ERROR: 'error',
+  RECALIBRATING: 'recalibrating'
 };
+
+const DELAY_OPTIONS = [
+  { label: 'Fast (10s)', value: 10000, desc: 'Quick but may miss webhooks' },
+  { label: 'Normal (30s)', value: 30000, desc: 'Recommended for most meetings' },
+  { label: 'Slow (60s)', value: 60000, desc: 'Best accuracy' },
+  { label: 'Very Slow (90s)', value: 90000, desc: 'Maximum reliability' }
+];
 
 function CalibrationPanel() {
   const {
     isConfigured,
     error: sdkError,
     meetingContext,
-    userContext,
     isHost,
     getBreakoutRooms,
     getParticipants,
     moveParticipantToRoom,
     moveToMainRoom,
-    getMeetingUUID,
-    changeMyBreakoutRoom
+    getMeetingUUID
   } = useZoomSdk();
 
+  // UI State
   const [uiState, setUiState] = useState(UI_STATES.IDLE);
   const [statusMessage, setStatusMessage] = useState('');
   const [rooms, setRooms] = useState([]);
@@ -43,135 +54,167 @@ function CalibrationPanel() {
   const [totalRooms, setTotalRooms] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
   const [debugLogs, setDebugLogs] = useState([]);
-  const [failedVerifications, setFailedVerifications] = useState([]);  // Rooms that failed backend verification
 
-  const handleStartCalibration = useCallback(async () => {
-    if (!isConfigured) {
-      setErrorMessage('Zoom SDK not configured');
-      setUiState(UI_STATES.ERROR);
-      return;
+  // Failure tracking
+  const [failedRoomIndex, setFailedRoomIndex] = useState(-1);
+  const [failedRoomName, setFailedRoomName] = useState('');
+  const [failedReason, setFailedReason] = useState('');
+
+  // Settings
+  const [selectedDelay, setSelectedDelay] = useState(30000);
+
+  // Live View & Summary
+  const [liveRooms, setLiveRooms] = useState([]);
+  const [mappingSummary, setMappingSummary] = useState(null);
+  const [showLiveView, setShowLiveView] = useState(false);
+
+  // Recalibration
+  const [recalibratingRoom, setRecalibratingRoom] = useState(null);
+
+  // Resume support
+  const [resumeFromRoom, setResumeFromRoom] = useState(null);
+
+  // ETA
+  const [estimatedTime, setEstimatedTime] = useState(null);
+
+  // Calculate ETA when settings change
+  useEffect(() => {
+    if (rooms.length > 0) {
+      const totalMs = rooms.length * (selectedDelay + 8000);
+      const mins = Math.ceil(totalMs / 60000);
+      setEstimatedTime(`~${mins} min for ${rooms.length} rooms`);
     }
+  }, [rooms.length, selectedDelay]);
 
-    if (!isHost) {
-      setErrorMessage('Only hosts or co-hosts can run calibration');
+  // Check for existing calibration progress on mount
+  useEffect(() => {
+    const checkExistingProgress = async () => {
+      const meetingId = meetingContext?.meetingID;
+      if (!meetingId) return;
+      try {
+        const response = await fetch(`/calibration/status?meeting_id=${meetingId}`);
+        const data = await response.json();
+        if (data.calibration_in_progress && data.current_room_index > 0) {
+          setResumeFromRoom(data.current_room_index);
+          setTotalRooms(data.total_rooms || 66);
+        }
+      } catch (err) {
+        console.error('Failed to check calibration progress:', err);
+      }
+    };
+    checkExistingProgress();
+  }, [meetingContext]);
+
+  // Fetch live rooms
+  const refreshLiveRooms = useCallback(async () => {
+    const meetingId = meetingContext?.meetingID;
+    if (!meetingId) return;
+    try {
+      const data = await getLiveRooms(meetingId);
+      if (data.success) setLiveRooms(data.rooms || []);
+    } catch (err) {
+      console.error('Failed to fetch live rooms:', err);
+    }
+  }, [meetingContext]);
+
+  // Fetch mapping summary
+  const refreshMappingSummary = useCallback(async () => {
+    const meetingId = meetingContext?.meetingID;
+    if (!meetingId) return;
+    try {
+      const data = await getMappingSummary(meetingId);
+      if (data.success) setMappingSummary(data);
+    } catch (err) {
+      console.error('Failed to fetch mapping summary:', err);
+    }
+  }, [meetingContext]);
+
+  // Clear failure state
+  const clearFailure = useCallback(() => {
+    setFailedRoomIndex(-1);
+    setFailedRoomName('');
+    setFailedReason('');
+  }, []);
+
+  // Main calibration
+  const handleStartCalibration = useCallback(async (startFromRoom = 0) => {
+    if (!isConfigured || !isHost) {
+      setErrorMessage(!isConfigured ? 'Zoom SDK not configured' : 'Only hosts can run calibration');
       setUiState(UI_STATES.ERROR);
       return;
     }
 
     try {
       setUiState(UI_STATES.CHECKING);
-      setStatusMessage('Initializing calibration...');
+      setStatusMessage(startFromRoom > 0 ? `Resuming from room ${startFromRoom + 1}...` : 'Initializing...');
       setMappedRooms([]);
-      setCurrentRoom(-1);
+      setCurrentRoom(startFromRoom > 0 ? startFromRoom - 1 : -1);
       setErrorMessage('');
       setDebugLogs([]);
-      setFailedVerifications([]);
+      clearFailure();
+      setMappingSummary(null);
 
-      // Get meeting info
       const meetingUUID = await getMeetingUUID();
       const meetingId = meetingContext?.meetingID;
 
-      // Store meeting info for use in callbacks
-      const meetingInfo = { meetingId, meetingUUID };
-
-      // Notify backend - using Scout Bot mode
-      await notifyCalibrationStart(meetingId, meetingUUID, {
-        mode: 'scout_bot',
-        name: 'Scout Bot',
-        participantUUID: ''  // Will be found during calibration
-      });
-      setDebugLogs(prev => [...prev, `Notified backend: calibration started (Scout Bot mode)`]);
-
-      // Fetch rooms first to show in UI
       const breakoutRooms = await getBreakoutRooms();
       setRooms(breakoutRooms);
       setTotalRooms(breakoutRooms.length);
 
-      // DEBUG: Log first room object with all keys and values
-      if (breakoutRooms.length > 0) {
-        const room = breakoutRooms[0];
-        const keys = Object.keys(room).join(', ');
-        setDebugLogs(prev => [...prev, `ROOM KEYS: ${keys}`]);
-        // Log each key-value pair
-        for (const [key, value] of Object.entries(room)) {
-          setDebugLogs(prev => [...prev, `  ${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`]);
-        }
-      }
+      const remainingRooms = breakoutRooms.length - startFromRoom;
+      const etaMins = Math.ceil((remainingRooms * (selectedDelay + 8000)) / 60000);
+      setDebugLogs([
+        `=== CALIBRATION ${startFromRoom > 0 ? 'RESUMING' : 'STARTING'} ===`,
+        `Total Rooms: ${breakoutRooms.length}`,
+        startFromRoom > 0 ? `Resuming from: Room ${startFromRoom + 1}` : '',
+        `Remaining: ${remainingRooms} rooms`,
+        `Delay: ${selectedDelay / 1000}s per room`,
+        `ETA: ~${etaMins} minutes`
+      ].filter(Boolean));
 
-      // DEBUG: Get and log participants
-      const participants = await getParticipants();
-      setDebugLogs(prev => [...prev, `PARTICIPANTS (${participants.length}): ${JSON.stringify(participants.map(p => ({name: p.screenName || p.participantName || p.name, uuid: p.participantUUID || p.participantId})))}`]);
+      await notifyCalibrationStart(meetingId, meetingUUID, {
+        mode: 'scout_bot',
+        name: 'Scout Bot',
+        participantUUID: ''
+      }, breakoutRooms);
 
       setUiState(UI_STATES.CALIBRATING);
 
-      // Run calibration with BEFORE-MOVE mapping notification
       const result = await runCalibration({
         getBreakoutRooms,
         getParticipants,
         moveParticipantToRoom,
         moveToMainRoom,
-        onProgress: async (progress) => {
+        delayMs: selectedDelay,
+        startFromRoom: startFromRoom,
+        onProgress: (progress) => {
           setStatusMessage(progress.message);
           if (progress.currentRoom !== undefined) {
             setCurrentRoom(progress.currentRoom - 1);
           }
-          // Log bot found info
-          if (progress.step === 'bot_found') {
-            setDebugLogs(prev => [...prev, `BOT FOUND: ${progress.message}`]);
-            setDebugLogs(prev => [...prev, `BOT UUID: ${progress.botId}`]);
-          }
-          // CRITICAL FIX: Send mapping to backend BEFORE moving Scout Bot
-          // This tells the backend which room Scout Bot is about to enter
-          if (progress.step === 'moving_to_room') {
-            const mapping = {
-              roomUUID: progress.roomUUID,
-              roomName: progress.roomName,
-              roomIndex: progress.currentRoom - 1,
-              timestamp: new Date().toISOString()
-            };
-            try {
-              await sendRoomMapping(meetingInfo.meetingId, meetingInfo.meetingUUID, [mapping]);
-              setDebugLogs(prev => [...prev, `SENT MAPPING BEFORE MOVE: ${progress.roomName}`]);
-            } catch (err) {
-              setDebugLogs(prev => [...prev, `WARNING: Failed to send mapping: ${err.message}`]);
-            }
 
-            // Log first move attempt with full details
-            if (progress.currentRoom === 1) {
-              setDebugLogs(prev => [...prev, `FIRST MOVE: ${progress.message}`]);
-              setDebugLogs(prev => [...prev, `CALLING SDK WITH:`]);
-              setDebugLogs(prev => [...prev, `  participantUUID: ${progress.botUUID}`]);
-              setDebugLogs(prev => [...prev, `  breakoutRoomUUID: ${progress.roomUUID}`]);
-            }
+          if (progress.step === 'bot_found') {
+            setDebugLogs(prev => [...prev, `BOT: ${progress.message}`]);
           }
-          // Log first room mapped (SDK response)
-          if (progress.step === 'room_mapped' && progress.currentRoom === 1) {
-            setDebugLogs(prev => [...prev, `SDK RESPONSE: ${JSON.stringify(progress.mapping)}`]);
+
+          if (progress.step === 'moving_to_room') {
+            setDebugLogs(prev => [...prev, `[${progress.currentRoom}/${progress.totalRooms}] Moving: ${progress.roomName}`]);
           }
-          // CRITICAL: After SDK verification succeeds, notify backend to save mapping to BigQuery
-          if (progress.step === 'room_mapped' && progress.verified) {
-            const verifyResult = await verifyRoomMapping(meetingInfo.meetingId, progress.mapping.roomName);
-            if (verifyResult.success) {
-              setDebugLogs(prev => [...prev, `✓ VERIFIED & SAVED: ${progress.mapping.roomName}`]);
-            } else {
-              // This can happen if webhook didn't arrive in time - track for potential retry
-              setDebugLogs(prev => [...prev, `⚠️ SDK verified but webhook missing: ${progress.mapping.roomName} (${verifyResult.error || 'unknown error'})`]);
-              setFailedVerifications(prev => [...prev, {
-                roomName: progress.mapping.roomName,
-                roomUUID: progress.mapping.roomUUID,
-                error: verifyResult.error || 'Webhook not received in time'
-              }]);
-            }
+
+          if (progress.step === 'waiting_webhook') {
+            setDebugLogs(prev => [...prev, `  ... waiting for webhook`]);
           }
-          // Log verification steps
-          if (progress.step === 'verifying_location') {
-            setDebugLogs(prev => [...prev, `VERIFYING: ${progress.message}`]);
+
+          if (progress.step === 'room_mapped' && progress.webhookConfirmed) {
+            setDebugLogs(prev => [...prev, `  OK: ${progress.mapping.roomName}`]);
           }
-          if (progress.step === 'verification_mismatch') {
-            setDebugLogs(prev => [...prev, `⚠️ MISMATCH: ${progress.message}`]);
-          }
-          if (progress.step === 'verification_failed') {
-            setDebugLogs(prev => [...prev, `❌ VERIFY FAILED: ${progress.message}`]);
+
+          if (progress.step === 'room_error') {
+            const roomIdx = (progress.currentRoom || 1) - 1;
+            setFailedRoomIndex(roomIdx);
+            setFailedRoomName(progress.roomName || `Room ${roomIdx + 1}`);
+            setFailedReason(progress.error || 'Unknown error');
+            setDebugLogs(prev => [...prev, `  FAILED: ${progress.message}`]);
           }
         },
         onRoomMapped: (mapping) => {
@@ -179,191 +222,117 @@ function CalibrationPanel() {
         }
       });
 
-      // Notify completion (mappings already sent before each move)
-      await notifyCalibrationComplete(meetingId, meetingUUID, result);
-      setDebugLogs(prev => [...prev, `Notified backend: calibration complete`]);
+      if (result.success) {
+        await notifyCalibrationComplete(meetingId, meetingUUID, result);
+        setDebugLogs(prev => [...prev, `=== COMPLETE: ${result.mappedRooms}/${result.totalRooms} ===`]);
+        setUiState(UI_STATES.COMPLETE);
+        setStatusMessage(`All ${result.mappedRooms} rooms mapped successfully`);
+        setTimeout(() => refreshMappingSummary(), 1000);
+      } else {
+        // Calibration stopped midway - abort and clean up partial mappings
+        const failedAt = result.mappedRooms;
+        const failedError = result.errors[0]?.error || 'Unknown error';
+        const failedName = result.errors[0]?.roomName || `Room ${failedAt + 1}`;
 
-      setUiState(UI_STATES.COMPLETE);
-      setStatusMessage(`Successfully mapped ${result.mappedRooms} of ${result.totalRooms} rooms`);
+        setDebugLogs(prev => [...prev,
+          `=== FAILED at room ${failedAt + 1}/${result.totalRooms} ===`,
+          `Room: ${failedName}`,
+          `Error: ${failedError}`,
+          `Cleaning up ${failedAt} partial mappings...`
+        ]);
+
+        await abortCalibration(meetingId);
+
+        setDebugLogs(prev => [...prev, `All partial mappings deleted. Ready to retry.`]);
+        setErrorMessage(`Calibration stopped at room ${failedAt + 1}: ${failedError}`);
+        setFailedRoomIndex(failedAt);
+        setFailedRoomName(failedName);
+        setFailedReason(failedError);
+        setUiState(UI_STATES.ERROR);
+      }
       setCurrentRoom(-1);
 
     } catch (err) {
       console.error('Calibration failed:', err);
+      const meetingId2 = meetingContext?.meetingID;
+      if (meetingId2) await abortCalibration(meetingId2);
       setErrorMessage(err.message || 'Calibration failed');
-      setDebugLogs(prev => [...prev, `ERROR: ${err.message}`]);
-      setDebugLogs(prev => [...prev, `ERROR CODE: ${err.code || 'none'}`]);
-      setDebugLogs(prev => [...prev, `FULL ERROR: ${JSON.stringify(err)}`]);
+      setDebugLogs(prev => [...prev, `ERROR: ${err.message}`, `Partial mappings cleaned up`]);
       setUiState(UI_STATES.ERROR);
       setCurrentRoom(-1);
     }
-  }, [
-    isConfigured,
-    isHost,
-    meetingContext,
-    getMeetingUUID,
-    getBreakoutRooms,
-    getParticipants,
-    moveParticipantToRoom,
-    moveToMainRoom
-  ]);
+  }, [isConfigured, isHost, meetingContext, getMeetingUUID, getBreakoutRooms, getParticipants, moveParticipantToRoom, moveToMainRoom, selectedDelay, refreshMappingSummary, clearFailure]);
 
-  // Self-calibration: Move YOURSELF through rooms (when YOU are the scout bot)
-  const handleSelfCalibration = useCallback(async () => {
-    if (!isConfigured) {
-      setErrorMessage('Zoom SDK not configured');
-      setUiState(UI_STATES.ERROR);
-      return;
-    }
-
+  // Full reset (abort + clear all BigQuery mappings)
+  const handleFullReset = useCallback(async () => {
+    const meetingId = meetingContext?.meetingID;
     try {
-      setUiState(UI_STATES.CALIBRATING);
-      setStatusMessage('Self-calibration: Moving through rooms...');
+      setStatusMessage('Resetting...');
+      if (meetingId) {
+        await abortCalibration(meetingId);
+        await resetCalibration(meetingId, true);
+      }
+      setUiState(UI_STATES.IDLE);
+      setStatusMessage('');
+      setRooms([]);
       setMappedRooms([]);
       setCurrentRoom(-1);
+      setTotalRooms(0);
       setErrorMessage('');
-      setDebugLogs(['=== SELF-CALIBRATION MODE ===', 'You will move through each room']);
-
-      // Get meeting info
-      const meetingUUID = await getMeetingUUID();
-      const meetingId = meetingContext?.meetingID;
-
-      // Get current user's info for self-calibration
-      const myName = userContext?.screenName || userContext?.userName || 'Unknown User';
-      const myUUID = userContext?.participantUUID || userContext?.participantId || '';
-
-      setDebugLogs(prev => [...prev, `Self-calibration participant: ${myName} (UUID: ${myUUID})`]);
-
-      // Notify backend that calibration is starting - SELF mode with my info
-      await notifyCalibrationStart(meetingId, meetingUUID, {
-        mode: 'self',
-        name: myName,
-        participantUUID: myUUID
-      });
-      setDebugLogs(prev => [...prev, `Notified backend: calibration started (Self mode: ${myName})`]);
-
-      // Get rooms
-      const breakoutRooms = await getBreakoutRooms();
-      setRooms(breakoutRooms);
-      setTotalRooms(breakoutRooms.length);
-
-      setDebugLogs(prev => [...prev, `Found ${breakoutRooms.length} rooms`]);
-
-      const mappings = [];
-
-      // Move through each room
-      for (let i = 0; i < breakoutRooms.length; i++) {
-        const room = breakoutRooms[i];
-        const roomName = room.breakoutRoomName || room.name || `Room ${i + 1}`;
-        const roomUUID = room.breakoutRoomId || room.breakoutRoomUUID || room.uuid;
-        const cleanUUID = roomUUID ? roomUUID.replace(/[{}]/g, '') : roomUUID;
-
-        setStatusMessage(`Moving to room ${i + 1}/${breakoutRooms.length}: ${roomName}`);
-        setCurrentRoom(i);
-
-        if (i === 0) {
-          setDebugLogs(prev => [...prev, `First room UUID: ${roomUUID}`, `Cleaned UUID: ${cleanUUID}`]);
-        }
-
-        try {
-          // IMPORTANT: Send mapping to backend BEFORE moving
-          // This tells the backend which room the calibration participant is about to enter
-          const mapping = {
-            roomUUID: cleanUUID,
-            roomName: roomName,
-            roomIndex: i,
-            timestamp: new Date().toISOString()
-          };
-          await sendRoomMapping(meetingId, meetingUUID, [mapping]);
-          setDebugLogs(prev => [...prev, `Sent mapping to backend: ${roomName}`]);
-
-          // Now actually move to the room
-          const response = await changeMyBreakoutRoom(roomUUID);
-          setDebugLogs(prev => [...prev, `Room ${i + 1} response: ${JSON.stringify(response)}`]);
-
-          mappings.push({ roomUUID: cleanUUID, roomName, roomIndex: i });
-          setMappedRooms([...mappings]);
-
-          // Poll for webhook confirmation instead of fixed wait
-          const confirmation = await waitForWebhookConfirmation(roomName, 15000, 1000);
-          if (confirmation.confirmed) {
-            setDebugLogs(prev => [...prev, `Webhook confirmed for: ${roomName}`]);
-          } else {
-            setDebugLogs(prev => [...prev, `Webhook timeout for: ${roomName} (will continue)`]);
-          }
-        } catch (moveErr) {
-          setDebugLogs(prev => [...prev, `ERROR moving to room ${i + 1}: ${moveErr.message}`]);
-        }
-      }
-
-      // Notify backend that calibration is complete
-      await notifyCalibrationComplete(meetingId, meetingUUID, {
-        totalRooms: breakoutRooms.length,
-        mappedRooms: mappings.length,
-        success: true
-      });
-      setDebugLogs(prev => [...prev, `Notified backend: calibration complete`]);
-
-      setUiState(UI_STATES.COMPLETE);
-      setStatusMessage(`Self-calibration complete: ${mappings.length} rooms`);
-      setCurrentRoom(-1);
-
+      setDebugLogs(['=== RESET COMPLETE ===']);
+      clearFailure();
+      setLiveRooms([]);
+      setMappingSummary(null);
     } catch (err) {
-      console.error('Self-calibration failed:', err);
-      setErrorMessage(err.message || 'Self-calibration failed');
-      setDebugLogs(prev => [...prev, `ERROR: ${err.message}`]);
-      setUiState(UI_STATES.ERROR);
-      setCurrentRoom(-1);
+      setErrorMessage(`Reset failed: ${err.message}`);
     }
-  }, [isConfigured, meetingContext, userContext, getMeetingUUID, getBreakoutRooms, changeMyBreakoutRoom]);
+  }, [meetingContext, clearFailure]);
 
-  // Retry only the rooms that failed backend verification
-  const handleRetryFailed = useCallback(async () => {
-    if (failedVerifications.length === 0) return;
-
+  // Recalibrate specific room
+  const handleRecalibrateRoom = useCallback(async (room) => {
     const meetingId = meetingContext?.meetingID;
-    setStatusMessage(`Retrying ${failedVerifications.length} failed room(s)...`);
-    setDebugLogs(prev => [...prev, `=== RETRYING ${failedVerifications.length} FAILED ROOMS ===`]);
+    if (!meetingId) return;
 
-    const stillFailed = [];
-    for (const failed of failedVerifications) {
-      try {
-        // Re-send the mapping to backend
-        const mapping = {
-          roomUUID: failed.roomUUID,
-          roomName: failed.roomName,
-          roomIndex: 0,
-          timestamp: new Date().toISOString()
-        };
-        const meetingUUID = await getMeetingUUID();
-        await sendRoomMapping(meetingId, meetingUUID, [mapping]);
+    const roomName = room.roomName || room.expected_name;
+    try {
+      setRecalibratingRoom(room);
+      setUiState(UI_STATES.RECALIBRATING);
+      setStatusMessage(`Preparing: ${roomName}`);
+      setDebugLogs(prev => [...prev, `=== RECALIBRATING: ${roomName} ===`]);
 
-        // Wait for webhook confirmation
-        const confirmation = await waitForWebhookConfirmation(failed.roomName, 10000, 1000);
-        if (confirmation.confirmed) {
-          // Try verification again
-          const verifyResult = await verifyRoomMapping(meetingId, failed.roomName);
-          if (verifyResult.success) {
-            setDebugLogs(prev => [...prev, `RETRY SUCCESS: ${failed.roomName}`]);
-            continue;
+      const prepResult = await prepareRoomRecalibration(meetingId, roomName, room.roomUUID);
+      if (prepResult.success) {
+        setStatusMessage(`Move Scout Bot to "${roomName}" NOW`);
+        setDebugLogs(prev => [...prev, `Waiting for Scout Bot to join...`]);
+
+        const webhookResult = await waitForWebhookConfirmation(roomName, 120000, 2000);
+        if (webhookResult.confirmed) {
+          const completeResult = await completeRoomRecalibration(meetingId, roomName);
+          if (completeResult.success) {
+            setDebugLogs(prev => [...prev, `RECALIBRATION SUCCESS: ${roomName}`]);
+            setStatusMessage(`"${roomName}" recalibrated!`);
+            // Remove from failed state if it was the failed room
+            if (failedRoomName === roomName) clearFailure();
+            await refreshMappingSummary();
+          } else {
+            setDebugLogs(prev => [...prev, `FAILED: ${completeResult.error}`]);
+            setStatusMessage(`Failed: ${completeResult.error}`);
           }
+        } else {
+          setDebugLogs(prev => [...prev, `TIMEOUT: No webhook received for ${roomName}`]);
+          setStatusMessage(`Timeout - Scout Bot didn't join "${roomName}"`);
         }
-        // Still failed
-        stillFailed.push(failed);
-        setDebugLogs(prev => [...prev, `RETRY FAILED: ${failed.roomName}`]);
-      } catch (err) {
-        stillFailed.push(failed);
-        setDebugLogs(prev => [...prev, `RETRY ERROR: ${failed.roomName}: ${err.message}`]);
       }
+    } catch (err) {
+      setDebugLogs(prev => [...prev, `ERROR: ${err.message}`]);
+      setStatusMessage(`Error: ${err.message}`);
+    } finally {
+      setRecalibratingRoom(null);
+      setUiState(mappedRooms.length > 0 ? UI_STATES.COMPLETE : UI_STATES.IDLE);
     }
+  }, [meetingContext, refreshMappingSummary, mappedRooms.length, failedRoomName, clearFailure]);
 
-    setFailedVerifications(stillFailed);
-    if (stillFailed.length === 0) {
-      setStatusMessage('All retries succeeded!');
-    } else {
-      setStatusMessage(`${stillFailed.length} room(s) still failed after retry`);
-    }
-  }, [failedVerifications, meetingContext, getMeetingUUID]);
-
+  // Simple reset (UI only)
   const handleReset = useCallback(() => {
     setUiState(UI_STATES.IDLE);
     setStatusMessage('');
@@ -372,71 +341,28 @@ function CalibrationPanel() {
     setCurrentRoom(-1);
     setTotalRooms(0);
     setErrorMessage('');
-    setFailedVerifications([]);
-  }, []);
+    clearFailure();
+    setDebugLogs([]);
+    setMappingSummary(null);
+    setLiveRooms([]);
+  }, [clearFailure]);
 
-  // SDK not ready yet
+  // Render: SDK not ready
   if (!isConfigured) {
     return (
       <div style={styles.container}>
-        <div style={styles.header}>
-          <h2 style={styles.title}>Breakout Room Calibrator</h2>
-        </div>
-        <StatusMessage
-          status="checking"
-          message={sdkError || "Connecting to Zoom..."}
-        />
+        <h2 style={styles.title}>Breakout Room Calibrator</h2>
+        <StatusMessage status="checking" message={sdkError || "Connecting to Zoom..."} />
       </div>
     );
   }
 
-  // Not a host - show limited options (can still move self)
+  // Render: Not a host
   if (!isHost) {
     return (
       <div style={styles.container}>
-        <div style={styles.header}>
-          <h2 style={styles.title}>Breakout Room Calibrator</h2>
-          <span style={styles.meetingId}>Non-host mode</span>
-        </div>
-        <StatusMessage
-          status={uiState}
-          message={errorMessage || statusMessage || "You can move yourself through rooms"}
-        />
-
-        {/* Progress */}
-        {uiState === UI_STATES.CALIBRATING && totalRooms > 0 && (
-          <ProgressIndicator
-            current={mappedRooms.length}
-            total={totalRooms}
-            showSpinner={true}
-          />
-        )}
-
-        <div style={styles.actions}>
-          {uiState !== UI_STATES.CALIBRATING && (
-            <button
-              style={styles.primaryButton}
-              onClick={handleSelfCalibration}
-            >
-              Move Myself Through Rooms
-            </button>
-          )}
-          {uiState === UI_STATES.CALIBRATING && (
-            <button style={styles.disabledButton} disabled>
-              Moving...
-            </button>
-          )}
-        </div>
-
-        {/* Debug Logs */}
-        {debugLogs.length > 0 && (
-          <div style={styles.section}>
-            <h3 style={{...styles.sectionTitle, color: '#ff6b6b'}}>DEBUG LOGS</h3>
-            <pre style={{...styles.codeBlock, color: '#ff6b6b', maxHeight: '300px'}}>
-              {debugLogs.join('\n\n')}
-            </pre>
-          </div>
-        )}
+        <h2 style={styles.title}>Breakout Room Calibrator</h2>
+        <StatusMessage status="error" message="Only hosts or co-hosts can run calibration" />
       </div>
     );
   }
@@ -446,130 +372,230 @@ function CalibrationPanel() {
       {/* Header */}
       <div style={styles.header}>
         <h2 style={styles.title}>Breakout Room Calibrator</h2>
-        {meetingContext && (
-          <span style={styles.meetingId}>
-            Meeting: {meetingContext.meetingID}
-          </span>
-        )}
+        {meetingContext && <span style={styles.meetingId}>Meeting: {meetingContext.meetingID}</span>}
       </div>
 
+      {/* Settings Panel */}
+      {uiState === UI_STATES.IDLE && (
+        <div style={styles.settingsPanel}>
+          <div style={styles.settingRow}>
+            <label style={styles.label}>Delay per room:</label>
+            <select style={styles.select} value={selectedDelay} onChange={(e) => setSelectedDelay(Number(e.target.value))}>
+              {DELAY_OPTIONS.map(opt => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+          </div>
+          <p style={styles.hint}>
+            {DELAY_OPTIONS.find(o => o.value === selectedDelay)?.desc}
+          </p>
+          {estimatedTime && <p style={styles.eta}>{estimatedTime}</p>}
+        </div>
+      )}
+
       {/* Status */}
-      <StatusMessage
-        status={uiState}
-        message={errorMessage || statusMessage}
-      />
+      <StatusMessage status={uiState} message={errorMessage || statusMessage} />
 
       {/* Progress */}
       {uiState === UI_STATES.CALIBRATING && totalRooms > 0 && (
-        <ProgressIndicator
-          current={mappedRooms.length}
-          total={totalRooms}
-          showSpinner={true}
-        />
+        <ProgressIndicator current={mappedRooms.length} total={totalRooms} showSpinner={true} />
       )}
 
-      {/* Room List */}
-      {rooms.length > 0 && (
+      {/* ============================================================ */}
+      {/* FAILURE PANEL - Prominent error display when calibration fails */}
+      {/* ============================================================ */}
+      {uiState === UI_STATES.ERROR && failedRoomIndex >= 0 && (
+        <div style={styles.failurePanel}>
+          <div style={styles.failureHeader}>
+            <span style={styles.failureIcon}>!</span>
+            <span style={styles.failureTitle}>Calibration Failed</span>
+          </div>
+
+          <div style={styles.failureDetails}>
+            <div style={styles.failureRow}>
+              <span style={styles.failureLabel}>Stopped at:</span>
+              <span style={styles.failureValue}>Room {failedRoomIndex + 1} of {totalRooms}</span>
+            </div>
+            <div style={styles.failureRow}>
+              <span style={styles.failureLabel}>Room name:</span>
+              <span style={styles.failureValue}>{failedRoomName}</span>
+            </div>
+            <div style={styles.failureRow}>
+              <span style={styles.failureLabel}>Error:</span>
+              <span style={styles.failureValueError}>{failedReason}</span>
+            </div>
+            <div style={styles.failureRow}>
+              <span style={styles.failureLabel}>Mapped before failure:</span>
+              <span style={styles.failureValue}>{mappedRooms.length} rooms (deleted)</span>
+            </div>
+          </div>
+
+          <p style={styles.failureNote}>
+            All partial mappings have been cleaned up. You can retry calibration from the beginning.
+          </p>
+
+          <div style={styles.failureActions}>
+            <button
+              style={styles.retryButton}
+              onClick={() => handleStartCalibration(0)}
+            >
+              Retry Calibration
+            </button>
+            <button
+              style={styles.secondaryButton}
+              onClick={handleFullReset}
+            >
+              Full Reset
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Room List - visible during calibration AND on error */}
+      {rooms.length > 0 && (uiState === UI_STATES.CALIBRATING || uiState === UI_STATES.ERROR) && (
         <div style={styles.section}>
-          <h3 style={styles.sectionTitle}>Breakout Rooms</h3>
+          <h3 style={styles.sectionTitle}>
+            {uiState === UI_STATES.ERROR ? 'Room Status (failed)' : 'Progress'}
+          </h3>
           <RoomList
             rooms={rooms}
             mappedRooms={mappedRooms}
             currentRoom={currentRoom}
+            failedRoom={failedRoomIndex}
           />
         </div>
       )}
 
-      {/* Actions */}
+      {/* Action Buttons */}
       <div style={styles.actions}>
         {uiState === UI_STATES.IDLE && (
           <>
-            <button
-              style={styles.primaryButton}
-              onClick={handleStartCalibration}
-            >
-              Move Scout Bot
-            </button>
-            <button
-              style={{...styles.secondaryButton, marginLeft: '8px'}}
-              onClick={handleSelfCalibration}
-            >
-              Move Myself
+            {resumeFromRoom > 0 && (
+              <button style={styles.primaryButton} onClick={() => handleStartCalibration(resumeFromRoom)}>
+                Resume from Room {resumeFromRoom + 1}/{totalRooms}
+              </button>
+            )}
+            <button style={resumeFromRoom > 0 ? styles.secondaryButton : styles.primaryButton} onClick={() => handleStartCalibration(0)}>
+              {resumeFromRoom > 0 ? 'Start Fresh' : 'Start Calibration'}
             </button>
           </>
         )}
 
         {uiState === UI_STATES.CALIBRATING && (
+          <>
+            <button style={styles.disabledButton} disabled>
+              Calibrating... {mappedRooms.length}/{totalRooms}
+            </button>
+            <button style={styles.dangerButton} onClick={handleFullReset}>
+              Cancel
+            </button>
+          </>
+        )}
+
+        {uiState === UI_STATES.RECALIBRATING && (
           <button style={styles.disabledButton} disabled>
-            Calibrating...
+            Recalibrating: {recalibratingRoom?.roomName || recalibratingRoom?.expected_name}...
           </button>
         )}
 
-        {(uiState === UI_STATES.COMPLETE || uiState === UI_STATES.ERROR) && (
+        {/* Error buttons (only when no failure panel, e.g. initialization errors) */}
+        {uiState === UI_STATES.ERROR && failedRoomIndex < 0 && (
           <>
-            <button
-              style={styles.primaryButton}
-              onClick={handleStartCalibration}
-            >
-              Run Again
-            </button>
-            <button
-              style={styles.secondaryButton}
-              onClick={handleReset}
-            >
-              Reset
-            </button>
+            <button style={styles.primaryButton} onClick={() => handleStartCalibration(0)}>Try Again</button>
+            <button style={styles.dangerButton} onClick={handleFullReset}>Full Reset</button>
+          </>
+        )}
+
+        {uiState === UI_STATES.COMPLETE && (
+          <>
+            <button style={styles.primaryButton} onClick={() => handleStartCalibration(0)}>Run Again</button>
+            <button style={styles.secondaryButton} onClick={handleReset}>Reset</button>
+            <button style={styles.dangerButton} onClick={handleFullReset}>Full Reset</button>
           </>
         )}
       </div>
 
-      {/* Mapping Results */}
-      {uiState === UI_STATES.COMPLETE && mappedRooms.length > 0 && (
+      {/* Mapping Summary (after successful calibration) */}
+      {uiState === UI_STATES.COMPLETE && (
         <div style={styles.section}>
-          <h3 style={styles.sectionTitle}>Mapping Data</h3>
-          <pre style={styles.codeBlock}>
-            {JSON.stringify(mappedRooms, null, 2)}
-          </pre>
+          <div style={styles.sectionHeader}>
+            <h3 style={styles.sectionTitle}>MAPPING SUMMARY</h3>
+            <button style={styles.smallButton} onClick={refreshMappingSummary}>Refresh</button>
+          </div>
+
+          {mappingSummary && (
+            <div style={styles.summaryBox}>
+              <p style={styles.summaryText}>
+                <span style={styles.green}>{mappingSummary.mapped_count} mapped</span>
+                {' / '}
+                <span style={mappingSummary.missing_count > 0 ? styles.red : styles.gray}>
+                  {mappingSummary.missing_count} missing
+                </span>
+                {' / '}{mappingSummary.total_expected} total
+              </p>
+
+              {mappingSummary.rooms?.filter(r => !r.mapped).length > 0 && (
+                <div style={styles.missingList}>
+                  <h4 style={styles.subTitle}>Missing rooms:</h4>
+                  {mappingSummary.rooms.filter(r => !r.mapped).slice(0, 10).map((room, idx) => (
+                    <div key={idx} style={styles.missingItem}>
+                      <span style={styles.roomIdx}>{room.index + 1}.</span>
+                      <span style={styles.missingRoomName}>{room.expected_name}</span>
+                      <button
+                        style={styles.recalButton}
+                        onClick={() => handleRecalibrateRoom(room)}
+                        disabled={uiState === UI_STATES.RECALIBRATING}
+                      >
+                        Fix
+                      </button>
+                    </div>
+                  ))}
+                  {mappingSummary.rooms.filter(r => !r.mapped).length > 10 && (
+                    <p style={styles.moreText}>+{mappingSummary.rooms.filter(r => !r.mapped).length - 10} more</p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
-      {/* Failed Verifications Warning */}
-      {failedVerifications.length > 0 && (
-        <div style={styles.warningSection}>
-          <h3 style={{...styles.sectionTitle, color: '#ffaa00'}}>
-            ⚠️ {failedVerifications.length} Room(s) Missing Backend Verification
-          </h3>
-          <p style={styles.warningText}>
-            These rooms were verified by SDK but webhook UUID wasn't saved to BigQuery.
-            The report may show room UUIDs instead of names for these rooms.
-          </p>
-          <ul style={styles.warningList}>
-            {failedVerifications.map((f, i) => (
-              <li key={i}>{f.roomName}: {f.error}</li>
-            ))}
-          </ul>
+      {/* Live Room View Toggle */}
+      {uiState === UI_STATES.COMPLETE && (
+        <div style={styles.section}>
           <button
-            style={{...styles.secondaryButton, borderColor: '#ffaa00', color: '#ffaa00', marginRight: '8px'}}
-            onClick={handleRetryFailed}
+            style={styles.secondaryButton}
+            onClick={async () => {
+              setShowLiveView(!showLiveView);
+              if (!showLiveView) await refreshLiveRooms();
+            }}
           >
-            Retry Failed Only
+            {showLiveView ? 'Hide Live View' : 'Show Live Room Participants'}
           </button>
-          <button
-            style={{...styles.secondaryButton, borderColor: '#666', color: '#888'}}
-            onClick={handleStartCalibration}
-          >
-            Re-run All
-          </button>
+
+          {showLiveView && liveRooms.length > 0 && (
+            <div style={styles.liveBox}>
+              <div style={styles.liveHeader}>
+                <h4 style={styles.subTitle}>Current Occupancy</h4>
+                <button style={styles.smallButton} onClick={refreshLiveRooms}>Refresh</button>
+              </div>
+              {liveRooms.slice(0, 10).map((room, idx) => (
+                <div key={idx} style={styles.liveRoom}>
+                  <span style={styles.liveRoomName}>{room.room_name}</span>
+                  <span style={styles.liveCount}>{room.participant_count}</span>
+                </div>
+              ))}
+              {liveRooms.length > 10 && <p style={styles.moreText}>+{liveRooms.length - 10} more rooms</p>}
+            </div>
+          )}
         </div>
       )}
 
-      {/* Debug Logs */}
+      {/* Debug Log */}
       {debugLogs.length > 0 && (
         <div style={styles.section}>
-          <h3 style={{...styles.sectionTitle, color: '#ff6b6b'}}>DEBUG LOGS</h3>
-          <pre style={{...styles.codeBlock, color: '#ff6b6b', maxHeight: '300px'}}>
-            {debugLogs.join('\n\n')}
-          </pre>
+          <h3 style={styles.sectionTitle}>LOG</h3>
+          <pre style={styles.codeBlock}>{debugLogs.slice(-25).join('\n')}</pre>
         </div>
       )}
     </div>
@@ -577,111 +603,136 @@ function CalibrationPanel() {
 }
 
 const styles = {
-  container: {
+  container: { display: 'flex', flexDirection: 'column', gap: '12px', padding: '16px', maxWidth: '500px', margin: '0 auto', minHeight: '100vh', backgroundColor: '#1a1a2e' },
+  header: { display: 'flex', flexDirection: 'column', gap: '2px' },
+  title: { color: '#fff', fontSize: '18px', fontWeight: '600', margin: 0 },
+  meetingId: { color: '#666', fontSize: '11px' },
+
+  // Settings
+  settingsPanel: { backgroundColor: 'rgba(45,140,255,0.1)', border: '1px solid rgba(45,140,255,0.3)', borderRadius: '8px', padding: '12px' },
+  settingRow: { display: 'flex', alignItems: 'center', gap: '10px' },
+  label: { color: '#ccc', fontSize: '13px' },
+  select: { flex: 1, padding: '8px', backgroundColor: '#2a2a4a', border: '1px solid #444', borderRadius: '4px', color: '#fff', fontSize: '13px' },
+  hint: { color: '#888', fontSize: '11px', margin: '6px 0 0 0', fontStyle: 'italic' },
+  eta: { color: '#2D8CFF', fontSize: '12px', margin: '4px 0 0 0', fontWeight: '500' },
+
+  // Layout
+  section: { display: 'flex', flexDirection: 'column', gap: '6px' },
+  sectionHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+  sectionTitle: { color: '#888', fontSize: '11px', fontWeight: '600', textTransform: 'uppercase', margin: 0 },
+  subTitle: { color: '#aaa', fontSize: '12px', margin: '6px 0 4px 0' },
+
+  // Buttons
+  actions: { display: 'flex', gap: '8px', marginTop: '4px' },
+  primaryButton: { flex: 1, padding: '12px', backgroundColor: '#2D8CFF', color: '#fff', border: 'none', borderRadius: '6px', fontSize: '14px', fontWeight: '600', cursor: 'pointer' },
+  secondaryButton: { padding: '10px 14px', backgroundColor: 'transparent', color: '#888', border: '1px solid #444', borderRadius: '6px', fontSize: '12px', cursor: 'pointer' },
+  dangerButton: { padding: '10px 14px', backgroundColor: '#ff4757', color: '#fff', border: 'none', borderRadius: '6px', fontSize: '12px', cursor: 'pointer' },
+  disabledButton: { flex: 1, padding: '12px', backgroundColor: '#333', color: '#666', border: 'none', borderRadius: '6px', fontSize: '14px', cursor: 'not-allowed' },
+  smallButton: { padding: '4px 8px', backgroundColor: 'transparent', color: '#2D8CFF', border: '1px solid #2D8CFF', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' },
+  recalButton: { padding: '4px 8px', backgroundColor: '#ff6b6b', color: '#fff', border: 'none', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' },
+
+  // Failure Panel
+  failurePanel: {
+    backgroundColor: 'rgba(255, 71, 87, 0.08)',
+    border: '1px solid rgba(255, 71, 87, 0.4)',
+    borderRadius: '10px',
+    padding: '16px',
     display: 'flex',
     flexDirection: 'column',
-    gap: '16px',
-    padding: '20px',
-    maxWidth: '500px',
-    margin: '0 auto',
-    minHeight: '100vh',
-    backgroundColor: '#1a1a2e'
+    gap: '12px'
   },
-  header: {
+  failureHeader: {
     display: 'flex',
-    flexDirection: 'column',
-    gap: '4px',
-    marginBottom: '8px'
+    alignItems: 'center',
+    gap: '10px'
   },
-  title: {
+  failureIcon: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '28px',
+    height: '28px',
+    borderRadius: '50%',
+    backgroundColor: '#ff4757',
     color: '#fff',
-    fontSize: '20px',
-    fontWeight: '600',
-    margin: 0
+    fontSize: '16px',
+    fontWeight: '700'
   },
-  meetingId: {
-    color: '#666',
+  failureTitle: {
+    color: '#ff6b6b',
+    fontSize: '16px',
+    fontWeight: '600'
+  },
+  failureDetails: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+    padding: '10px 12px',
+    backgroundColor: 'rgba(0,0,0,0.2)',
+    borderRadius: '6px'
+  },
+  failureRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center'
+  },
+  failureLabel: {
+    color: '#888',
     fontSize: '12px'
   },
-  section: {
+  failureValue: {
+    color: '#fff',
+    fontSize: '12px',
+    fontWeight: '500'
+  },
+  failureValueError: {
+    color: '#ff6b6b',
+    fontSize: '12px',
+    fontWeight: '600'
+  },
+  failureNote: {
+    color: '#888',
+    fontSize: '11px',
+    margin: 0,
+    fontStyle: 'italic'
+  },
+  failureActions: {
     display: 'flex',
-    flexDirection: 'column',
     gap: '8px'
   },
-  sectionTitle: {
-    color: '#888',
-    fontSize: '12px',
-    fontWeight: '600',
-    textTransform: 'uppercase',
-    letterSpacing: '0.5px',
-    margin: 0
-  },
-  actions: {
-    display: 'flex',
-    gap: '12px',
-    marginTop: '8px'
-  },
-  primaryButton: {
+  retryButton: {
     flex: 1,
-    padding: '14px 24px',
-    backgroundColor: '#2D8CFF',
+    padding: '10px',
+    backgroundColor: '#ff6b6b',
     color: '#fff',
     border: 'none',
-    borderRadius: '8px',
-    fontSize: '14px',
+    borderRadius: '6px',
+    fontSize: '13px',
     fontWeight: '600',
-    cursor: 'pointer',
-    transition: 'background-color 0.2s'
-  },
-  secondaryButton: {
-    padding: '14px 24px',
-    backgroundColor: 'transparent',
-    color: '#888',
-    border: '1px solid #333',
-    borderRadius: '8px',
-    fontSize: '14px',
     cursor: 'pointer'
   },
-  disabledButton: {
-    flex: 1,
-    padding: '14px 24px',
-    backgroundColor: '#333',
-    color: '#666',
-    border: 'none',
-    borderRadius: '8px',
-    fontSize: '14px',
-    cursor: 'not-allowed'
-  },
-  codeBlock: {
-    backgroundColor: 'rgba(0,0,0,0.3)',
-    padding: '12px',
-    borderRadius: '8px',
-    fontSize: '11px',
-    color: '#00C851',
-    overflow: 'auto',
-    maxHeight: '200px',
-    fontFamily: 'Monaco, monospace'
-  },
-  warningSection: {
-    backgroundColor: 'rgba(255, 170, 0, 0.1)',
-    border: '1px solid #ffaa00',
-    borderRadius: '8px',
-    padding: '12px',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '8px'
-  },
-  warningText: {
-    color: '#ccc',
-    fontSize: '12px',
-    margin: 0
-  },
-  warningList: {
-    color: '#ffaa00',
-    fontSize: '12px',
-    margin: 0,
-    paddingLeft: '20px'
-  }
+
+  // Summary
+  summaryBox: { backgroundColor: 'rgba(0,0,0,0.2)', borderRadius: '6px', padding: '10px' },
+  summaryText: { color: '#fff', fontSize: '14px', margin: 0 },
+  green: { color: '#00C851' },
+  red: { color: '#ff4757' },
+  gray: { color: '#888' },
+  missingList: { marginTop: '10px' },
+  missingItem: { display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,0.05)' },
+  roomIdx: { color: '#666', fontSize: '11px', minWidth: '24px' },
+  missingRoomName: { color: '#ff6b6b', fontSize: '12px', flex: 1 },
+  moreText: { color: '#666', fontSize: '10px', margin: '6px 0 0 0' },
+
+  // Live view
+  liveBox: { backgroundColor: 'rgba(0,0,0,0.3)', borderRadius: '6px', padding: '10px', marginTop: '8px' },
+  liveHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' },
+  liveRoom: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,0.05)' },
+  liveRoomName: { color: '#2D8CFF', fontSize: '12px' },
+  liveCount: { color: '#888', fontSize: '11px' },
+
+  // Debug log
+  codeBlock: { backgroundColor: 'rgba(0,0,0,0.4)', padding: '10px', borderRadius: '6px', fontSize: '10px', color: '#00C851', overflow: 'auto', maxHeight: '180px', fontFamily: 'Monaco, monospace', margin: 0, whiteSpace: 'pre-wrap' }
 };
 
 export default CalibrationPanel;

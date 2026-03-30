@@ -57,6 +57,24 @@ def get_ist_date_from_utc(utc_dt):
     ist_dt = utc_to_ist(utc_dt)
     return ist_dt.strftime('%Y-%m-%d')
 
+def validate_date_format(date_str):
+    """
+    Validate date string is in YYYY-MM-DD format.
+    Returns the validated date string or raises ValueError.
+    SECURITY: Prevents SQL injection by ensuring only valid date format.
+    """
+    import re
+    if not date_str:
+        return get_ist_date()
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        raise ValueError(f"Invalid date format: {date_str}. Expected YYYY-MM-DD")
+    # Additional validation: ensure it's a valid date
+    try:
+        datetime.strptime(date_str, '%Y-%m-%d')
+    except ValueError:
+        raise ValueError(f"Invalid date: {date_str}")
+    return date_str
+
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
@@ -98,6 +116,92 @@ ZOOM_CLIENT_SECRET = os.environ.get('ZOOM_CLIENT_SECRET', '')
 SCOUT_BOT_NAME = os.environ.get('SCOUT_BOT_NAME', 'Scout Bot')
 SCOUT_BOT_EMAIL = os.environ.get('SCOUT_BOT_EMAIL', '')
 
+# ==============================================================================
+# FIXED ROOM SEQUENCE - Rooms in the exact order Scout Bot visits them
+# ==============================================================================
+# This is the master list of room names in the order the bot moves through them.
+# When calibration completes, webhooks are sorted by timestamp and matched to this sequence.
+# Position 1 webhook = Room index 0, Position 2 webhook = Room index 1, etc.
+# To update: Add/remove/reorder room names as needed.
+# IMPORTANT: Bot visits rooms in this EXACT order - 1st room = index 0, etc.
+FIXED_ROOM_SEQUENCE = [
+    # Floor 1 rooms (1.1 to 1.34)
+    "1.1:It's Accrual World",
+    "1.2:Between The Spreadsheet",
+    "1.3:Opera House",
+    "1.4:Statue Of Liberty",
+    "1.5:The Squad",
+    "1.6:Visionary Vault - Team Kruta",
+    "1.7:Inspiration Island - Team Kruta",
+    "1.8:Life In The Math Lane",
+    "1.9:Finance Pirates",
+    "1.10:Number Nook - Team Ganesh",
+    "1.11:Accountaholics",
+    "1.12:The Forbidden City",
+    "1.13:Dev's Professional Bungalow",
+    "1.14:Innovation Station",
+    "1.15:Precision Point",
+    "1.16:Creative Corner - Team Dev",
+    "1.17:Insight Lounge - Team Dev",
+    "1.18:Synergy Space - Team Dev",
+    "1.19:Numbers and Nuance",
+    "1.20:Sales Wizard",
+    "1.21:Sales Station",
+    "1.22:Virtual Vista",
+    "1.23:The Genius Lounge",
+    "1.24:Emirates Palace",
+    "1.25:Victoria Memorial",
+    "1.26:Number Nexus",
+    "1.27:Ledger Lounge",
+    "1.28:The Capital Corner",
+    "1.29:Meeting Room - Hawks Eye",
+    "1.30:HR Connect Room",
+    "1.31:HR Strategy Meeting Suite",
+    "1.32:Interview Room - 1",
+    "1.33:Interview Room - 2",
+    "1.34:Interview/Meeting - Eagle Eyes",
+    # Floor 2 (Vridam)
+    "2.0:Vridam - Wellness Meeting Lounge",
+    # Floor 3 rooms (Cloud/Accurest)
+    "3.1:Cloud Gunners",
+    "3.2:Cloud Knights",
+    "3.3:Cloud Avengers",
+    "3.4:Cloud Falcons",
+    "3.5:Cloud Titans",
+    "3.6:Cloud Guardians",
+    "3.7:Inspiration Lounge /Meeting Room",
+    "3.8:Agenda Chamber/Meeting Room",
+    "3.9:ABAP AMS",
+    # Floor 4 rooms (KPRC)
+    "4.1:KPRC - Legal Eagle",
+    "4.2:KPRC - Corporate Crest",
+    "4.3:KPRC - Innovation Lounge",
+    "4.4:KPRC - Decision Dome",
+    "4.5:KPRC - Focus Zone",
+    "4.6:KPRC - Strategic Space",
+    # Floor 5 rooms (Accurest)
+    "5.1:Accurest - HR Oasis",
+    "5.2:Accurest-Meeting Room:Strategist",
+    "5.3:Accurest - Meeting Room: Pioneer",
+    "5.4:Accurest - Automation Crafters",
+    "5.5:Accurest-Learning / Meeting room",
+    "5.6:Accurest - Sales Lounge",
+    "5.7:Accurest - Focus Lab",
+    "5.8:Accurest - Pattern Inbound",
+    "5.9:Accurest - Pattern Planning",
+    "5.10:Accurest - Himal's Suite",
+    "5.11:Accurest Insight : Team Shubham",
+    "5.12:Accurest - Creators",
+    "5.13:Accurest - Interview Room",
+    # Special zones
+    "6.0:Silence Zone",
+    "7.0:Masti Ki Pathshala",
+    "8.0:BREAK TIME - Tea/Lunch/ Dinner",
+]
+
+# Set to True to use FIXED_ROOM_SEQUENCE instead of dynamic room sequence
+USE_FIXED_SEQUENCE = True
+
 # GCP Configuration
 GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID', '')
 BQ_DATASET = os.environ.get('BQ_DATASET', 'breakout_room_calibrator')
@@ -107,6 +211,7 @@ BQ_EVENTS_TABLE = 'participant_events'
 BQ_MAPPINGS_TABLE = 'room_mappings'
 BQ_CAMERA_TABLE = 'camera_events'
 BQ_QOS_TABLE = 'qos_data'
+BQ_CALIBRATION_STATE_TABLE = 'calibration_state'
 
 # Email Configuration
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
@@ -154,6 +259,9 @@ class MeetingState:
         self.calibration_mode = 'scout_bot'  # 'scout_bot' or 'self'
         self.calibration_participant_name = None  # Name of participant doing calibration
         self.calibration_participant_uuid = None  # UUID of participant doing calibration
+        # SEQUENCE-BASED MATCHING: Room sequence and next expected index
+        self.calibration_sequence = []  # Ordered list of room names ["Room 1", "Room 2", ...]
+        self.calibration_next_index = 0  # Index of next expected webhook (0, 1, 2, ...)
         # Note: Don't reset dedup cache on meeting reset - keep it for cross-meeting dedup
         print("[MeetingState] Reset for new meeting")
 
@@ -297,13 +405,25 @@ class MeetingState:
                         camera_on_minutes = camera_info.get('minutes', 0)
                         camera_on_intervals = camera_info.get('intervals', '')
 
+                        # Calculate event_date from participant's join_time (not today's date)
+                        # This ensures late-night meetings get correct date
+                        join_time_str = safe_str(p.get('join_time', ''))
+                        event_date = get_ist_date()  # Fallback
+                        if join_time_str:
+                            try:
+                                # Parse ISO timestamp and convert to IST date
+                                join_dt = datetime.fromisoformat(join_time_str.replace('Z', '+00:00'))
+                                event_date = get_ist_date_from_utc(join_dt.replace(tzinfo=None))
+                            except (ValueError, AttributeError):
+                                pass  # Keep fallback
+
                         qos_data = {
                             'qos_id': str(uuid_lib.uuid4()),
                             'meeting_uuid': safe_str(meeting_uuid),
                             'participant_id': participant_id,
                             'participant_name': participant_name,
                             'participant_email': participant_email,
-                            'join_time': safe_str(p.get('join_time', '')),
+                            'join_time': join_time_str,
                             'leave_time': safe_str(p.get('leave_time', '')),
                             'duration_minutes': duration_minutes,
                             'attentiveness_score': str(p.get('attentiveness_score', '')),
@@ -311,7 +431,7 @@ class MeetingState:
                             'camera_on_minutes': camera_on_minutes,
                             'camera_on_intervals': camera_on_intervals,
                             'recorded_at': datetime.utcnow().isoformat(),
-                            'event_date': get_ist_date()
+                            'event_date': event_date
                         }
 
                         if insert_qos_data(qos_data):
@@ -340,9 +460,14 @@ class MeetingState:
             cutoff_date = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d')
             query = f"""
             DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
-            WHERE mapping_date < '{cutoff_date}'
+            WHERE mapping_date < @cutoff_date
             """
-            client.query(query).result()
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("cutoff_date", "STRING", cutoff_date)
+                ]
+            )
+            client.query(query, job_config=job_config).result()
             print(f"[MeetingState] Cleaned up mappings older than {cutoff_date}")
         except Exception as e:
             print(f"[MeetingState] Error cleaning up old mappings: {e}")
@@ -547,6 +672,347 @@ def validate_and_clean_event(event_data, required_fields=None):
     return cleaned
 
 
+# ==============================================================================
+# CALIBRATION STATE PERSISTENCE (BigQuery)
+# ==============================================================================
+
+def save_calibration_state(meeting_id, meeting_uuid, state_data):
+    """Save calibration state to BigQuery for persistence across restarts"""
+    try:
+        client = get_bq_client()
+        table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_CALIBRATION_STATE_TABLE}"
+        today = get_ist_date()
+
+        row = {
+            'state_id': f"{meeting_id}_{today}",
+            'meeting_id': str(meeting_id),
+            'meeting_uuid': meeting_uuid or '',
+            'calibration_in_progress': state_data.get('calibration_in_progress', False),
+            'calibration_mode': state_data.get('calibration_mode', 'scout_bot'),
+            'calibration_participant_name': state_data.get('calibration_participant_name', ''),
+            'current_room_index': state_data.get('current_room_index', 0),
+            'total_rooms': state_data.get('total_rooms', 0),
+            'room_sequence': json.dumps(state_data.get('room_sequence', [])),
+            'started_at': state_data.get('started_at', datetime.utcnow().isoformat()),
+            'updated_at': datetime.utcnow().isoformat(),
+            'calibration_date': today,
+            'completed': state_data.get('completed', False),
+            'completed_at': state_data.get('completed_at', '')
+        }
+
+        # Use MERGE to upsert (insert or update)
+        merge_query = f"""
+        MERGE `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_CALIBRATION_STATE_TABLE}` AS target
+        USING (SELECT @state_id as state_id) AS source
+        ON target.state_id = source.state_id
+        WHEN MATCHED THEN
+            UPDATE SET
+                calibration_in_progress = @calibration_in_progress,
+                current_room_index = @current_room_index,
+                total_rooms = @total_rooms,
+                room_sequence = @room_sequence,
+                updated_at = @updated_at,
+                completed = @completed,
+                completed_at = @completed_at
+        WHEN NOT MATCHED THEN
+            INSERT (state_id, meeting_id, meeting_uuid, calibration_in_progress, calibration_mode,
+                    calibration_participant_name, current_room_index, total_rooms, room_sequence,
+                    started_at, updated_at, calibration_date, completed, completed_at)
+            VALUES (@state_id, @meeting_id, @meeting_uuid, @calibration_in_progress, @calibration_mode,
+                    @calibration_participant_name, @current_room_index, @total_rooms, @room_sequence,
+                    @started_at, @updated_at, @calibration_date, @completed, @completed_at)
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("state_id", "STRING", row['state_id']),
+                bigquery.ScalarQueryParameter("meeting_id", "STRING", row['meeting_id']),
+                bigquery.ScalarQueryParameter("meeting_uuid", "STRING", row['meeting_uuid']),
+                bigquery.ScalarQueryParameter("calibration_in_progress", "BOOL", row['calibration_in_progress']),
+                bigquery.ScalarQueryParameter("calibration_mode", "STRING", row['calibration_mode']),
+                bigquery.ScalarQueryParameter("calibration_participant_name", "STRING", row['calibration_participant_name']),
+                bigquery.ScalarQueryParameter("current_room_index", "INT64", row['current_room_index']),
+                bigquery.ScalarQueryParameter("total_rooms", "INT64", row['total_rooms']),
+                bigquery.ScalarQueryParameter("room_sequence", "STRING", row['room_sequence']),
+                bigquery.ScalarQueryParameter("started_at", "STRING", row['started_at']),
+                bigquery.ScalarQueryParameter("updated_at", "STRING", row['updated_at']),
+                bigquery.ScalarQueryParameter("calibration_date", "STRING", row['calibration_date']),
+                bigquery.ScalarQueryParameter("completed", "BOOL", row['completed']),
+                bigquery.ScalarQueryParameter("completed_at", "STRING", row['completed_at']),
+            ]
+        )
+
+        client.query(merge_query, job_config=job_config).result()
+        print(f"[CalibrationState] Saved state: room {row['current_room_index']}/{row['total_rooms']}, completed={row['completed']}")
+        return True
+
+    except Exception as e:
+        print(f"[CalibrationState] Error saving state: {e}")
+        traceback.print_exc()
+        return False
+
+
+def load_calibration_state(meeting_id=None, date=None):
+    """Load calibration state from BigQuery"""
+    try:
+        client = get_bq_client()
+        target_date = date or get_ist_date()
+
+        if meeting_id:
+            query = f"""
+            SELECT * FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_CALIBRATION_STATE_TABLE}`
+            WHERE meeting_id = @meeting_id AND calibration_date = @target_date
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("meeting_id", "STRING", str(meeting_id)),
+                    bigquery.ScalarQueryParameter("target_date", "STRING", target_date),
+                ]
+            )
+        else:
+            # Get latest calibration state for today
+            query = f"""
+            SELECT * FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_CALIBRATION_STATE_TABLE}`
+            WHERE calibration_date = @target_date
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("target_date", "STRING", target_date),
+                ]
+            )
+
+        results = list(client.query(query, job_config=job_config).result())
+
+        if results:
+            row = results[0]
+            state = {
+                'state_id': row.state_id,
+                'meeting_id': row.meeting_id,
+                'meeting_uuid': row.meeting_uuid,
+                'calibration_in_progress': row.calibration_in_progress,
+                'calibration_mode': row.calibration_mode,
+                'calibration_participant_name': row.calibration_participant_name,
+                'current_room_index': row.current_room_index,
+                'total_rooms': row.total_rooms,
+                'room_sequence': json.loads(row.room_sequence) if row.room_sequence else [],
+                'started_at': row.started_at,
+                'updated_at': row.updated_at,
+                'calibration_date': row.calibration_date,
+                'completed': row.completed,
+                'completed_at': row.completed_at
+            }
+            print(f"[CalibrationState] Loaded state: room {state['current_room_index']}/{state['total_rooms']}, completed={state['completed']}")
+            return state
+
+        return None
+
+    except Exception as e:
+        print(f"[CalibrationState] Error loading state: {e}")
+        # Table might not exist yet - that's OK
+        return None
+
+
+def update_calibration_progress(meeting_id, room_index):
+    """Update only the current room index (lightweight update during calibration)"""
+    try:
+        client = get_bq_client()
+        today = get_ist_date()
+        state_id = f"{meeting_id}_{today}"
+
+        update_query = f"""
+        UPDATE `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_CALIBRATION_STATE_TABLE}`
+        SET current_room_index = @room_index, updated_at = @updated_at
+        WHERE state_id = @state_id
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("room_index", "INT64", room_index),
+                bigquery.ScalarQueryParameter("updated_at", "STRING", datetime.utcnow().isoformat()),
+                bigquery.ScalarQueryParameter("state_id", "STRING", state_id),
+            ]
+        )
+
+        client.query(update_query, job_config=job_config).result()
+        print(f"[CalibrationState] Updated progress: room {room_index}")
+        return True
+
+    except Exception as e:
+        print(f"[CalibrationState] Error updating progress: {e}")
+        return False
+
+
+def complete_calibration_state(meeting_id):
+    """Mark calibration as complete in BigQuery"""
+    try:
+        client = get_bq_client()
+        today = get_ist_date()
+        state_id = f"{meeting_id}_{today}"
+
+        update_query = f"""
+        UPDATE `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_CALIBRATION_STATE_TABLE}`
+        SET completed = TRUE,
+            completed_at = @completed_at,
+            calibration_in_progress = FALSE,
+            updated_at = @updated_at
+        WHERE state_id = @state_id
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("completed_at", "STRING", datetime.utcnow().isoformat()),
+                bigquery.ScalarQueryParameter("updated_at", "STRING", datetime.utcnow().isoformat()),
+                bigquery.ScalarQueryParameter("state_id", "STRING", state_id),
+            ]
+        )
+
+        client.query(update_query, job_config=job_config).result()
+        print(f"[CalibrationState] Marked complete for meeting {meeting_id}")
+        return True
+
+    except Exception as e:
+        print(f"[CalibrationState] Error marking complete: {e}")
+        return False
+
+
+def correct_calibration_by_timestamp(meeting_id=None, target_date=None):
+    """
+    POST-CALIBRATION CORRECTION:
+    Sort Scout Bot webhooks by timestamp and match to room sequence.
+    This fixes any out-of-order webhook issues.
+
+    If USE_FIXED_SEQUENCE is True, uses FIXED_ROOM_SEQUENCE instead of dynamic sequence.
+    This is the most reliable method - room names are predetermined!
+
+    Returns: dict with correction results
+    """
+    try:
+        client = get_bq_client()
+        today = target_date or get_ist_date()
+
+        print(f"\n{'='*60}")
+        print(f"[CalibrationCorrect] Starting timestamp-based correction for {today}")
+
+        # Step 1: Get room sequence - FIXED or dynamic
+        # Always load state for meeting context (meeting_id, meeting_uuid)
+        state = load_calibration_state(meeting_id, today) or {}
+
+        if USE_FIXED_SEQUENCE and FIXED_ROOM_SEQUENCE:
+            room_sequence = FIXED_ROOM_SEQUENCE
+            print(f"[CalibrationCorrect] Using FIXED_ROOM_SEQUENCE ({len(room_sequence)} rooms)")
+        else:
+            # Fall back to dynamic sequence from calibration_state
+            if not state.get('room_sequence'):
+                print(f"[CalibrationCorrect] No room sequence found for {today}")
+                return {'success': False, 'error': 'No room sequence found'}
+            room_sequence = state['room_sequence']
+            print(f"[CalibrationCorrect] Using dynamic room sequence ({len(room_sequence)} rooms)")
+
+        # Step 2: Get all sequence_calibration mappings, sorted by mapped_at timestamp
+        # The mapped_at timestamp reflects when the webhook was processed (close to arrival time)
+        # This gives us the actual order Scout Bot visited the rooms
+        mapping_query = f"""
+        SELECT DISTINCT
+            room_uuid,
+            MIN(mapped_at) as first_mapped_at
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date = @target_date
+            AND source = 'sequence_calibration'
+            AND room_uuid IS NOT NULL
+            AND room_uuid != ''
+        GROUP BY room_uuid
+        ORDER BY first_mapped_at ASC
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("target_date", "STRING", today),
+            ]
+        )
+
+        results = list(client.query(mapping_query, job_config=job_config).result())
+        webhook_uuids = [row.room_uuid for row in results]
+
+        print(f"[CalibrationCorrect] Found {len(webhook_uuids)} sequence_calibration mappings to correct")
+
+        if len(webhook_uuids) == 0:
+            print(f"[CalibrationCorrect] No Scout Bot webhooks found")
+            return {'success': False, 'error': 'No Scout Bot webhooks found'}
+
+        # Step 3: Match sorted webhooks to room sequence
+        # Position 0 webhook = Room 0 in sequence, etc.
+        corrections = []
+        for i, room_uuid in enumerate(webhook_uuids):
+            if i < len(room_sequence):
+                room_name = room_sequence[i]
+                corrections.append({
+                    'room_uuid': room_uuid,
+                    'room_name': room_name,
+                    'position': i + 1
+                })
+                print(f"  Position {i+1}: {room_uuid[:20]}... → {room_name}")
+
+        print(f"[CalibrationCorrect] Matched {len(corrections)} rooms")
+
+        # Step 4: Delete old sequence_calibration mappings for today
+        delete_query = f"""
+        DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date = @target_date
+            AND source = 'timestamp_calibration'
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("target_date", "STRING", today),
+            ]
+        )
+        client.query(delete_query, job_config=job_config).result()
+        print(f"[CalibrationCorrect] Deleted old timestamp_calibration mappings")
+
+        # Step 5: Insert corrected mappings with new source type
+        table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}"
+        rows_to_insert = []
+
+        for corr in corrections:
+            rows_to_insert.append({
+                'mapping_id': str(uuid_lib.uuid4()),
+                'meeting_id': str(meeting_id or state.get('meeting_id', '')),
+                'meeting_uuid': state.get('meeting_uuid', ''),
+                'room_uuid': corr['room_uuid'],
+                'room_name': corr['room_name'],
+                'room_index': corr['position'] - 1,
+                'mapping_date': today,
+                'mapped_at': datetime.utcnow().isoformat(),
+                'source': 'timestamp_calibration'  # New source type - most accurate!
+            })
+
+        if rows_to_insert:
+            errors = client.insert_rows_json(table_id, rows_to_insert)
+            if errors:
+                print(f"[CalibrationCorrect] Insert errors: {errors}")
+            else:
+                print(f"[CalibrationCorrect] Inserted {len(rows_to_insert)} corrected mappings")
+
+        print(f"[CalibrationCorrect] CORRECTION COMPLETE")
+        print(f"{'='*60}\n")
+
+        return {
+            'success': True,
+            'date': today,
+            'rooms_corrected': len(corrections),
+            'total_in_sequence': len(room_sequence),
+            'webhooks_found': len(webhook_uuids)
+        }
+
+    except Exception as e:
+        print(f"[CalibrationCorrect] Error: {e}")
+        traceback.print_exc()
+        return {'success': False, 'error': str(e)}
+
+
 def insert_participant_event(event_data):
     """Insert participant event into BigQuery with validation"""
     try:
@@ -616,13 +1082,27 @@ def insert_camera_event(event_data):
 
 
 def insert_room_mappings(mappings):
-    """Insert room mappings into BigQuery with validation"""
+    """
+    Insert or update room mappings in BigQuery with MERGE/UPSERT logic.
+
+    DEDUPLICATION RULES:
+    1. For same (meeting_id, room_uuid, source) - UPDATE existing row
+    2. webhook_calibration source always wins over zoom_sdk_app
+    3. Never store Room-XXXXX placeholder names
+    4. Normalize room names (strip whitespace)
+    """
     try:
         # Clean each mapping
         cleaned_mappings = []
         required = ['mapping_id', 'meeting_id', 'room_uuid', 'room_name', 'mapping_date', 'mapped_at']
 
         for mapping in mappings:
+            # Skip placeholder room names - these indicate calibration failure
+            room_name = mapping.get('room_name', '')
+            if not room_name or room_name.startswith('Room-') or room_name == 'Unknown Room':
+                print(f"[BigQuery] REJECTED placeholder room name: {room_name}")
+                continue
+
             cleaned = validate_and_clean_event(mapping, required)
             if cleaned:
                 # Ensure room_index is int
@@ -631,6 +1111,8 @@ def insert_room_mappings(mappings):
                         cleaned['room_index'] = int(cleaned['room_index']) if cleaned['room_index'] else 0
                     except (ValueError, TypeError):
                         cleaned['room_index'] = 0
+                # Normalize room name
+                cleaned['room_name'] = cleaned['room_name'].strip()
                 cleaned_mappings.append(cleaned)
             else:
                 print(f"[BigQuery] Skipping invalid mapping: {mapping}")
@@ -642,13 +1124,93 @@ def insert_room_mappings(mappings):
         client = get_bq_client()
         table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}"
 
-        errors = client.insert_rows_json(table_id, cleaned_mappings)
-        if errors:
-            print(f"[BigQuery] Mapping insert error: {errors}")
-            return False
+        # Use MERGE to handle deduplication
+        # For each mapping, check if (meeting_id, room_uuid, source) exists
+        # If exists AND source matches: UPDATE
+        # If exists with lower priority source: DELETE old, INSERT new
+        # If not exists: INSERT
 
-        print(f"[BigQuery] Inserted {len(cleaned_mappings)} mappings successfully")
-        return True
+        inserted_count = 0
+        updated_count = 0
+
+        for mapping in cleaned_mappings:
+            meeting_id = mapping['meeting_id']
+            room_uuid = mapping['room_uuid']
+            room_name = mapping['room_name']
+            source = mapping.get('source', 'unknown')
+            mapping_date = mapping['mapping_date']
+
+            # Check for existing mapping with same room_uuid
+            check_query = f"""
+            SELECT mapping_id, room_name, source
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+            WHERE meeting_id = @meeting_id
+              AND room_uuid = @room_uuid
+              AND mapping_date = @mapping_date
+            ORDER BY
+              CASE WHEN source = 'webhook_calibration' THEN 0 ELSE 1 END,
+              mapped_at DESC
+            LIMIT 1
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("meeting_id", "STRING", meeting_id),
+                    bigquery.ScalarQueryParameter("room_uuid", "STRING", room_uuid),
+                    bigquery.ScalarQueryParameter("mapping_date", "STRING", mapping_date),
+                ]
+            )
+
+            existing = list(client.query(check_query, job_config=job_config).result())
+
+            if existing:
+                existing_row = existing[0]
+                existing_source = existing_row.source
+                existing_name = existing_row.room_name
+
+                # If existing is webhook_calibration and new is not, skip
+                if existing_source == 'webhook_calibration' and source != 'webhook_calibration':
+                    print(f"[BigQuery] SKIP: {room_name} - webhook_calibration mapping already exists")
+                    continue
+
+                # If same source and same name, skip
+                if existing_source == source and existing_name == room_name:
+                    print(f"[BigQuery] SKIP: {room_name} - identical mapping exists")
+                    continue
+
+                # Update existing mapping (new source wins or same source with new name)
+                update_query = f"""
+                UPDATE `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+                SET room_name = @room_name,
+                    source = @source,
+                    mapped_at = @mapped_at
+                WHERE meeting_id = @meeting_id
+                  AND room_uuid = @room_uuid
+                  AND mapping_date = @mapping_date
+                """
+                update_config = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("room_name", "STRING", room_name),
+                        bigquery.ScalarQueryParameter("source", "STRING", source),
+                        bigquery.ScalarQueryParameter("mapped_at", "STRING", mapping['mapped_at']),
+                        bigquery.ScalarQueryParameter("meeting_id", "STRING", meeting_id),
+                        bigquery.ScalarQueryParameter("room_uuid", "STRING", room_uuid),
+                        bigquery.ScalarQueryParameter("mapping_date", "STRING", mapping_date),
+                    ]
+                )
+                client.query(update_query, job_config=update_config).result()
+                updated_count += 1
+                print(f"[BigQuery] UPDATED: {room_name} (was: {existing_name}, source: {existing_source} -> {source})")
+            else:
+                # Insert new mapping
+                errors = client.insert_rows_json(table_id, [mapping])
+                if errors:
+                    print(f"[BigQuery] Insert error for {room_name}: {errors}")
+                else:
+                    inserted_count += 1
+                    print(f"[BigQuery] INSERTED: {room_name} ({source})")
+
+        print(f"[BigQuery] Mappings: {inserted_count} inserted, {updated_count} updated")
+        return inserted_count > 0 or updated_count > 0
     except Exception as e:
         print(f"[BigQuery] Mapping error: {e}")
         traceback.print_exc()
@@ -948,6 +1510,8 @@ class ZoomAPI:
                     next_page_token = None
                     page_count = 0
                     max_pages = 50  # Safety limit
+                    auth_retries = 0  # Track 401 retries to prevent infinite loop
+                    max_auth_retries = 3
 
                     while page_count < max_pages:
                         # Build URL with pagination params
@@ -993,7 +1557,11 @@ class ZoomAPI:
                             print(f"[ZoomAPI] {method_name}: Bad request (400) - {response.text[:200]}")
                             break
                         elif response.status_code == 401:
-                            print(f"[ZoomAPI] {method_name}: Unauthorized (401) - refreshing token")
+                            auth_retries += 1
+                            if auth_retries > max_auth_retries:
+                                print(f"[ZoomAPI] {method_name}: Too many 401 errors ({auth_retries}), giving up")
+                                break
+                            print(f"[ZoomAPI] {method_name}: Unauthorized (401) - refreshing token (retry {auth_retries}/{max_auth_retries})")
                             self.access_token = None
                             self.token_expires = 0
                             token = self.get_access_token()
@@ -1052,6 +1620,9 @@ class ZoomAPI:
             page_count = 0
 
             print(f"[ZoomAPI] Fetching QoS data for meeting {meeting_id}...")
+
+            auth_retries = 0
+            max_auth_retries = 3
 
             while page_count < max_pages:
                 params = {'page_size': 10}  # Max 10 per page for QoS API
@@ -1184,7 +1755,11 @@ class ZoomAPI:
                     print(f"[ZoomAPI] QoS API: Bad request - {response.text[:200]}")
                     break
                 elif response.status_code == 401:
-                    print(f"[ZoomAPI] QoS API: Unauthorized - refreshing token")
+                    auth_retries += 1
+                    if auth_retries > max_auth_retries:
+                        print(f"[ZoomAPI] QoS API: Too many 401 errors ({auth_retries}), giving up")
+                        break
+                    print(f"[ZoomAPI] QoS API: Unauthorized - refreshing token (attempt {auth_retries}/{max_auth_retries})")
                     self.access_token = None
                     token = self.get_access_token()
                     headers = {'Authorization': f'Bearer {token}'}
@@ -1313,15 +1888,16 @@ def extract_participant_data(data):
     meeting_uuid = obj.get('uuid', '') or obj.get('meeting_uuid', '') or payload.get('meeting_uuid', '')
     room_uuid = obj.get('breakout_room_uuid', '') or obj.get('room_uuid', '') or ''
 
-    # Parse timestamp - Zoom sends event_ts in milliseconds
+    # Parse timestamp - Zoom sends event_ts in milliseconds (UTC)
+    # IMPORTANT: Use utcfromtimestamp to ensure consistent UTC handling regardless of server timezone
     event_ts = data.get('event_ts', 0)
     if event_ts and event_ts > 0:
         try:
             # Handle both milliseconds and seconds
             if event_ts > 1e12:  # Milliseconds
-                event_dt = datetime.fromtimestamp(event_ts / 1000)
+                event_dt = datetime.utcfromtimestamp(event_ts / 1000)
             else:  # Seconds
-                event_dt = datetime.fromtimestamp(event_ts)
+                event_dt = datetime.utcfromtimestamp(event_ts)
         except (ValueError, OSError):
             event_dt = datetime.utcnow()
     else:
@@ -1450,55 +2026,96 @@ def handle_breakout_room_join(data):
     if is_calibration_participant(p['participant_name'], p['participant_email']):
         cal_mode = meeting_state.calibration_mode
         cal_name = meeting_state.calibration_participant_name or 'Scout Bot'
+        webhook_time = p['event_dt']
         print(f"  -> Calibration participant detected: {p['participant_name']} (mode: {cal_mode}, expected: {cal_name})")
-        print(f"  -> Calibration in progress: {meeting_state.calibration_in_progress}")
-        print(f"  -> Pending room moves: {len(meeting_state.pending_room_moves)}")
+        print(f"  -> Calibration in progress (memory): {meeting_state.calibration_in_progress}")
 
-        # Scout Bot is moving during calibration
-        # Find the oldest unmatched OR matched-but-not-verified pending room move
-        # (matched-but-not-verified means we're retrying after a mismatch)
+        # BUG FIX: If in-memory state says not in progress, check BigQuery!
+        # This handles the case where webhook hits a different Cloud Run instance
+        if not meeting_state.calibration_in_progress:
+            print(f"  -> Memory says not in progress, checking BigQuery...")
+            bq_state = load_calibration_state(p['meeting_id'])
+            if bq_state and bq_state.get('calibration_in_progress') and not bq_state.get('completed'):
+                print(f"  -> BigQuery says calibration IS in progress! Restoring state...")
+                meeting_state.calibration_in_progress = True
+                meeting_state.calibration_mode = bq_state.get('calibration_mode', 'scout_bot')
+                meeting_state.calibration_participant_name = bq_state.get('calibration_participant_name', 'Scout Bot')
+                meeting_state.calibration_next_index = bq_state.get('current_room_index', 0)
+                room_names = bq_state.get('room_sequence', [])
+                meeting_state.calibration_sequence = [
+                    {'room_name': name, 'room_index': i, 'sdk_uuid': None, 'webhook_uuid': None, 'matched': i < meeting_state.calibration_next_index}
+                    for i, name in enumerate(room_names)
+                ]
+                print(f"  -> Restored: next_index={meeting_state.calibration_next_index}, sequence_len={len(meeting_state.calibration_sequence)}")
+            else:
+                print(f"  -> BigQuery confirms: Calibration NOT in progress")
+                print(f"  -> Calibration participant in breakout room, skipping event storage")
+                return
+
+        if not meeting_state.calibration_in_progress:
+            print(f"  -> Calibration NOT in progress, skipping to protect existing mappings")
+            return
+
+        # =====================================================================
+        # PURE POSITION-BASED MATCHING
+        # The nth webhook from calibration participant = nth room in sequence
+        # Frontend waits for each webhook before moving to next room,
+        # so there is ZERO ambiguity - webhook N always = room N
+        # =====================================================================
         room_name = None
-        matched_move = None
+        matched_index = -1
 
-        # First, look for completely unmatched entries
-        for move in meeting_state.pending_room_moves:
-            if not move.get('matched'):
-                room_name = move['room_name']
-                matched_move = move
-                break
+        with meeting_state._lock:
+            sequence = meeting_state.calibration_sequence
+            next_idx = meeting_state.calibration_next_index
 
-        # If all entries are matched, look for matched-but-not-verified (retry scenario)
-        # This handles the case where bot went to wrong room, webhook arrived, but SDK detected mismatch
-        # IMPORTANT: Iterate in REVERSE to find the MOST RECENT unverified room (the one being retried)
-        if not matched_move:
-            for move in reversed(meeting_state.pending_room_moves):
-                if move.get('matched') and not move.get('verified'):
-                    room_name = move['room_name']
-                    matched_move = move
-                    print(f"  -> RETRY: Updating webhook_uuid for unverified room: {room_name}")
-                    break
+            print(f"  -> POSITION-BASED MATCHING: sequence={len(sequence)} rooms, next_index={next_idx}")
 
-        # Fallback to scout_bot_current_room if no pending moves
-        if not room_name and hasattr(meeting_state, 'scout_bot_current_room'):
-            room_name = meeting_state.scout_bot_current_room
+            if sequence and next_idx < len(sequence):
+                entry = sequence[next_idx]
+                room_name = entry['room_name']
+                entry['webhook_uuid'] = room_uuid
+                entry['matched'] = True
+                matched_index = next_idx
+                meeting_state.calibration_next_index = next_idx + 1
 
-        if room_name and room_uuid:
-            # Mark the move as matched (but NOT verified yet - frontend must confirm)
-            if matched_move:
-                matched_move['matched'] = True
-                matched_move['webhook_uuid'] = room_uuid
-                matched_move['verified'] = False  # Will be set True by frontend after SDK verification
-                print(f"  -> MATCHED pending move: {room_name} (awaiting frontend verification)")
+                remaining = len(sequence) - meeting_state.calibration_next_index
+                print(f"  -> MATCH: webhook #{next_idx + 1} = {room_name}")
+                print(f"  -> Webhook UUID: {room_uuid[:30] if room_uuid else 'None'}...")
+                print(f"  -> Remaining: {remaining}")
+            elif not sequence:
+                print(f"  -> WARNING: No calibration sequence (calibration/start not called?)")
+            else:
+                print(f"  -> WARNING: All rooms already matched (index {next_idx} >= {len(sequence)})")
 
-            # Store webhook UUID -> room name mapping in memory (temporary)
+        if room_name and room_uuid and matched_index >= 0:
             meeting_state.add_webhook_room_mapping(room_uuid, room_name)
-            print(f"  -> CALIBRATION: Learned webhook UUID {room_uuid[:20]}... = {room_name}")
-            print(f"  -> NOTE: Mapping will be saved to BigQuery after frontend verification")
+            print(f"  -> CALIBRATION SUCCESS: {room_uuid[:20]}... = {room_name}")
 
-            # DON'T save to BigQuery yet - wait for frontend to verify via /calibration/verify
-            # This prevents saving wrong mappings when bot ends up in wrong room
+            try:
+                today = get_ist_date()
+                mapping_row = {
+                    'mapping_id': str(uuid_lib.uuid4()),
+                    'meeting_id': str(meeting_state.meeting_id),
+                    'meeting_uuid': meeting_state.meeting_uuid or '',
+                    'room_uuid': room_uuid,
+                    'room_name': room_name,
+                    'room_index': matched_index,
+                    'mapping_date': today,
+                    'mapped_at': datetime.utcnow().isoformat(),
+                    'source': 'sequential_calibration'
+                }
+                success = insert_room_mappings([mapping_row])
+                if success:
+                    print(f"  -> SAVED to BigQuery: {room_name} = {room_uuid[:20]}...")
+                    update_calibration_progress(meeting_state.meeting_id, meeting_state.calibration_next_index)
+                else:
+                    print(f"  -> WARNING: BigQuery insert failed for {room_name}")
+            except Exception as e:
+                print(f"  -> ERROR saving to BigQuery: {e}")
         else:
-            print(f"  -> WARNING: Could not match webhook UUID - room_name={room_name}, room_uuid={room_uuid[:20] if room_uuid else 'None'}")
+            print(f"  -> WARNING: Could not match webhook UUID")
+            print(f"  -> room_name={room_name}, room_uuid={room_uuid[:20] if room_uuid else 'None'}")
 
         print(f"  -> Calibration participant in breakout room, skipping event storage")
         return
@@ -1761,6 +2378,15 @@ def handle_meeting_ended(data):
                     camera_on_minutes = camera_info.get('minutes', 0)
                     camera_on_intervals = camera_info.get('intervals', '')
 
+                    # Calculate event_date from participant's join_time (not today's date)
+                    event_date = get_ist_date()  # Fallback
+                    if join_time:
+                        try:
+                            join_dt = datetime.fromisoformat(join_time.replace('Z', '+00:00'))
+                            event_date = get_ist_date_from_utc(join_dt.replace(tzinfo=None))
+                        except (ValueError, AttributeError):
+                            pass  # Keep fallback
+
                     qos_data = {
                         'qos_id': str(uuid_lib.uuid4()),
                         'meeting_uuid': safe_str(meeting_uuid),
@@ -1775,7 +2401,7 @@ def handle_meeting_ended(data):
                         'camera_on_minutes': camera_on_minutes,
                         'camera_on_intervals': camera_on_intervals,
                         'recorded_at': datetime.utcnow().isoformat(),
-                        'event_date': get_ist_date()
+                        'event_date': event_date
                     }
 
                     # Log each insert for debugging
@@ -1973,46 +2599,143 @@ def webhook():
 
 @app.route('/calibration/start', methods=['POST'])
 def calibration_start():
-    """Start calibration session"""
+    """Start calibration session with SEQUENCE-BASED matching and BigQuery persistence"""
     data = request.json or {}
     meeting_id = data.get('meeting_id')
     meeting_uuid = data.get('meeting_uuid')
+    force_restart = data.get('force_restart', False)  # Force restart even if incomplete exists
 
     # Calibration participant info (for "Move Myself" mode)
     calibration_mode = data.get('calibration_mode', 'scout_bot')
     calibration_participant_name = data.get('calibration_participant_name', '')
     calibration_participant_uuid = data.get('calibration_participant_uuid', '')
 
+    # SEQUENCE-BASED MATCHING: Get ordered room list
+    # Frontend sends rooms in the order they will be visited
+    room_sequence = data.get('room_sequence', [])  # [{room_name, room_uuid}, ...]
+
     if not meeting_id:
         return jsonify({'error': 'meeting_id required'}), 400
+
+    # CHECK FOR INCOMPLETE CALIBRATION (Auto-resume support)
+    resume_from = 0
+    existing_state = load_calibration_state(meeting_id)
+    if existing_state and not force_restart:
+        if existing_state.get('calibration_in_progress') and not existing_state.get('completed'):
+            # Incomplete calibration found - can resume
+            resume_from = existing_state.get('current_room_index', 0)
+            total_rooms = existing_state.get('total_rooms', 0)
+            print(f"[Calibration] RESUME available: {resume_from}/{total_rooms} rooms completed")
+
+            # If room sequence matches, we can resume
+            if len(room_sequence) == total_rooms:
+                print(f"[Calibration] Room count matches - resuming from room {resume_from + 1}")
+            else:
+                print(f"[Calibration] Room count changed ({len(room_sequence)} vs {total_rooms}) - starting fresh")
+                resume_from = 0
 
     # Reset state for new calibration
     meeting_state.set_meeting(meeting_id, meeting_uuid)
     meeting_state.calibration_complete = False
     meeting_state.calibration_in_progress = True
-    meeting_state.pending_room_moves = []
+    meeting_state.pending_room_moves = []  # Legacy, kept for compatibility
+
+    # Clear sequence state for clean start
+    meeting_state.calibration_sequence = []
+    meeting_state.calibration_next_index = 0
+    print(f"[Calibration] State reset: next_index=0, sequence cleared")
 
     # Store calibration participant info
     meeting_state.calibration_mode = calibration_mode
     meeting_state.calibration_participant_name = calibration_participant_name
     meeting_state.calibration_participant_uuid = calibration_participant_uuid
 
-    print(f"\n{'='*50}")
+    # SEQUENCE-BASED MATCHING: Use FIXED_ROOM_SEQUENCE as authoritative source
+    # This is more reliable than frontend order since bot always visits in this exact sequence
+    meeting_state.calibration_sequence = []
+    meeting_state.calibration_next_index = resume_from  # Start from resume point
+
+    # PRIORITY 1: Use FIXED_ROOM_SEQUENCE (most reliable - hardcoded order)
+    if USE_FIXED_SEQUENCE and FIXED_ROOM_SEQUENCE:
+        print(f"[Calibration] Using FIXED_ROOM_SEQUENCE ({len(FIXED_ROOM_SEQUENCE)} rooms)")
+        for i, room_name in enumerate(FIXED_ROOM_SEQUENCE):
+            meeting_state.calibration_sequence.append({
+                'room_name': room_name,
+                'room_index': i,
+                'sdk_uuid': None,  # Will be filled from frontend if available
+                'webhook_uuid': None,  # Will be filled when webhook arrives
+                'matched': False
+            })
+
+        # Also store SDK UUIDs from frontend for cross-reference (secondary source)
+        for room in room_sequence:
+            room_name = room.get('room_name') or room.get('name') or room.get('breakoutRoomName')
+            room_uuid = room.get('room_uuid') or room.get('uuid') or room.get('breakoutRoomId')
+            if room_uuid and room_name:
+                # Find matching room in sequence and add SDK UUID
+                for seq_room in meeting_state.calibration_sequence:
+                    if seq_room['room_name'] == room_name:
+                        seq_room['sdk_uuid'] = room_uuid
+                        meeting_state.add_room_mapping(room_uuid, room_name)
+                        break
+    else:
+        # Fallback: Use frontend sequence (original behavior)
+        print(f"[Calibration] Using frontend room sequence ({len(room_sequence)} rooms)")
+        for idx, room in enumerate(room_sequence):
+            room_name = room.get('room_name') or room.get('name') or room.get('breakoutRoomName')
+            room_uuid = room.get('room_uuid') or room.get('uuid') or room.get('breakoutRoomId')
+            if room_name:
+                meeting_state.calibration_sequence.append({
+                    'room_name': room_name,
+                    'room_index': idx,
+                    'sdk_uuid': room_uuid,
+                    'webhook_uuid': None,
+                    'matched': False
+                })
+                if room_uuid:
+                    meeting_state.add_room_mapping(room_uuid, room_name)
+
+    # SAVE CALIBRATION STATE TO BIGQUERY (persistence)
+    state_data = {
+        'calibration_in_progress': True,
+        'calibration_mode': calibration_mode,
+        'calibration_participant_name': calibration_participant_name or SCOUT_BOT_NAME,
+        'current_room_index': resume_from,
+        'total_rooms': len(meeting_state.calibration_sequence),
+        'room_sequence': [r['room_name'] for r in meeting_state.calibration_sequence],
+        'started_at': datetime.utcnow().isoformat(),
+        'completed': False,
+        'completed_at': ''
+    }
+    save_calibration_state(meeting_id, meeting_uuid, state_data)
+
+    print(f"\n{'='*60}")
     print(f"[Calibration] STARTED for meeting {meeting_id}")
     print(f"[Calibration] Mode: {calibration_mode}")
+    print(f"[Calibration] SEQUENCE-BASED MATCHING ENABLED")
+    if resume_from > 0:
+        print(f"[Calibration] RESUMING from room {resume_from + 1}")
+    print(f"[Calibration] Room sequence ({len(meeting_state.calibration_sequence)} rooms):")
+    for i, room in enumerate(meeting_state.calibration_sequence):
+        status = "✓ DONE" if i < resume_from else ""
+        print(f"  Position {i+1}: {room['room_name']} {status}")
     if calibration_mode == 'self':
         print(f"[Calibration] Participant: {calibration_participant_name}")
     else:
         print(f"[Calibration] Using Scout Bot: {SCOUT_BOT_NAME}")
-    print(f"[Calibration] Webhook UUID capture ENABLED")
-    print(f"{'='*50}\n")
+    print(f"[Calibration] State saved to BigQuery")
+    print(f"{'='*60}\n")
 
     return jsonify({
         'success': True,
-        'message': 'Calibration started',
+        'message': 'Calibration started with sequence-based matching',
         'meeting_id': meeting_id,
         'calibration_mode': calibration_mode,
-        'calibration_participant': calibration_participant_name or SCOUT_BOT_NAME
+        'calibration_participant': calibration_participant_name or SCOUT_BOT_NAME,
+        'room_count': len(meeting_state.calibration_sequence),
+        'sequence_matching': True,
+        'resume_from': resume_from,
+        'persisted': True
     })
 
 
@@ -2082,38 +2805,48 @@ def calibration_mapping():
 @app.route('/calibration/pending', methods=['GET'])
 def calibration_pending():
     """
-    Get pending room moves and their match status.
+    Check if a room's webhook has been received.
     Used by React app to poll and wait for webhook confirmation.
+    Pure position-based: frontend waits for each webhook before moving to next room.
     """
     room_name = request.args.get('room_name')
+    sequence = meeting_state.calibration_sequence
 
-    pending_moves = []
-    for move in meeting_state.pending_room_moves:
-        move_info = {
-            'room_name': move.get('room_name'),
-            'sdk_uuid': move.get('sdk_uuid'),
-            'matched': move.get('matched', False),
-            'webhook_uuid': move.get('webhook_uuid') if move.get('matched') else None
-        }
-        pending_moves.append(move_info)
+    if not sequence:
+        return jsonify({
+            'matched': False,
+            'total_pending': 0,
+            'total_matched': 0,
+            'error': 'No calibration sequence active'
+        })
+
+    total_matched = len([m for m in sequence if m.get('matched')])
+    total_pending = len(sequence) - total_matched
 
     # If room_name is specified, check if that specific room is matched
     if room_name:
         room_matched = any(
             m.get('room_name') == room_name and m.get('matched')
-            for m in meeting_state.pending_room_moves
+            for m in sequence
         )
         return jsonify({
             'room_name': room_name,
             'matched': room_matched,
-            'total_pending': len([m for m in meeting_state.pending_room_moves if not m['matched']]),
-            'total_matched': len([m for m in meeting_state.pending_room_moves if m['matched']])
+            'total_pending': total_pending,
+            'total_matched': total_matched
         })
+
+    # Return full status
+    pending_moves = [{
+        'room_name': room.get('room_name'),
+        'matched': room.get('matched', False),
+        'webhook_uuid': room.get('webhook_uuid') if room.get('matched') else None
+    } for room in sequence]
 
     return jsonify({
         'pending_moves': pending_moves,
-        'total_pending': len([m for m in meeting_state.pending_room_moves if not m['matched']]),
-        'total_matched': len([m for m in meeting_state.pending_room_moves if m['matched']])
+        'total_pending': total_pending,
+        'total_matched': total_matched
     })
 
 
@@ -2130,98 +2863,64 @@ def calibration_complete():
     meeting_state.calibrated_at = datetime.utcnow().isoformat()
     meeting_state.calibration_in_progress = False
 
-    # Count webhook UUID matches
-    webhook_matches = len([m for m in meeting_state.pending_room_moves if m.get('matched')])
-    unmatched = len([m for m in meeting_state.pending_room_moves if not m.get('matched')])
+    # Count matches from sequence
+    sequence = meeting_state.calibration_sequence
+    webhook_matches = len([m for m in sequence if m.get('matched')])
+    unmatched = len([m for m in sequence if not m.get('matched')])
 
-    print(f"\n{'='*50}")
-    print(f"[Calibration] COMPLETE - {mapped_rooms}/{total_rooms} SDK room mappings")
-    print(f"[Calibration] Webhook UUID matches: {webhook_matches} matched, {unmatched} unmatched")
+    # MARK CALIBRATION COMPLETE IN BIGQUERY
+    if meeting_id or meeting_state.meeting_id:
+        complete_calibration_state(meeting_id or meeting_state.meeting_id)
+
+    print(f"\n{'='*60}")
+    print(f"[Calibration] COMPLETE - {mapped_rooms}/{total_rooms} rooms")
+    print(f"[Calibration] Position-based matching: {webhook_matches} matched, {unmatched} unmatched")
     print(f"[Calibration] Total mappings in memory: {len(meeting_state.uuid_to_name)}")
-    print(f"[Calibration] Scout Bot can now leave the meeting")
-    print(f"{'='*50}\n")
+    if sequence:
+        for i, room in enumerate(sequence):
+            status = "MATCHED" if room.get('matched') else "PENDING"
+            uuid_preview = room.get('webhook_uuid', '')[:20] + '...' if room.get('webhook_uuid') else 'N/A'
+            print(f"  {i+1}. {room.get('room_name')}: {status} (UUID: {uuid_preview})")
+    print(f"{'='*60}\n")
 
     return jsonify({
         'success': True,
-        'message': 'Calibration complete - Scout Bot can leave now',
-        'sdk_mappings': mapped_rooms,
+        'message': 'Calibration complete',
         'webhook_uuid_matches': webhook_matches,
-        'unmatched_rooms': unmatched
+        'unmatched_rooms': unmatched,
+        'persisted': True
     })
 
 
 @app.route('/calibration/verify', methods=['POST'])
 def calibration_verify():
     """
-    Frontend calls this AFTER SDK verification confirms bot is in correct room.
-    This saves the webhook UUID mapping to BigQuery.
+    Frontend calls this AFTER webhook confirmed for a room.
+    With position-based matching, the mapping is already saved to BigQuery
+    when the webhook arrives. This endpoint just confirms it.
     """
     data = request.json or {}
     room_name = data.get('room_name')
-    meeting_id = data.get('meeting_id')
 
     if not room_name:
         return jsonify({'error': 'room_name required'}), 400
 
-    # Find the matched pending move for this room
-    matched_move = None
-    for move in meeting_state.pending_room_moves:
-        if move.get('room_name') == room_name and move.get('matched') and not move.get('verified'):
-            matched_move = move
+    # Find the matched entry in calibration sequence
+    matched_entry = None
+    for entry in meeting_state.calibration_sequence:
+        if entry.get('room_name') == room_name and entry.get('matched'):
+            matched_entry = entry
             break
 
-    if not matched_move:
-        print(f"[Calibration] Verify called but no unverified match found for: {room_name}")
+    if not matched_entry:
+        print(f"[Calibration] Verify: no match found for {room_name}")
         return jsonify({
             'success': False,
-            'error': f'No unverified match found for room: {room_name}'
+            'error': f'No match found for room: {room_name}'
         }), 404
 
-    webhook_uuid = matched_move.get('webhook_uuid')
-    if not webhook_uuid:
-        print(f"[Calibration] Verify called but no webhook UUID for: {room_name}")
-        return jsonify({
-            'success': False,
-            'error': f'No webhook UUID captured for room: {room_name}'
-        }), 404
-
-    # Mark as verified
-    matched_move['verified'] = True
+    webhook_uuid = matched_entry.get('webhook_uuid', '')
     print(f"[Calibration] VERIFIED: {room_name} = {webhook_uuid[:20]}...")
-
-    # NOW save to BigQuery (only after frontend verification)
-    try:
-        today = get_ist_date()
-        mapping_row = {
-            'mapping_id': str(uuid_lib.uuid4()),
-            'meeting_id': str(meeting_id or meeting_state.meeting_id),
-            'meeting_uuid': meeting_state.meeting_uuid or '',
-            'room_uuid': webhook_uuid,
-            'room_name': room_name,
-            'room_index': len([m for m in meeting_state.pending_room_moves if m.get('verified')]) - 1,
-            'mapping_date': today,
-            'mapped_at': datetime.utcnow().isoformat(),
-            'source': 'webhook_calibration'  # Webhook UUID verified by SDK
-        }
-        success = insert_room_mappings([mapping_row])
-        if success:
-            print(f"[Calibration] SAVED verified mapping to BigQuery: {room_name}")
-        else:
-            print(f"[Calibration] WARNING: BigQuery insert returned false for {room_name}")
-
-        # Prune old verified entries to prevent list from growing indefinitely
-        # Keep only entries that are either unverified or verified within last 5 minutes
-        now = datetime.utcnow()
-        meeting_state.pending_room_moves = [
-            m for m in meeting_state.pending_room_moves
-            if not m.get('verified') or (now - m.get('timestamp', now)).total_seconds() < 300
-        ]
-        print(f"[Calibration] Pending moves after prune: {len(meeting_state.pending_room_moves)}")
-
-    except Exception as e:
-        print(f"[Calibration] ERROR saving verified mapping: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
 
     return jsonify({
         'success': True,
@@ -2233,14 +2932,478 @@ def calibration_verify():
 
 @app.route('/calibration/status', methods=['GET'])
 def calibration_status():
-    """Get current calibration status"""
+    """Get current calibration status - supports resume functionality"""
+    meeting_id = request.args.get('meeting_id') or meeting_state.meeting_id
+
+    # First check in-memory state
+    in_progress = meeting_state.calibration_in_progress
+    current_index = meeting_state.calibration_next_index
+    total_rooms = len(meeting_state.calibration_sequence)
+
+    # If in-memory state is empty, check BigQuery for persisted state
+    if not in_progress and meeting_id:
+        bq_state = load_calibration_state(meeting_id)
+        if bq_state and bq_state.get('calibration_in_progress') and not bq_state.get('completed'):
+            in_progress = True
+            current_index = bq_state.get('current_room_index', 0)
+            total_rooms = bq_state.get('total_rooms', 66)
+            print(f"[calibration/status] Found resumable state in BQ: index={current_index}/{total_rooms}")
+
     return jsonify({
         'meeting_id': meeting_state.meeting_id,
         'calibration_complete': meeting_state.calibration_complete,
         'calibrated_at': meeting_state.calibrated_at,
         'rooms_mapped': len(meeting_state.uuid_to_name),
-        'room_names': list(meeting_state.name_to_uuid.keys())[:20]
+        'room_names': list(meeting_state.name_to_uuid.keys())[:20],
+        # Resume support fields
+        'calibration_in_progress': in_progress,
+        'current_room_index': current_index,
+        'total_rooms': total_rooms
     })
+
+
+@app.route('/calibration/correct', methods=['POST'])
+def calibration_correct():
+    """
+    Manual trigger for timestamp-based calibration correction.
+    Call this after calibration to fix any out-of-order webhook issues.
+    """
+    data = request.json or {}
+    meeting_id = data.get('meeting_id') or meeting_state.meeting_id
+    target_date = data.get('date') or get_ist_date()
+
+    result = correct_calibration_by_timestamp(meeting_id, target_date)
+
+    if result.get('success'):
+        return jsonify(result)
+    else:
+        return jsonify(result), 400
+
+
+@app.route('/calibration/fix-by-index', methods=['POST'])
+def calibration_fix_by_index():
+    """
+    Fix room_name values in BigQuery based on room_index and FIXED_ROOM_SEQUENCE.
+    This corrects any mismatched room names by using the authoritative sequence.
+
+    Use this after calibration if validation shows mismatches.
+    """
+    data = request.json or {}
+    try:
+        target_date = validate_date_format(data.get('date'))
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    dry_run = data.get('dry_run', True)  # Default to dry run for safety
+
+    try:
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+
+        # First, get current mappings to identify what needs fixing
+        query = f"""
+        SELECT
+            mapping_id,
+            room_uuid,
+            room_name,
+            room_index,
+            source
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date = @target_date
+          AND room_index IS NOT NULL
+          AND room_index >= 0
+          AND room_index < {len(FIXED_ROOM_SEQUENCE)}
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("target_date", "STRING", target_date)
+            ]
+        )
+        results = list(client.query(query, job_config=job_config).result())
+
+        fixes_needed = []
+        already_correct = 0
+
+        for row in results:
+            room_index = row.room_index
+            stored_name = row.room_name
+            expected_name = FIXED_ROOM_SEQUENCE[room_index]
+
+            if stored_name != expected_name:
+                fixes_needed.append({
+                    'mapping_id': row.mapping_id,
+                    'room_uuid': row.room_uuid,
+                    'room_index': room_index,
+                    'old_name': stored_name,
+                    'new_name': expected_name
+                })
+            else:
+                already_correct += 1
+
+        if dry_run:
+            return jsonify({
+                'dry_run': True,
+                'date': target_date,
+                'fixes_needed': len(fixes_needed),
+                'already_correct': already_correct,
+                'fixes_preview': fixes_needed[:20],  # Show first 20
+                'message': 'Set dry_run=false to apply fixes'
+            })
+
+        # Apply fixes using MERGE/UPDATE
+        if fixes_needed:
+            # Build CASE statement for updates
+            updates_applied = 0
+            for fix in fixes_needed:
+                update_query = f"""
+                UPDATE `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+                SET room_name = '{fix['new_name'].replace("'", "''")}'
+                WHERE mapping_id = '{fix['mapping_id']}'
+                """
+                try:
+                    client.query(update_query).result()
+                    updates_applied += 1
+                except Exception as e:
+                    print(f"[FixByIndex] Error updating {fix['mapping_id']}: {e}")
+
+            # Also update in-memory state
+            for fix in fixes_needed:
+                if fix['room_uuid'] in meeting_state.uuid_to_name:
+                    meeting_state.uuid_to_name[fix['room_uuid']] = fix['new_name']
+
+            return jsonify({
+                'success': True,
+                'date': target_date,
+                'fixes_applied': updates_applied,
+                'fixes_needed': len(fixes_needed),
+                'already_correct': already_correct,
+                'message': f'Fixed {updates_applied} room names based on FIXED_ROOM_SEQUENCE'
+            })
+        else:
+            return jsonify({
+                'success': True,
+                'date': target_date,
+                'fixes_needed': 0,
+                'already_correct': already_correct,
+                'message': 'All room names already match FIXED_ROOM_SEQUENCE'
+            })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': str(e),
+            'date': target_date
+        }), 500
+
+
+@app.route('/calibration/fixed-sequence', methods=['GET'])
+def get_fixed_sequence():
+    """
+    Get the current FIXED_ROOM_SEQUENCE configuration.
+    This is the master list of room names in the order Scout Bot visits them.
+    """
+    return jsonify({
+        'use_fixed_sequence': USE_FIXED_SEQUENCE,
+        'total_rooms': len(FIXED_ROOM_SEQUENCE),
+        'sequence': FIXED_ROOM_SEQUENCE
+    })
+
+
+@app.route('/calibration/validate', methods=['GET', 'POST'])
+def calibration_validate():
+    """
+    Validate mapping accuracy by comparing multiple sources:
+    1. FIXED_ROOM_SEQUENCE (authoritative)
+    2. BigQuery room_mappings (calibration data)
+    3. Cross-reference room_index with room_name
+
+    Returns discrepancies and accuracy metrics.
+    """
+    data = request.json or {}
+    try:
+        target_date = validate_date_format(data.get('date') or request.args.get('date'))
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+
+    try:
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+
+        # Get all mappings for target date
+        query = f"""
+        SELECT
+            room_uuid,
+            room_name,
+            room_index,
+            source,
+            mapping_date,
+            mapped_at
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date = @target_date
+        ORDER BY room_index, mapped_at
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("target_date", "STRING", target_date)
+            ]
+        )
+        results = list(client.query(query, job_config=job_config).result())
+
+        # Analyze mappings
+        validation_results = {
+            'date': target_date,
+            'total_mappings': len(results),
+            'fixed_sequence_total': len(FIXED_ROOM_SEQUENCE),
+            'matches': [],
+            'mismatches': [],
+            'missing_from_calibration': [],
+            'extra_in_calibration': [],
+            'accuracy_percent': 0
+        }
+
+        # Track which rooms from fixed sequence were found
+        found_indices = set()
+        match_count = 0
+
+        for row in results:
+            room_uuid = row.room_uuid
+            stored_name = row.room_name
+            room_index = row.room_index
+            source = row.source
+
+            # Get expected name from FIXED_ROOM_SEQUENCE
+            expected_name = None
+            if room_index is not None and 0 <= room_index < len(FIXED_ROOM_SEQUENCE):
+                expected_name = FIXED_ROOM_SEQUENCE[room_index]
+                found_indices.add(room_index)
+
+            entry = {
+                'room_uuid': room_uuid[:20] + '...' if room_uuid and len(room_uuid) > 20 else room_uuid,
+                'room_index': room_index,
+                'stored_name': stored_name,
+                'expected_name': expected_name,
+                'source': source
+            }
+
+            if expected_name and stored_name == expected_name:
+                validation_results['matches'].append(entry)
+                match_count += 1
+            elif expected_name and stored_name != expected_name:
+                entry['issue'] = f"Name mismatch: stored '{stored_name}' vs expected '{expected_name}'"
+                validation_results['mismatches'].append(entry)
+            elif room_index is None or room_index >= len(FIXED_ROOM_SEQUENCE):
+                entry['issue'] = f"Invalid room_index: {room_index}"
+                validation_results['extra_in_calibration'].append(entry)
+
+        # Find rooms in FIXED_ROOM_SEQUENCE not in calibration
+        for idx, name in enumerate(FIXED_ROOM_SEQUENCE):
+            if idx not in found_indices:
+                validation_results['missing_from_calibration'].append({
+                    'room_index': idx,
+                    'room_name': name,
+                    'issue': 'Not found in calibration'
+                })
+
+        # Calculate accuracy
+        if len(FIXED_ROOM_SEQUENCE) > 0:
+            validation_results['accuracy_percent'] = round(
+                (match_count / len(FIXED_ROOM_SEQUENCE)) * 100, 1
+            )
+
+        # Summary
+        validation_results['summary'] = {
+            'correct': match_count,
+            'mismatched': len(validation_results['mismatches']),
+            'missing': len(validation_results['missing_from_calibration']),
+            'extra': len(validation_results['extra_in_calibration'])
+        }
+
+        return jsonify(validation_results)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': str(e),
+            'date': target_date
+        }), 500
+
+
+@app.route('/calibration/health', methods=['GET', 'POST'])
+def calibration_health():
+    """
+    Health check for calibration status.
+    Called by Cloud Scheduler at 9:30 AM to verify calibration is complete.
+    Sends email alert if calibration is incomplete or failed.
+    """
+    send_alert = request.args.get('alert', 'true').lower() == 'true'
+    target_date = request.args.get('date') or get_ist_date()
+
+    try:
+        # Load calibration state from BigQuery
+        state = load_calibration_state(date=target_date)
+
+        # Count room mappings with sequence_calibration source
+        client = get_bq_client()
+        mapping_query = f"""
+        SELECT
+            COUNT(*) as total_mappings,
+            COUNTIF(source = 'sequence_calibration') as sequence_mappings,
+            COUNTIF(source = 'zoom_sdk_app') as sdk_mappings
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date = @target_date
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("target_date", "STRING", target_date),
+            ]
+        )
+        results = list(client.query(mapping_query, job_config=job_config).result())
+
+        total_mappings = results[0].total_mappings if results else 0
+        sequence_mappings = results[0].sequence_mappings if results else 0
+        sdk_mappings = results[0].sdk_mappings if results else 0
+
+        # Determine health status
+        calibration_started = state is not None
+        calibration_completed = state.get('completed', False) if state else False
+        calibration_in_progress = state.get('calibration_in_progress', False) if state else False
+        current_room = state.get('current_room_index', 0) if state else 0
+        total_rooms = state.get('total_rooms', 0) if state else 0
+
+        # Health criteria:
+        # - HEALTHY: calibration completed AND sequence_mappings > 0
+        # - WARNING: calibration in progress (not yet complete)
+        # - CRITICAL: calibration started but failed OR no calibration at all
+        if calibration_completed and sequence_mappings > 0:
+            health_status = 'HEALTHY'
+            message = f'Calibration complete: {sequence_mappings} rooms mapped with webhook UUIDs'
+        elif calibration_in_progress:
+            health_status = 'WARNING'
+            message = f'Calibration in progress: {current_room}/{total_rooms} rooms done'
+        elif calibration_started and not calibration_completed:
+            health_status = 'CRITICAL'
+            message = f'Calibration incomplete: {current_room}/{total_rooms} rooms done, then stopped'
+        elif total_mappings > 0 and sequence_mappings == 0:
+            health_status = 'WARNING'
+            message = f'No webhook UUID mappings - only SDK mappings ({sdk_mappings}). Reports may show Room-XXXXX'
+        else:
+            health_status = 'CRITICAL'
+            message = 'No calibration data for today'
+
+        # Send email alert if critical and alerts enabled
+        alert_sent = False
+        if health_status == 'CRITICAL' and send_alert and SENDGRID_API_KEY:
+            try:
+                alert_sent = send_calibration_alert(
+                    target_date,
+                    health_status,
+                    message,
+                    {
+                        'total_mappings': total_mappings,
+                        'sequence_mappings': sequence_mappings,
+                        'sdk_mappings': sdk_mappings,
+                        'current_room': current_room,
+                        'total_rooms': total_rooms,
+                        'calibration_started': calibration_started,
+                        'calibration_completed': calibration_completed
+                    }
+                )
+            except Exception as e:
+                print(f"[CalibrationHealth] Alert send error: {e}")
+
+        response = {
+            'date': target_date,
+            'health_status': health_status,
+            'message': message,
+            'calibration': {
+                'started': calibration_started,
+                'completed': calibration_completed,
+                'in_progress': calibration_in_progress,
+                'current_room': current_room,
+                'total_rooms': total_rooms
+            },
+            'mappings': {
+                'total': total_mappings,
+                'sequence_calibration': sequence_mappings,
+                'sdk_only': sdk_mappings
+            },
+            'alert_sent': alert_sent
+        }
+
+        print(f"[CalibrationHealth] {health_status}: {message}")
+        return jsonify(response), 200 if health_status == 'HEALTHY' else 503
+
+    except Exception as e:
+        print(f"[CalibrationHealth] Error: {e}")
+        traceback.print_exc()
+        return jsonify({
+            'date': target_date,
+            'health_status': 'ERROR',
+            'message': str(e),
+            'alert_sent': False
+        }), 500
+
+
+def send_calibration_alert(date, status, message, details):
+    """Send email alert for calibration issues via SendGrid"""
+    if not SENDGRID_API_KEY or not REPORT_EMAIL_TO:
+        print("[CalibrationAlert] SendGrid not configured, skipping alert")
+        return False
+
+    try:
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To, Content
+
+        sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
+
+        subject = f"[ALERT] Zoom Calibration {status} - {date}"
+
+        html_content = f"""
+        <h2>Zoom Breakout Room Calibration Alert</h2>
+        <p><strong>Status:</strong> <span style="color: {'red' if status == 'CRITICAL' else 'orange'}">{status}</span></p>
+        <p><strong>Date:</strong> {date}</p>
+        <p><strong>Message:</strong> {message}</p>
+
+        <h3>Details</h3>
+        <ul>
+            <li>Calibration Started: {details.get('calibration_started', False)}</li>
+            <li>Calibration Completed: {details.get('calibration_completed', False)}</li>
+            <li>Rooms Progress: {details.get('current_room', 0)} / {details.get('total_rooms', 0)}</li>
+            <li>Webhook UUID Mappings: {details.get('sequence_mappings', 0)}</li>
+            <li>SDK-only Mappings: {details.get('sdk_mappings', 0)}</li>
+        </ul>
+
+        <h3>Action Required</h3>
+        <p>Please run calibration by:</p>
+        <ol>
+            <li>Open Zoom meeting with Scout Bot</li>
+            <li>Open the Zoom App calibration panel</li>
+            <li>Click "Move Scout Bot" to auto-calibrate all rooms</li>
+        </ol>
+
+        <p style="color: gray; font-size: 12px;">
+        This alert was sent by the Zoom Breakout Room Tracker system.
+        </p>
+        """
+
+        recipients = [r.strip() for r in REPORT_EMAIL_TO.replace(';', ',').split(',') if r.strip()]
+
+        mail = Mail(
+            from_email=Email(REPORT_EMAIL_FROM),
+            to_emails=[To(r) for r in recipients],
+            subject=subject,
+            html_content=Content("text/html", html_content)
+        )
+
+        response = sg.send(mail)
+        print(f"[CalibrationAlert] Email sent to {recipients}, status: {response.status_code}")
+        return response.status_code == 202
+
+    except Exception as e:
+        print(f"[CalibrationAlert] Failed to send email: {e}")
+        traceback.print_exc()
+        return False
 
 
 @app.route('/debug/bq-mappings', methods=['GET'])
@@ -2255,11 +3418,17 @@ def debug_bq_mappings():
         query = f"""
         SELECT mapping_date, room_uuid, room_name, meeting_id, source, mapped_at
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
-        WHERE mapping_date IN ('{today}', '{yesterday}')
+        WHERE mapping_date IN (@today, @yesterday)
         ORDER BY mapped_at DESC
         LIMIT 100
         """
-        results = list(client.query(query).result())
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("today", "STRING", today),
+                bigquery.ScalarQueryParameter("yesterday", "STRING", yesterday)
+            ]
+        )
+        results = list(client.query(query, job_config=job_config).result())
 
         mappings = []
         for row in results:
@@ -2310,6 +3479,549 @@ def calibration_reload():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/calibration/abort', methods=['POST'])
+def calibration_abort():
+    """
+    Abort calibration and DELETE all mappings saved during this session.
+    Called when calibration fails midway to prevent duplicate/partial records.
+    This ensures a clean state for the next calibration attempt.
+    """
+    data = request.json or {}
+    meeting_id = data.get('meeting_id') or meeting_state.meeting_id
+    today = get_ist_date()
+
+    print(f"\n{'='*60}")
+    print(f"[Calibration] ABORT requested for meeting {meeting_id}")
+    print(f"{'='*60}\n")
+
+    deleted_count = 0
+
+    if meeting_id:
+        try:
+            client = get_bq_client()
+            # Delete ALL calibration mappings for this meeting + today
+            # This removes sequential_calibration, pending_move_calibration, and zoom_sdk_app
+            delete_query = f"""
+            DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+            WHERE meeting_id = @meeting_id
+              AND mapping_date = @today
+              AND source IN ('sequential_calibration', 'pending_move_calibration', 'zoom_sdk_app')
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("meeting_id", "STRING", str(meeting_id)),
+                    bigquery.ScalarQueryParameter("today", "STRING", today),
+                ]
+            )
+            job = client.query(delete_query, job_config=job_config)
+            job.result()  # Wait for completion
+            deleted_count = job.num_dml_affected_rows or 0
+            print(f"[Calibration] Deleted {deleted_count} calibration mappings from BigQuery")
+        except Exception as e:
+            print(f"[Calibration] Error deleting mappings: {e}")
+
+    # Reset in-memory calibration state
+    meeting_state.calibration_in_progress = False
+    meeting_state.calibration_complete = False
+    meeting_state.calibration_sequence = []
+    meeting_state.calibration_next_index = 0
+    meeting_state.pending_room_moves = []
+    meeting_state.scout_bot_current_room = None
+    meeting_state.uuid_to_name = {}
+    meeting_state.name_to_uuid = {}
+
+    # Mark as aborted in BigQuery state
+    if meeting_id:
+        try:
+            complete_calibration_state(meeting_id)
+        except Exception:
+            pass
+
+    print(f"[Calibration] Abort complete - all session data cleared")
+
+    return jsonify({
+        'success': True,
+        'message': 'Calibration aborted - all session mappings deleted',
+        'deleted_mappings': deleted_count
+    })
+
+
+@app.route('/calibration/reset', methods=['POST'])
+def calibration_reset():
+    """
+    Full reset of calibration state.
+    Call this to stop ongoing calibration and start fresh.
+    """
+    data = request.json or {}
+    clear_bigquery = data.get('clear_bigquery', False)
+    meeting_id = data.get('meeting_id') or meeting_state.meeting_id
+
+    print(f"\n{'='*60}")
+    print(f"[Calibration] RESET requested")
+    print(f"[Calibration] Clear BigQuery: {clear_bigquery}")
+    print(f"{'='*60}\n")
+
+    # Reset in-memory state COMPLETELY
+    old_meeting_id = meeting_state.meeting_id
+    meeting_state.calibration_in_progress = False
+    meeting_state.calibration_complete = False
+    meeting_state.calibration_sequence = []
+    meeting_state.calibration_next_index = 0
+    meeting_state.pending_room_moves = []
+    meeting_state.scout_bot_current_room = None
+    # CRITICAL: Clear the actual room mappings!
+    meeting_state.uuid_to_name = {}
+    meeting_state.name_to_uuid = {}
+    print(f"[Calibration] Cleared all in-memory mappings")
+
+    # Optionally clear BigQuery mappings for ALL dates (not just today)
+    if clear_bigquery and meeting_id:
+        try:
+            client = get_bq_client()
+            # Delete ALL mappings for this meeting, not just today
+            delete_query = f"""
+            DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+            WHERE meeting_id = @meeting_id
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("meeting_id", "STRING", str(meeting_id)),
+                ]
+            )
+            client.query(delete_query, job_config=job_config).result()
+            print(f"[Calibration] Cleared ALL BigQuery mappings for meeting {meeting_id}")
+        except Exception as e:
+            print(f"[Calibration] Error clearing BigQuery: {e}")
+
+    return jsonify({
+        'success': True,
+        'message': 'Calibration reset complete',
+        'previous_meeting_id': old_meeting_id,
+        'bigquery_cleared': clear_bigquery
+    })
+
+
+@app.route('/calibration/live-rooms', methods=['GET'])
+def calibration_live_rooms():
+    """
+    Get current breakout room participant data from BigQuery events.
+    This shows who is currently in each room based on join/leave events.
+    Used for manual verification of room mappings.
+    """
+    meeting_id = request.args.get('meeting_id') or meeting_state.meeting_id
+    today = get_ist_date()
+
+    if not meeting_id:
+        return jsonify({'error': 'No meeting_id available'}), 400
+
+    try:
+        client = get_bq_client()
+
+        # Query to get current room occupancy
+        # A participant is "in" a room if their last event for that room was a join
+        query = f"""
+        WITH latest_events AS (
+            SELECT
+                participant_name,
+                participant_email,
+                room_uuid,
+                room_name,
+                event_type,
+                event_timestamp,
+                ROW_NUMBER() OVER (
+                    PARTITION BY participant_id, room_uuid
+                    ORDER BY event_timestamp DESC
+                ) as rn
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+            WHERE event_date = @today
+              AND meeting_id = @meeting_id
+              AND event_type IN ('breakout_room_joined', 'breakout_room_left')
+        ),
+        current_in_rooms AS (
+            SELECT
+                room_uuid,
+                room_name,
+                participant_name,
+                participant_email,
+                event_timestamp as joined_at
+            FROM latest_events
+            WHERE rn = 1 AND event_type = 'breakout_room_joined'
+        )
+        SELECT
+            room_uuid,
+            room_name,
+            ARRAY_AGG(STRUCT(participant_name, participant_email, joined_at)) as participants
+        FROM current_in_rooms
+        GROUP BY room_uuid, room_name
+        ORDER BY room_name
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("today", "STRING", today),
+                bigquery.ScalarQueryParameter("meeting_id", "STRING", str(meeting_id)),
+            ]
+        )
+
+        results = list(client.query(query, job_config=job_config).result())
+
+        rooms = []
+        for row in results:
+            rooms.append({
+                'room_uuid': row.room_uuid,
+                'room_name': row.room_name,
+                'participants': [
+                    {
+                        'name': p['participant_name'],
+                        'email': p['participant_email'],
+                        'joined_at': p['joined_at']
+                    }
+                    for p in row.participants
+                ],
+                'participant_count': len(row.participants)
+            })
+
+        # Also get mapping status for each room
+        mapping_query = f"""
+        SELECT DISTINCT room_uuid, room_name, source
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date = @today AND meeting_id = @meeting_id
+        """
+        mapping_results = list(client.query(mapping_query, job_config=job_config).result())
+        mapped_uuids = {r.room_uuid: {'name': r.room_name, 'source': r.source} for r in mapping_results}
+
+        return jsonify({
+            'success': True,
+            'meeting_id': meeting_id,
+            'date': today,
+            'rooms': rooms,
+            'total_rooms': len(rooms),
+            'mapped_rooms': len(mapped_uuids),
+            'mapping_status': mapped_uuids,
+            'calibration_in_progress': meeting_state.calibration_in_progress,
+            'calibration_sequence_progress': f"{meeting_state.calibration_next_index}/{len(meeting_state.calibration_sequence)}"
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/calibration/recalibrate-room', methods=['POST'])
+def calibration_recalibrate_room():
+    """
+    Re-calibrate a specific room.
+    Used when a room mapping is incorrect - delete old mapping and prepare for new webhook.
+    """
+    data = request.json or {}
+    room_name = data.get('room_name')
+    room_uuid = data.get('room_uuid')  # SDK UUID
+    meeting_id = data.get('meeting_id') or meeting_state.meeting_id
+
+    if not room_name:
+        return jsonify({'error': 'room_name required'}), 400
+
+    today = get_ist_date()
+
+    print(f"[Calibration] Re-calibrating room: {room_name}")
+
+    try:
+        # Step 1: Delete existing mappings for this room name
+        client = get_bq_client()
+        delete_query = f"""
+        DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date = @today
+          AND meeting_id = @meeting_id
+          AND room_name = @room_name
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("today", "STRING", today),
+                bigquery.ScalarQueryParameter("meeting_id", "STRING", str(meeting_id)),
+                bigquery.ScalarQueryParameter("room_name", "STRING", room_name),
+            ]
+        )
+        client.query(delete_query, job_config=job_config).result()
+        print(f"[Calibration] Deleted old mappings for: {room_name}")
+
+        # Step 2: Clear from in-memory state
+        with meeting_state._lock:
+            # Remove from uuid_to_name if exists
+            uuids_to_remove = [uuid for uuid, name in meeting_state.uuid_to_name.items() if name == room_name]
+            for uuid in uuids_to_remove:
+                del meeting_state.uuid_to_name[uuid]
+            # Remove from name_to_uuid
+            if room_name in meeting_state.name_to_uuid:
+                del meeting_state.name_to_uuid[room_name]
+
+        # Step 3: Find room index in FIXED_ROOM_SEQUENCE
+        room_index = None
+        if USE_FIXED_SEQUENCE and FIXED_ROOM_SEQUENCE:
+            for i, name in enumerate(FIXED_ROOM_SEQUENCE):
+                if name == room_name:
+                    room_index = i
+                    break
+
+        # Step 4: Set up for single room calibration
+        # Add to pending_room_moves so next webhook from scout bot gets matched
+        meeting_state.pending_room_moves.append({
+            'room_name': room_name,
+            'sdk_uuid': room_uuid,
+            'timestamp': datetime.utcnow(),
+            'matched': False,
+            'recalibration': True
+        })
+
+        # Set calibration in progress (but for single room)
+        meeting_state.calibration_in_progress = True
+        meeting_state.scout_bot_current_room = room_name
+
+        print(f"[Calibration] Ready for re-calibration webhook for: {room_name}")
+
+        return jsonify({
+            'success': True,
+            'message': f'Room "{room_name}" ready for re-calibration. Move Scout Bot to this room now.',
+            'room_name': room_name,
+            'room_index': room_index,
+            'instructions': [
+                '1. Move Scout Bot to this specific room',
+                '2. Wait for Scout Bot to click "Join"',
+                '3. Webhook will capture the correct UUID',
+                '4. Call /calibration/verify to confirm'
+            ]
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/calibration/single-room-complete', methods=['POST'])
+def calibration_single_room_complete():
+    """
+    Complete a single room re-calibration.
+    Called after Scout Bot has entered the room and webhook was received.
+    """
+    data = request.json or {}
+    room_name = data.get('room_name')
+    meeting_id = data.get('meeting_id') or meeting_state.meeting_id
+
+    if not room_name:
+        return jsonify({'error': 'room_name required'}), 400
+
+    # Check if webhook was matched
+    matched_move = None
+    for move in meeting_state.pending_room_moves:
+        if move.get('room_name') == room_name and move.get('matched') and move.get('recalibration'):
+            matched_move = move
+            break
+
+    if not matched_move:
+        return jsonify({
+            'success': False,
+            'error': f'No webhook received for room: {room_name}',
+            'hint': 'Make sure Scout Bot clicked "Join" in the breakout room dialog'
+        }), 404
+
+    webhook_uuid = matched_move.get('webhook_uuid')
+
+    # Save to BigQuery
+    try:
+        today = get_ist_date()
+        room_index = None
+        if USE_FIXED_SEQUENCE and FIXED_ROOM_SEQUENCE:
+            for i, name in enumerate(FIXED_ROOM_SEQUENCE):
+                if name == room_name:
+                    room_index = i
+                    break
+
+        mapping_row = {
+            'mapping_id': str(uuid_lib.uuid4()),
+            'meeting_id': str(meeting_id),
+            'meeting_uuid': meeting_state.meeting_uuid or '',
+            'room_uuid': webhook_uuid,
+            'room_name': room_name,
+            'room_index': room_index if room_index is not None else 0,
+            'mapping_date': today,
+            'mapped_at': datetime.utcnow().isoformat(),
+            'source': 'recalibration'  # Mark as recalibration
+        }
+        success = insert_room_mappings([mapping_row])
+
+        # Clean up
+        meeting_state.pending_room_moves = [
+            m for m in meeting_state.pending_room_moves
+            if not (m.get('room_name') == room_name and m.get('recalibration'))
+        ]
+        meeting_state.calibration_in_progress = False
+
+        if success:
+            print(f"[Calibration] Re-calibration SUCCESS: {room_name} = {webhook_uuid[:20]}...")
+            return jsonify({
+                'success': True,
+                'message': f'Room "{room_name}" re-calibrated successfully',
+                'room_name': room_name,
+                'webhook_uuid': webhook_uuid
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to save mapping to BigQuery'
+            }), 500
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/calibration/mapping-summary', methods=['GET'])
+def calibration_mapping_summary():
+    """
+    Get a summary of all room mappings comparing FIXED_ROOM_SEQUENCE with actual mappings.
+    Useful for identifying missing or incorrect mappings.
+    """
+    meeting_id = request.args.get('meeting_id') or meeting_state.meeting_id
+    today = get_ist_date()
+
+    try:
+        client = get_bq_client()
+
+        # Get all mappings for today
+        query = f"""
+        SELECT room_uuid, room_name, room_index, source, mapped_at
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date = @today
+          AND meeting_id = @meeting_id
+        ORDER BY room_index, mapped_at DESC
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("today", "STRING", today),
+                bigquery.ScalarQueryParameter("meeting_id", "STRING", str(meeting_id) if meeting_id else ''),
+            ]
+        )
+        results = list(client.query(query, job_config=job_config).result())
+
+        # Build mapping lookup
+        mapped_rooms = {}
+        for row in results:
+            if row.room_name not in mapped_rooms:
+                mapped_rooms[row.room_name] = {
+                    'room_uuid': row.room_uuid,
+                    'room_index': row.room_index,
+                    'source': row.source,
+                    'mapped_at': row.mapped_at
+                }
+
+        # Compare with FIXED_ROOM_SEQUENCE
+        summary = []
+        for i, expected_name in enumerate(FIXED_ROOM_SEQUENCE):
+            mapping = mapped_rooms.get(expected_name)
+            summary.append({
+                'index': i,
+                'expected_name': expected_name,
+                'mapped': mapping is not None,
+                'webhook_uuid': mapping['room_uuid'][:20] + '...' if mapping else None,
+                'source': mapping['source'] if mapping else None,
+                'status': 'OK' if mapping else 'MISSING'
+            })
+
+        # Count stats
+        mapped_count = len([s for s in summary if s['mapped']])
+        missing_count = len([s for s in summary if not s['mapped']])
+
+        return jsonify({
+            'success': True,
+            'meeting_id': meeting_id,
+            'date': today,
+            'total_expected': len(FIXED_ROOM_SEQUENCE),
+            'mapped_count': mapped_count,
+            'missing_count': missing_count,
+            'rooms': summary,
+            'calibration_in_progress': meeting_state.calibration_in_progress
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/calibration/check-room-mapped', methods=['GET'])
+def check_room_mapped():
+    """
+    Check if a specific room already has a webhook UUID mapping.
+    Used by frontend to skip already-calibrated rooms during calibration.
+
+    Query params:
+    - room_name: Name of the room to check
+    - meeting_id: Optional meeting ID (defaults to current)
+
+    Returns:
+    - mapped: True if room has webhook UUID mapping
+    - source: Source of mapping (webhook_calibration, pending_move_calibration, etc.)
+    - can_skip: True if room can be safely skipped (has reliable mapping)
+    """
+    room_name = request.args.get('room_name')
+    meeting_id = request.args.get('meeting_id') or meeting_state.meeting_id
+
+    if not room_name:
+        return jsonify({'error': 'room_name required'}), 400
+
+    try:
+        today = get_ist_date()
+
+        # Check BigQuery for existing webhook mapping
+        # Only consider reliable sources (webhook-based, not SDK-only)
+        query = """
+        SELECT room_uuid, source, mapped_at
+        FROM `{project}.{dataset}.room_mappings`
+        WHERE room_name = @room_name
+          AND mapping_date = @mapping_date
+          AND source IN ('webhook_calibration', 'pending_move_calibration', 'sequence_calibration')
+        ORDER BY mapped_at DESC
+        LIMIT 1
+        """.format(project=GCP_PROJECT_ID, dataset=BQ_DATASET)
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("room_name", "STRING", room_name),
+                bigquery.ScalarQueryParameter("mapping_date", "DATE", today),
+            ]
+        )
+
+        result = bq_client.query(query, job_config=job_config).result()
+        rows = list(result)
+
+        if rows:
+            row = rows[0]
+            print(f"[check-room-mapped] {room_name}: MAPPED (source={row.source})")
+            return jsonify({
+                'room_name': room_name,
+                'mapped': True,
+                'can_skip': True,
+                'source': row.source,
+                'room_uuid': row.room_uuid[:20] + '...' if row.room_uuid else None
+            })
+        else:
+            print(f"[check-room-mapped] {room_name}: NOT MAPPED")
+            return jsonify({
+                'room_name': room_name,
+                'mapped': False,
+                'can_skip': False,
+                'source': None
+            })
+
+    except Exception as e:
+        print(f"[check-room-mapped] Error: {e}")
+        # On error, return not mapped to be safe (will calibrate)
+        return jsonify({
+            'room_name': room_name,
+            'mapped': False,
+            'can_skip': False,
+            'error': str(e)
+        })
 
 
 @app.route('/mappings', methods=['GET'])
@@ -2557,13 +4269,24 @@ def qos_delete():
     if not target_date:
         return jsonify({'error': 'date required'}), 400
 
+    # Validate date format to prevent SQL injection
+    try:
+        datetime.strptime(target_date, '%Y-%m-%d')
+    except ValueError:
+        return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
+
     try:
         client = get_bq_client()
         query = f"""
         DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_QOS_TABLE}`
-        WHERE event_date = '{target_date}'
+        WHERE event_date = @target_date
         """
-        job = client.query(query)
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("target_date", "STRING", target_date)
+            ]
+        )
+        job = client.query(query, job_config=job_config)
         job.result()
 
         return jsonify({
@@ -2585,6 +4308,12 @@ def qos_update_camera():
     if not target_date:
         return jsonify({'error': 'date required'}), 400
 
+    # Validate date format to prevent SQL injection
+    try:
+        datetime.strptime(target_date, '%Y-%m-%d')
+    except ValueError:
+        return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
+
     try:
         client = get_bq_client()
 
@@ -2594,11 +4323,16 @@ def qos_update_camera():
             query = f"""
             SELECT DISTINCT meeting_uuid, meeting_id
             FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}`
-            WHERE event_date = '{target_date}'
+            WHERE event_date = @target_date
               AND meeting_uuid IS NOT NULL
             LIMIT 1
             """
-            results = list(client.query(query).result())
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("target_date", "STRING", target_date)
+                ]
+            )
+            results = list(client.query(query, job_config=job_config).result())
             if not results:
                 return jsonify({'error': f'No meeting found for {target_date}'}), 404
             meeting_uuid = results[0].meeting_uuid
@@ -2693,8 +4427,15 @@ def qos_scheduled_collection():
     target_date = data.get('date')
 
     if not target_date:
-        # Default to yesterday
-        target_date = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+        # Default to yesterday in IST (not UTC - IST is 5:30 ahead)
+        # This ensures correct date around midnight IST
+        target_date = (get_ist_now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    else:
+        # Validate date format to prevent SQL injection
+        try:
+            datetime.strptime(target_date, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
 
     print(f"[ScheduledQoS] Starting collection for date: {target_date}")
 
@@ -2705,12 +4446,17 @@ def qos_scheduled_collection():
         query = f"""
         SELECT DISTINCT meeting_uuid, meeting_id
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}`
-        WHERE event_date = '{target_date}'
+        WHERE event_date = @target_date
           AND meeting_uuid IS NOT NULL
           AND meeting_uuid != ''
         LIMIT 5
         """
-        results = list(client.query(query).result())
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("target_date", "STRING", target_date)
+            ]
+        )
+        results = list(client.query(query, job_config=job_config).result())
 
         if not results:
             return jsonify({
@@ -2727,9 +4473,14 @@ def qos_scheduled_collection():
         check_query = f"""
         SELECT COUNT(*) as count
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_QOS_TABLE}`
-        WHERE event_date = '{target_date}'
+        WHERE event_date = @target_date
         """
-        check_result = list(client.query(check_query).result())[0]
+        check_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("target_date", "STRING", target_date)
+            ]
+        )
+        check_result = list(client.query(check_query, job_config=check_config).result())[0]
         existing_count = check_result.count
 
         if existing_count > 50:
@@ -2863,9 +4614,14 @@ def qos_scheduled_collection():
             cleanup_date = (datetime.utcnow() - timedelta(days=2)).strftime('%Y-%m-%d')
             cleanup_query = f"""
             DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_QOS_TABLE}`
-            WHERE event_date < '{cleanup_date}'
+            WHERE event_date < @cleanup_date
             """
-            cleanup_job = client.query(cleanup_query)
+            cleanup_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("cleanup_date", "STRING", cleanup_date)
+                ]
+            )
+            cleanup_job = client.query(cleanup_query, job_config=cleanup_config)
             cleanup_job.result()
             cleanup_deleted = cleanup_job.num_dml_affected_rows or 0
             print(f"[ScheduledQoS] Cleanup: Deleted {cleanup_deleted} old QoS records (before {cleanup_date})")
@@ -2974,7 +4730,7 @@ def debug_rooms():
           ORDER BY event_timestamp DESC
         ) as rn
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
-      WHERE event_date = '{today}'
+      WHERE event_date = @today
         AND event_type IN ('breakout_room_joined', 'breakout_room_left')
         AND participant_name NOT LIKE '%Scout%'
     ),
@@ -2996,7 +4752,12 @@ def debug_rooms():
 
     try:
         client = get_bq_client()
-        results = list(client.query(query).result())
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("today", "STRING", today)
+            ]
+        )
+        results = list(client.query(query, job_config=job_config).result())
 
         rooms = {}
         total = 0
@@ -3058,10 +4819,16 @@ def test_bigquery():
             try:
                 # camera_events requires partition filter
                 if table_var == BQ_CAMERA_TABLE:
-                    query = f"SELECT COUNT(*) as count FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{table_var}` WHERE event_date = '{today}'"
+                    query = f"SELECT COUNT(*) as count FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{table_var}` WHERE event_date = @today"
+                    job_config = bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter("today", "STRING", today)
+                        ]
+                    )
+                    result = list(client.query(query, job_config=job_config).result())
                 else:
                     query = f"SELECT COUNT(*) as count FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{table_var}`"
-                result = list(client.query(query).result())
+                    result = list(client.query(query).result())
                 count = result[0]['count'] if result else 0
                 results['tables'][table_name] = {'status': 'OK', 'count': count}
             except Exception as te:

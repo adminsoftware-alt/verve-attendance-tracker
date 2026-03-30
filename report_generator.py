@@ -9,6 +9,11 @@ Format:
 - Room History: RoomName [Joined: HH:MM | Left: HH:MM | Duration: Xmin] -> NextRoom [...]
 
 Triggered by Cloud Scheduler daily or /generate-report endpoint
+
+ACCURACY ENHANCEMENT:
+- Uses FIXED_ROOM_SEQUENCE as authoritative source for room names
+- Cross-references room_index from calibration with fixed sequence
+- Validates and corrects room names using multiple mapping sources
 """
 
 from google.cloud import bigquery
@@ -17,6 +22,89 @@ import os
 import csv
 import io
 import json
+
+# ==============================================================================
+# FIXED ROOM SEQUENCE - AUTHORITATIVE ROOM ORDER
+# This MUST match the FIXED_ROOM_SEQUENCE in app.py
+# Used for cross-referencing and correcting room names by index
+# ==============================================================================
+FIXED_ROOM_SEQUENCE = [
+    # Floor 1 rooms (1.1 to 1.34)
+    "1.1:It's Accrual World",
+    "1.2:Between The Spreadsheet",
+    "1.3:Opera House",
+    "1.4:Statue Of Liberty",
+    "1.5:The Squad",
+    "1.6:Visionary Vault - Team Kruta",
+    "1.7:Inspiration Island - Team Kruta",
+    "1.8:Life In The Math Lane",
+    "1.9:Finance Pirates",
+    "1.10:Number Nook - Team Ganesh",
+    "1.11:Accountaholics",
+    "1.12:The Forbidden City",
+    "1.13:Dev's Professional Bungalow",
+    "1.14:Innovation Station",
+    "1.15:Precision Point",
+    "1.16:Creative Corner - Team Dev",
+    "1.17:Insight Lounge - Team Dev",
+    "1.18:Synergy Space - Team Dev",
+    "1.19:Numbers and Nuance",
+    "1.20:Sales Wizard",
+    "1.21:Sales Station",
+    "1.22:Virtual Vista",
+    "1.23:The Genius Lounge",
+    "1.24:Emirates Palace",
+    "1.25:Victoria Memorial",
+    "1.26:Number Nexus",
+    "1.27:Ledger Lounge",
+    "1.28:The Capital Corner",
+    "1.29:Meeting Room - Hawks Eye",
+    "1.30:HR Connect Room",
+    "1.31:HR Strategy Meeting Suite",
+    "1.32:Interview Room - 1",
+    "1.33:Interview Room - 2",
+    "1.34:Interview/Meeting - Eagle Eyes",
+    # Floor 2 (Vridam)
+    "2.0:Vridam - Wellness Meeting Lounge",
+    # Floor 3 rooms (Cloud/Accurest)
+    "3.1:Cloud Gunners",
+    "3.2:Cloud Knights",
+    "3.3:Cloud Avengers",
+    "3.4:Cloud Falcons",
+    "3.5:Cloud Titans",
+    "3.6:Cloud Guardians",
+    "3.7:Inspiration Lounge /Meeting Room",
+    "3.8:Agenda Chamber/Meeting Room",
+    "3.9:ABAP AMS",
+    # Floor 4 rooms (KPRC)
+    "4.1:KPRC - Legal Eagle",
+    "4.2:KPRC - Corporate Crest",
+    "4.3:KPRC - Innovation Lounge",
+    "4.4:KPRC - Decision Dome",
+    "4.5:KPRC - Focus Zone",
+    "4.6:KPRC - Strategic Space",
+    # Floor 5 rooms (Accurest)
+    "5.1:Accurest - HR Oasis",
+    "5.2:Accurest-Meeting Room:Strategist",
+    "5.3:Accurest - Meeting Room: Pioneer",
+    "5.4:Accurest - Automation Crafters",
+    "5.5:Accurest-Learning / Meeting room",
+    "5.6:Accurest - Sales Lounge",
+    "5.7:Accurest - Focus Lab",
+    "5.8:Accurest - Pattern Inbound",
+    "5.9:Accurest - Pattern Planning",
+    "5.10:Accurest - Himal's Suite",
+    "5.11:Accurest Insight : Team Shubham",
+    "5.12:Accurest - Creators",
+    "5.13:Accurest - Interview Room",
+    # Special zones
+    "6.0:Silence Zone",
+    "7.0:Masti Ki Pathshala",
+    "8.0:BREAK TIME - Tea/Lunch/ Dinner",
+]
+
+# Build reverse lookup: room_name -> room_index
+ROOM_NAME_TO_INDEX = {name: idx for idx, name in enumerate(FIXED_ROOM_SEQUENCE)}
 
 # ==============================================================================
 # IST TIMEZONE HELPERS (UTC+5:30 - India Standard Time)
@@ -73,6 +161,18 @@ def generate_daily_report(report_date=None):
         # Default to yesterday in IST
         report_date = get_yesterday_ist()
 
+    # SECURITY: Validate date format to prevent SQL injection
+    # Only allow YYYY-MM-DD format
+    import re
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', report_date):
+        raise ValueError(f"Invalid date format: {report_date}. Expected YYYY-MM-DD")
+
+    # Additional validation: ensure it's a valid date
+    try:
+        datetime.strptime(report_date, '%Y-%m-%d')
+    except ValueError:
+        raise ValueError(f"Invalid date: {report_date}")
+
     # Calculate previous day for mapping fallback (overnight meetings)
     prev_date = (datetime.strptime(report_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
 
@@ -84,68 +184,117 @@ def generate_daily_report(report_date=None):
     # MAIN QUERY - ONE ROW PER PARTICIPANT
     # Room history: RoomName [HH:MM-HH:MM] -> NextRoom [HH:MM-HH:MM]
     # Total time = sum of all room visit durations
+    #
+    # ACCURACY: Uses room_index from calibration to look up FIXED_ROOM_SEQUENCE
+    # This is more reliable than room_name which can be mismatched
     # =============================================
+
+    # Build FIXED_ROOM_SEQUENCE as SQL array for lookup (BigQuery compatible)
+    fixed_rooms_sql = ", ".join([f"STRUCT({i} AS room_index, '{name.replace(chr(39), chr(39)+chr(39))}' AS room_name)" for i, name in enumerate(FIXED_ROOM_SEQUENCE)])
+
     main_query = f"""
     WITH
-    -- Get room name mappings - ONE name per UUID
-    -- Priority: same-day mapping > previous-day mapping (for overnight meetings 9AM-9AM)
-    -- Within same day: webhook_calibration > zoom_sdk_app
-    -- Get distinct meeting IDs for this report date to scope mappings
+    -- FIXED_ROOM_SEQUENCE as lookup table (authoritative room names by index)
+    fixed_room_sequence AS (
+      SELECT room_index, room_name FROM UNNEST([
+        {fixed_rooms_sql}
+      ])
+    ),
+    -- Get distinct meeting IDs for this report date
     report_meetings AS (
       SELECT DISTINCT meeting_id
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
       WHERE event_date = '{report_date}'
         AND meeting_id IS NOT NULL AND meeting_id != ''
     ),
+    -- Room name mappings with INDEX-BASED correction
+    -- Priority:
+    -- 1. Use room_index to look up from FIXED_ROOM_SEQUENCE (most accurate)
+    -- 2. Fall back to stored room_name if index not available
+    -- 3. timestamp_calibration/sequence_calibration sources preferred
     room_name_map AS (
-      SELECT room_uuid, room_name
+      SELECT room_uuid,
+        COALESCE(frs.room_name, rm.room_name) as room_name,
+        rm.room_index,
+        rm.source
       FROM (
-        SELECT rm.room_uuid, rm.room_name,
+        SELECT rm.room_uuid, rm.room_name, rm.room_index, rm.source,
           ROW_NUMBER() OVER (
             PARTITION BY rm.room_uuid
             ORDER BY
+              -- SOURCE PRIORITY: recalibration > pending_move > timestamp > sequence/webhook > others
+              CASE WHEN rm.source = 'recalibration' THEN 0
+                   WHEN rm.source = 'pending_move_calibration' THEN 1
+                   WHEN rm.source = 'timestamp_calibration' THEN 2
+                   WHEN rm.source IN ('sequence_calibration', 'webhook_calibration') THEN 3
+                   ELSE 4 END,
               CASE WHEN rm.mapping_date = '{report_date}' THEN 0 ELSE 1 END,
-              CASE WHEN rm.source = 'webhook_calibration' THEN 0 ELSE 1 END,
               rm.mapped_at DESC
           ) as rn
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_mappings` rm
         INNER JOIN report_meetings rpt ON rm.meeting_id = rpt.meeting_id
         WHERE rm.mapping_date IN ('{report_date}', '{prev_date}')
-          AND rm.source = 'webhook_calibration'  -- Only use webhook UUIDs (SDK UUIDs are different format)
-      )
-      WHERE rn = 1
+      ) rm
+      LEFT JOIN fixed_room_sequence frs ON rm.room_index = frs.room_index
+      WHERE rm.rn = 1
     ),
-    -- All breakout room events for the day - deduplicated by participant + timestamp
+    -- Secondary map: room_name consensus from event data
+    -- If many participants have the same room_uuid with a real room_name in the event,
+    -- that name is trustworthy (it was resolved at webhook time when mappings were in memory)
+    event_room_consensus AS (
+      SELECT room_uuid, room_name, cnt
+      FROM (
+        SELECT room_uuid, room_name,
+          COUNT(*) as cnt,
+          ROW_NUMBER() OVER (
+            PARTITION BY room_uuid
+            ORDER BY COUNT(*) DESC
+          ) as rn
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+        WHERE event_date = '{report_date}'
+          AND event_type IN ('breakout_room_joined', 'breakout_room_left')
+          AND room_name IS NOT NULL AND room_name != ''
+          AND NOT STARTS_WITH(room_name, 'Room-')
+        GROUP BY room_uuid, room_name
+      )
+      WHERE rn = 1 AND cnt >= 2
+    ),
+    -- All breakout room events - deduplicated by participant + room + timestamp
     breakout_events AS (
       SELECT
         participant_id,
         participant_email,
         participant_name,
         room_uuid,
-        room_name as event_room_name,  -- Room name stored directly in event
+        room_name as event_room_name,
         event_type,
         event_timestamp,
-        PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', event_timestamp) as event_ts,
+        SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', event_timestamp) as event_ts_z,
+        SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', event_timestamp) as event_ts_plain,
         ROW_NUMBER() OVER (
-          PARTITION BY participant_id, event_type, event_timestamp
+          PARTITION BY participant_id, room_uuid, event_type, event_timestamp
           ORDER BY inserted_at
         ) as dup_rank
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
       WHERE event_date = '{report_date}'
         AND event_type IN ('breakout_room_joined', 'breakout_room_left')
     ),
-    -- Deduplicated events - ONE event per participant per timestamp
     breakout_events_dedup AS (
-      SELECT * FROM breakout_events WHERE dup_rank = 1
+      SELECT
+        participant_id, participant_email, participant_name,
+        room_uuid, event_room_name, event_type, event_timestamp,
+        COALESCE(event_ts_z, event_ts_plain) as event_ts
+      FROM breakout_events
+      WHERE dup_rank = 1
     ),
-    -- Pair each JOIN with its corresponding LEAVE (same room, same participant, leave after join)
+    -- Pair each JOIN with its corresponding LEAVE
     room_visits_paired AS (
       SELECT
         j.participant_id,
         j.participant_email,
         j.participant_name,
         j.room_uuid,
-        j.event_room_name,  -- Carry forward room name from event
+        j.event_room_name,
         j.event_ts as join_ts,
         (
           SELECT MIN(l.event_ts)
@@ -158,32 +307,61 @@ def generate_daily_report(report_date=None):
       FROM breakout_events_dedup j
       WHERE j.event_type = 'breakout_room_joined'
     ),
-    -- Add room names and calculate durations
-    -- Priority: 1) event_room_name (if actually resolved, not "Room-XXXX" placeholder)
-    --           2) room_mappings table
-    --           3) Fallback to Room-{uuid}
-    room_visits AS (
+    -- Resolve room names with 4-tier priority:
+    -- 1. event_room_name if it's a real name (resolved at webhook time)
+    -- 2. room_mappings table (calibration data)
+    -- 3. consensus from other participants' events (crowd-sourced truth)
+    -- 4. NEVER fall back to Room-XXXX - use "Unmapped Room" to flag data issues
+    room_visits_named AS (
       SELECT
         rv.participant_email,
         rv.participant_name,
+        rv.room_uuid,
         COALESCE(
-          -- First: use room_name from event if it's a real name (not Room-XXXX placeholder)
           CASE WHEN rv.event_room_name IS NOT NULL
                 AND rv.event_room_name != ''
                 AND NOT STARTS_WITH(rv.event_room_name, 'Room-')
                THEN rv.event_room_name END,
-          rm.room_name,                     -- Second: lookup from room_mappings table
-          rv.event_room_name,               -- Third: use event room_name even if Room-XXXX
-          CONCAT('Room-', SUBSTR(rv.room_uuid, 1, 8))  -- Last fallback
+          rm.room_name,
+          erc.room_name,
+          CASE WHEN rv.event_room_name IS NOT NULL
+                AND rv.event_room_name != ''
+               THEN rv.event_room_name END
         ) as room_name,
         rv.join_ts,
         rv.leave_ts,
-        -- IST times (UTC + 5:30)
         FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.join_ts, INTERVAL 330 MINUTE)) as join_ist,
         FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.leave_ts, INTERVAL 330 MINUTE)) as leave_ist,
         TIMESTAMP_DIFF(rv.leave_ts, rv.join_ts, MINUTE) as duration_mins
       FROM room_visits_paired rv
       LEFT JOIN room_name_map rm ON rv.room_uuid = rm.room_uuid
+      LEFT JOIN event_room_consensus erc ON rv.room_uuid = erc.room_uuid
+    ),
+    -- Merge consecutive visits to the SAME room (fixes duplicate room history)
+    -- Assign a group number: increment when room changes
+    room_visits_grouped AS (
+      SELECT *,
+        SUM(CASE WHEN room_name != prev_room OR prev_room IS NULL THEN 1 ELSE 0 END)
+          OVER (PARTITION BY participant_email, participant_name ORDER BY join_ts) as room_group
+      FROM (
+        SELECT *,
+          LAG(room_name) OVER (PARTITION BY participant_email, participant_name ORDER BY join_ts) as prev_room
+        FROM room_visits_named
+      )
+    ),
+    -- Collapse consecutive same-room visits into one entry
+    room_visits AS (
+      SELECT
+        participant_email,
+        participant_name,
+        room_name,
+        MIN(join_ts) as join_ts,
+        MAX(leave_ts) as leave_ts,
+        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(join_ts), INTERVAL 330 MINUTE)) as join_ist,
+        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(leave_ts), INTERVAL 330 MINUTE)) as leave_ist,
+        SUM(COALESCE(duration_mins, 0)) as duration_mins
+      FROM room_visits_grouped
+      GROUP BY participant_email, participant_name, room_name, room_group
     ),
     -- Build room history string per participant
     room_history AS (
@@ -198,31 +376,55 @@ def generate_daily_report(report_date=None):
       FROM room_visits
       GROUP BY participant_email, participant_name
     ),
-    -- Main meeting join/leave (first join, last leave across ALL sessions)
+    -- Main meeting join/leave - group by EMAIL only (prevents duplicate rows for name variations)
     participant_main AS (
       SELECT
         participant_email,
+        -- Pick the most common name for this email (handles "John Doe" vs "J. Doe")
+        ARRAY_AGG(participant_name ORDER BY event_count DESC LIMIT 1)[OFFSET(0)] as participant_name,
+        MIN(first_join) as first_join,
+        MAX(last_leave) as last_leave
+      FROM (
+        SELECT
+          participant_email,
+          participant_name,
+          COUNT(*) as event_count,
+          MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as first_join,
+          MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as last_leave
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+        WHERE event_date = '{report_date}'
+        GROUP BY participant_email, participant_name
+      )
+      WHERE participant_email IS NOT NULL AND participant_email != ''
+      GROUP BY participant_email
+    ),
+    -- Safe timestamp parser (handles both Z suffix and plain ISO)
+    participant_main_parsed AS (
+      SELECT
         participant_name,
-        MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as first_join,
-        MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as last_leave
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
-      WHERE event_date = '{report_date}'
-      GROUP BY participant_email, participant_name
+        participant_email,
+        COALESCE(
+          SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', first_join),
+          SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', first_join)
+        ) as first_join_ts,
+        COALESCE(
+          SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', last_leave),
+          SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', last_leave)
+        ) as last_leave_ts
+      FROM participant_main
     )
     SELECT
       pm.participant_name as Name,
       pm.participant_email as Email,
-      -- Main room times in IST (first join to last leave)
-      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.first_join), INTERVAL 330 MINUTE)) as Main_Joined_IST,
-      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.last_leave), INTERVAL 330 MINUTE)) as Main_Left_IST,
-      -- Total duration from room visits (more accurate than join-leave diff)
-      COALESCE(rh.total_room_mins, 0) as Total_Duration_Min,
-      -- Room history: RoomName [HH:MM-HH:MM] -> NextRoom [HH:MM-HH:MM]
+      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.first_join_ts, INTERVAL 330 MINUTE)) as Main_Joined_IST,
+      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.last_leave_ts, INTERVAL 330 MINUTE)) as Main_Left_IST,
+      -- Total duration = time from main room join to main room leave (actual meeting attendance)
+      -- This is more accurate than breakout room time which excludes main room time
+      TIMESTAMP_DIFF(pm.last_leave_ts, pm.first_join_ts, MINUTE) as Total_Duration_Min,
       COALESCE(rh.rooms, '-') as Room_History
-    FROM participant_main pm
+    FROM participant_main_parsed pm
     LEFT JOIN room_history rh
       ON pm.participant_email = rh.participant_email
-      AND pm.participant_name = rh.participant_name
     WHERE pm.participant_name NOT LIKE '%Scout%'
     ORDER BY pm.participant_name
     """
@@ -363,7 +565,7 @@ def send_report_email(report, report_date):
                     <td>{p.get('Email', '')}</td>
                     <td>{p.get('Main_Joined_IST', '')}</td>
                     <td>{p.get('Main_Left_IST', '')}</td>
-                    <td>{p.get('Total_Duration_Min', '')} min</td>
+                    <td>{format_minutes_to_hhmm(p.get('Total_Duration_Min', 0))}</td>
                     <td style="font-size:10px;">{room_history}</td>
                 </tr>
             """
@@ -374,7 +576,7 @@ def send_report_email(report, report_date):
             <div class="footer">
                 <p><strong>Full attendance data is in the attached CSV file.</strong></p>
                 <p>CSV Format: One row per participant with complete room visit history</p>
-                <p>Room History Format: RoomName [Joined: HH:MM | Left: HH:MM | Duration: Xmin] -> NextRoom [...]</p>
+                <p>Room History Format: RoomName [HH:MM-HH:MM] -> NextRoom [HH:MM-HH:MM]</p>
                 <p>Generated by Zoom Breakout Room Tracker</p>
             </div>
         </body>

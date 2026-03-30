@@ -1,6 +1,6 @@
 import React from 'react';
 
-function RoomList({ rooms, mappedRooms, currentRoom }) {
+function RoomList({ rooms, mappedRooms, currentRoom, failedRoom }) {
   if (!rooms || rooms.length === 0) {
     return (
       <div style={{
@@ -17,22 +17,25 @@ function RoomList({ rooms, mappedRooms, currentRoom }) {
     <div style={{
       display: 'flex',
       flexDirection: 'column',
-      gap: '8px',
+      gap: '4px',
       maxHeight: '300px',
       overflowY: 'auto',
       padding: '4px'
     }}>
       {rooms.map((room, index) => {
-        const isMapped = mappedRooms.some(m => m.roomUUID === room.roomUUID);
+        const roomUUID = room.breakoutRoomId || room.breakoutRoomUUID || room.breakoutroomid || room.uuid || room.id;
+        const isMapped = mappedRooms.some(m => m.roomUUID === roomUUID);
         const isCurrent = currentRoom === index;
+        const isFailed = failedRoom === index;
 
         return (
           <RoomItem
-            key={room.roomUUID || index}
+            key={roomUUID || index}
             room={room}
             index={index}
             isMapped={isMapped}
             isCurrent={isCurrent}
+            isFailed={isFailed}
           />
         );
       })}
@@ -40,91 +43,95 @@ function RoomList({ rooms, mappedRooms, currentRoom }) {
   );
 }
 
-function RoomItem({ room, index, isMapped, isCurrent }) {
+function RoomItem({ room, index, isMapped, isCurrent, isFailed }) {
   const roomName = room.breakoutRoomName || room.name || `Room ${index + 1}`;
-  const roomId = room.breakoutRoomUUID || room.uuid || '';
-  const shortId = roomId.substring(0, 8);
+
+  let bgColor = 'rgba(255, 255, 255, 0.03)';
+  let borderColor = 'transparent';
+  if (isFailed) {
+    bgColor = 'rgba(255, 71, 87, 0.15)';
+    borderColor = '#ff4757';
+  } else if (isCurrent) {
+    bgColor = 'rgba(45, 140, 255, 0.15)';
+    borderColor = '#2D8CFF';
+  } else if (isMapped) {
+    bgColor = 'rgba(0, 200, 81, 0.08)';
+  }
 
   return (
     <div style={{
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'space-between',
-      padding: '12px 16px',
-      backgroundColor: isCurrent
-        ? 'rgba(45, 140, 255, 0.2)'
-        : 'rgba(255, 255, 255, 0.05)',
-      borderRadius: '8px',
-      border: isCurrent
-        ? '1px solid #2D8CFF'
-        : '1px solid transparent',
+      padding: '8px 12px',
+      backgroundColor: bgColor,
+      borderRadius: '6px',
+      border: `1px solid ${borderColor}`,
       transition: 'all 0.2s ease'
     }}>
-      {/* Room info */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '8px'
-        }}>
-          <span style={{
-            color: '#fff',
-            fontWeight: '500',
-            fontSize: '14px'
-          }}>
-            {roomName}
-          </span>
-          {isCurrent && (
-            <span style={{
-              padding: '2px 8px',
-              backgroundColor: '#2D8CFF',
-              borderRadius: '12px',
-              fontSize: '10px',
-              color: '#fff',
-              fontWeight: '600'
-            }}>
-              CURRENT
-            </span>
-          )}
-        </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
         <span style={{
           color: '#666',
           fontSize: '11px',
-          fontFamily: 'monospace'
+          minWidth: '24px'
         }}>
-          ID: {shortId}...
+          {index + 1}.
         </span>
-      </div>
-
-      {/* Status badge */}
-      <div>
-        {isMapped ? (
+        <span style={{
+          color: isFailed ? '#ff4757' : '#fff',
+          fontWeight: isCurrent || isFailed ? '600' : '400',
+          fontSize: '13px'
+        }}>
+          {roomName}
+        </span>
+        {isCurrent && (
           <span style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '4px',
-            padding: '4px 12px',
-            backgroundColor: 'rgba(0, 200, 81, 0.2)',
-            color: '#00C851',
-            borderRadius: '16px',
-            fontSize: '12px',
-            fontWeight: '500'
+            padding: '1px 6px',
+            backgroundColor: '#2D8CFF',
+            borderRadius: '10px',
+            fontSize: '9px',
+            color: '#fff',
+            fontWeight: '600'
           }}>
-            <span>✓</span>
-            Mapped
-          </span>
-        ) : (
-          <span style={{
-            padding: '4px 12px',
-            backgroundColor: 'rgba(255, 255, 255, 0.1)',
-            color: '#888',
-            borderRadius: '16px',
-            fontSize: '12px'
-          }}>
-            Pending
+            ACTIVE
           </span>
         )}
       </div>
+
+      {isFailed ? (
+        <span style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '4px',
+          padding: '2px 8px',
+          backgroundColor: 'rgba(255, 71, 87, 0.3)',
+          color: '#ff4757',
+          borderRadius: '10px',
+          fontSize: '11px',
+          fontWeight: '600'
+        }}>
+          FAILED
+        </span>
+      ) : isMapped ? (
+        <span style={{
+          padding: '2px 8px',
+          backgroundColor: 'rgba(0, 200, 81, 0.2)',
+          color: '#00C851',
+          borderRadius: '10px',
+          fontSize: '11px',
+          fontWeight: '500'
+        }}>
+          OK
+        </span>
+      ) : (
+        <span style={{
+          padding: '2px 8px',
+          color: '#555',
+          fontSize: '11px'
+        }}>
+          --
+        </span>
+      )}
     </div>
   );
 }

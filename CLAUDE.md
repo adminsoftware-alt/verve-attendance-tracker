@@ -93,6 +93,11 @@ gcloud run services logs tail breakout-room-calibrator --region us-central1
 | `/calibration/pending` | GET | Check pending room moves and match status |
 | `/calibration/status` | GET | Get current calibration status |
 | `/calibration/reload` | POST | Force reload mappings from BigQuery |
+| `/calibration/reset` | POST | Full reset of calibration state, optionally clear BigQuery |
+| `/calibration/live-rooms` | GET | Get current room participant data for manual verification |
+| `/calibration/recalibrate-room` | POST | Prepare a specific room for re-calibration |
+| `/calibration/single-room-complete` | POST | Complete a single room re-calibration |
+| `/calibration/mapping-summary` | GET | Compare FIXED_ROOM_SEQUENCE with actual mappings |
 
 ### Reports
 | Endpoint | Method | Purpose |
@@ -330,6 +335,9 @@ src/
 
 ## Security Features
 
+
+
+
 1. **Webhook signature validation** - HMAC-SHA256 with timestamp freshness
 2. **CORS restricted** - Only Zoom domains allowed
 3. **No default credentials** - All env vars must be explicitly set
@@ -338,7 +346,8 @@ src/
 
 ## Version History
 
-- **Revision 77** (2026-03-05): Security & performance fixes (current)
+- **Revision 78** (2026-03-27): Enhanced calibration UI with delay selector, live room view, recalibration, reset
+- **Revision 77** (2026-03-05): Security & performance fixes
 - **Revision 76**: Source='webhook_calibration' fix
 - **Revision 75**: SDK verification before BQ save
 - Earlier: Camera tracking, QoS pagination, calibration timing fixes
