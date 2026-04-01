@@ -189,13 +189,24 @@ def generate_daily_report(report_date=None):
     main_query = f"""
     WITH
     -- ==========================================================
-    -- PART 1: ROOM HISTORY from SDK snapshots
-    -- Uses participant_name as key (SDK may not return emails)
-    -- Handles duplicate names by also using participant_uuid
+    -- WEBHOOK DATA: Main meeting join/leave times
     -- ==========================================================
-    snapshot_keyed AS (
+    webhook_times AS (
       SELECT
-        -- Unique key: prefer uuid, fall back to name
+        LOWER(TRIM(participant_name)) as name_key,
+        MAX(participant_email) as participant_email,
+        MIN(CASE WHEN event_type = 'participant_joined' THEN TIMESTAMP(event_timestamp) END) as main_join_time,
+        MAX(CASE WHEN event_type = 'participant_left' THEN TIMESTAMP(event_timestamp) END) as main_leave_time
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+      WHERE event_date = '{report_date}'
+        AND participant_name IS NOT NULL AND participant_name != ''
+      GROUP BY LOWER(TRIM(participant_name))
+    ),
+    -- ==========================================================
+    -- STEP 1: Clean snapshots - remove empty room names
+    -- ==========================================================
+    snapshot_clean AS (
+      SELECT
         COALESCE(NULLIF(participant_uuid, ''), participant_name) as participant_key,
         participant_name,
         COALESCE(NULLIF(participant_email, ''), '') as participant_email,
@@ -204,16 +215,20 @@ def generate_daily_report(report_date=None):
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
       WHERE event_date = '{report_date}'
         AND participant_name IS NOT NULL AND participant_name != ''
+        AND room_name IS NOT NULL AND room_name != ''
     ),
+    -- ==========================================================
+    -- STEP 2: Detect room transitions
+    -- ==========================================================
     snapshot_transitions AS (
       SELECT *,
         LAG(room_name) OVER (
           PARTITION BY participant_key
           ORDER BY snapshot_time
         ) as prev_room
-      FROM snapshot_keyed
+      FROM snapshot_clean
     ),
-    visit_groups AS (
+    visit_groups_raw AS (
       SELECT *,
         SUM(CASE
           WHEN prev_room IS NULL OR room_name != prev_room THEN 1
@@ -224,7 +239,10 @@ def generate_daily_report(report_date=None):
         ) as visit_id
       FROM snapshot_transitions
     ),
-    room_visits AS (
+    -- ==========================================================
+    -- STEP 3: Collapse into room visits, drop 0-minute entries
+    -- ==========================================================
+    room_visits_raw AS (
       SELECT
         participant_key,
         MAX(participant_name) as participant_name,
@@ -232,142 +250,67 @@ def generate_daily_report(report_date=None):
         room_name,
         MIN(snapshot_time) as join_time,
         MAX(snapshot_time) as leave_time,
-        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(snapshot_time), INTERVAL 330 MINUTE)) as join_ist,
-        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(snapshot_time), INTERVAL 330 MINUTE)) as leave_ist
-      FROM visit_groups
+        TIMESTAMP_DIFF(MAX(snapshot_time), MIN(snapshot_time), MINUTE) as duration_mins
+      FROM visit_groups_raw
       GROUP BY participant_key, room_name, visit_id
+      HAVING TIMESTAMP_DIFF(MAX(snapshot_time), MIN(snapshot_time), MINUTE) > 0
     ),
-    room_history AS (
+    -- ==========================================================
+    -- STEP 4: Re-merge consecutive same-room visits
+    -- After removing 0-min entries, "Room A → Room A" can happen
+    -- e.g., Room A [10:00-10:30], (0-min removed), Room A [10:31-11:00]
+    --   → should become Room A [10:00-11:00]
+    -- ==========================================================
+    remerge_transitions AS (
+      SELECT *,
+        LAG(room_name) OVER (
+          PARTITION BY participant_key
+          ORDER BY join_time
+        ) as prev_room_name
+      FROM room_visits_raw
+    ),
+    remerge_groups AS (
+      SELECT *,
+        SUM(CASE
+          WHEN prev_room_name IS NULL OR room_name != prev_room_name THEN 1
+          ELSE 0
+        END) OVER (
+          PARTITION BY participant_key
+          ORDER BY join_time
+        ) as merge_group
+      FROM remerge_transitions
+    ),
+    room_visits_final AS (
       SELECT
+        participant_key,
         MAX(participant_name) as participant_name,
-        MAX(participant_email) as snapshot_email,
-        STRING_AGG(
-          CONCAT(room_name, ' [', join_ist, '-', leave_ist, ']'),
-          ' -> ' ORDER BY join_time
-        ) as rooms
-      FROM room_visits
-      GROUP BY participant_key
-    ),
-    -- ==========================================================
-    -- PART 2: JOIN/LEAVE TIMES from webhooks (EXACT timestamps)
-    -- Webhooks have real join/leave times, not when bot saw them
-    -- ==========================================================
-    webhook_by_email AS (
-      SELECT
-        participant_email,
-        ARRAY_AGG(participant_name ORDER BY cnt DESC LIMIT 1)[OFFSET(0)] as participant_name,
-        MIN(first_join) as first_join,
-        MAX(last_leave) as last_leave
-      FROM (
-        SELECT
-          participant_email,
-          participant_name,
-          COUNT(*) as cnt,
-          MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as first_join,
-          MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as last_leave
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
-        WHERE event_date = '{report_date}'
-        GROUP BY participant_email, participant_name
-      )
-      WHERE participant_email IS NOT NULL AND participant_email != ''
-      GROUP BY participant_email
-    ),
-    webhook_parsed AS (
-      SELECT
-        participant_name,
-        participant_email,
-        COALESCE(
-          SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', first_join),
-          SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', first_join)
-        ) as first_join_ts,
-        COALESCE(
-          SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', last_leave),
-          SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', last_leave)
-        ) as last_leave_ts
-      FROM webhook_by_email
-    ),
-    -- ==========================================================
-    -- PART 3: COMBINE
-    -- Match webhooks ↔ snapshots using 3-tier matching:
-    --   1. Email match (most reliable - if SDK returns email)
-    --   2. Exact name match (case-insensitive)
-    --   3. First-word name match ("Shashank" matches "Shashank C" and "Shashank Channawar")
-    -- ==========================================================
-    matched AS (
-      SELECT
-        w.participant_name as webhook_name,
-        w.participant_email,
-        w.first_join_ts,
-        w.last_leave_ts,
-        rh.participant_name as snapshot_name,
-        rh.snapshot_email,
-        rh.rooms,
-        ROW_NUMBER() OVER (
-          PARTITION BY COALESCE(w.participant_email, LOWER(TRIM(w.participant_name)))
-          ORDER BY
-            -- Priority: email match > exact name > first-word match
-            CASE
-              WHEN w.participant_email != '' AND rh.snapshot_email != ''
-                   AND LOWER(w.participant_email) = LOWER(rh.snapshot_email) THEN 0
-              WHEN LOWER(TRIM(w.participant_name)) = LOWER(TRIM(rh.participant_name)) THEN 1
-              WHEN SPLIT(LOWER(TRIM(w.participant_name)), ' ')[OFFSET(0)]
-                   = SPLIT(LOWER(TRIM(rh.participant_name)), ' ')[OFFSET(0)] THEN 2
-              ELSE 3
-            END
-        ) as match_rank
-      FROM webhook_parsed w
-      LEFT JOIN room_history rh ON (
-        -- Tier 1: Email match
-        (w.participant_email != '' AND rh.snapshot_email != ''
-         AND LOWER(w.participant_email) = LOWER(rh.snapshot_email))
-        OR
-        -- Tier 2: Exact name match
-        LOWER(TRIM(w.participant_name)) = LOWER(TRIM(rh.participant_name))
-        OR
-        -- Tier 3: First word match (handles "Shashank" vs "Shashank Channawar")
-        (SPLIT(LOWER(TRIM(w.participant_name)), ' ')[OFFSET(0)]
-         = SPLIT(LOWER(TRIM(rh.participant_name)), ' ')[OFFSET(0)]
-         AND LENGTH(SPLIT(LOWER(TRIM(w.participant_name)), ' ')[OFFSET(0)]) >= 3)
-      )
-    ),
-    -- Get best match per webhook participant
-    best_match AS (
-      SELECT * FROM matched WHERE match_rank = 1
-    ),
-    -- Also include snapshot-only participants (no webhook match)
-    snapshot_only AS (
-      SELECT rh.participant_name, rh.snapshot_email, rh.rooms
-      FROM room_history rh
-      WHERE NOT EXISTS (
-        SELECT 1 FROM best_match bm
-        WHERE bm.rooms = rh.rooms AND bm.snapshot_name = rh.participant_name
-      )
+        MAX(participant_email) as participant_email,
+        room_name,
+        MIN(join_time) as join_time,
+        MAX(leave_time) as leave_time,
+        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(join_time), INTERVAL 330 MINUTE)) as room_joined_ist,
+        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(leave_time), INTERVAL 330 MINUTE)) as room_left_ist,
+        TIMESTAMP_DIFF(MAX(leave_time), MIN(join_time), MINUTE) as duration_mins
+      FROM remerge_groups
+      GROUP BY participant_key, room_name, merge_group
     )
-    -- Final output
+    -- ==========================================================
+    -- OUTPUT: One clean row per room visit with main meeting times
+    -- ==========================================================
     SELECT
-      bm.webhook_name as Name,
-      bm.participant_email as Email,
-      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(bm.first_join_ts, INTERVAL 330 MINUTE)) as Main_Joined_IST,
-      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(bm.last_leave_ts, INTERVAL 330 MINUTE)) as Main_Left_IST,
-      TIMESTAMP_DIFF(bm.last_leave_ts, bm.first_join_ts, MINUTE) as Total_Duration_Min,
-      COALESCE(bm.rooms, '-') as Room_History
-    FROM best_match bm
-    WHERE bm.webhook_name NOT LIKE '%Scout%'
-
-    UNION ALL
-
-    -- Participants only in snapshots (no webhook - maybe joined before webhooks started)
-    SELECT
-      so.participant_name as Name,
-      COALESCE(so.snapshot_email, '') as Email,
-      '' as Main_Joined_IST,
-      '' as Main_Left_IST,
-      NULL as Total_Duration_Min,
-      so.rooms as Room_History
-    FROM snapshot_only so
-    WHERE so.participant_name NOT LIKE '%Scout%'
-
-    ORDER BY Name
+      rv.participant_name as Name,
+      COALESCE(NULLIF(rv.participant_email, ''), w.participant_email, '') as Email,
+      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(w.main_join_time, INTERVAL 330 MINUTE)) as Main_Joined_IST,
+      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(w.main_leave_time, INTERVAL 330 MINUTE)) as Main_Left_IST,
+      rv.room_name as Room,
+      rv.room_joined_ist as Room_Joined_IST,
+      rv.room_left_ist as Room_Left_IST,
+      rv.duration_mins as Duration_Minutes
+    FROM room_visits_final rv
+    LEFT JOIN webhook_times w ON LOWER(TRIM(rv.participant_name)) = w.name_key
+    WHERE rv.participant_name NOT LIKE '%Scout%'
+      AND rv.duration_mins > 0
+    ORDER BY rv.participant_name, rv.join_time
     """
 
     try:
@@ -410,32 +353,35 @@ def format_minutes_to_hhmm(minutes):
 
 
 def generate_csv(report):
-    """Generate CSV content from report data"""
+    """Generate CSV content from report data - ONE ROW PER ROOM VISIT"""
     output = io.StringIO()
     writer = csv.writer(output)
 
-    # Header
+    # Header - includes main meeting times from webhooks
     writer.writerow([
         'Name',
         'Email',
         'Main_Joined_IST',
         'Main_Left_IST',
-        'Total_Duration',
-        'Room_History'
+        'Room',
+        'Room_Joined_IST',
+        'Room_Left_IST',
+        'Duration_Minutes'
     ])
 
-    # Data rows
+    # Data rows - one row per room visit
     for p in report['participants']:
-        # Format durations as Xh Ym
-        total_mins = p.get('Total_Duration_Min', 0) or 0
+        duration_mins = p.get('Duration_Minutes', 0) or 0
 
         writer.writerow([
             p.get('Name', '') or '',
             p.get('Email', '') or '',
             p.get('Main_Joined_IST', '') or '',
             p.get('Main_Left_IST', '') or '',
-            format_minutes_to_hhmm(total_mins),
-            p.get('Room_History', '-') or '-'
+            p.get('Room', '') or '',
+            p.get('Room_Joined_IST', '') or '',
+            p.get('Room_Left_IST', '') or '',
+            duration_mins
         ])
 
     return output.getvalue()

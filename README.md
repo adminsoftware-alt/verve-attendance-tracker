@@ -31,7 +31,7 @@ This system captures participant activity in Zoom meetings and breakout rooms. T
 | Zoom App Client ID | `raEkn6HpTkWO_DCO3z5zGA` |
 | Zoom App ID | `RRYgo_e2QE697_mxkp3tzg` |
 | Meeting ID | `9034027764` |
-| Current Revision | **119** |
+| Current Revision | **124** |
 
 ### Scout Bot VM
 | Setting | Value |
@@ -379,23 +379,37 @@ NEW METHOD (SDK Monitoring):
 
 ---
 
-## Report Format
+## Report Format (Rev 124+)
+
+### One Row Per Room Visit
+Each room visit is a separate row (not concatenated with `->`)
 
 ### CSV Columns
 | Column | Description | Source |
 |--------|-------------|--------|
 | Name | Participant name | Snapshots |
-| Email | Email (often empty) | Webhooks/Snapshots |
-| Main_Joined_IST | First seen time | Webhooks or Snapshots |
-| Main_Left_IST | Last seen time | Webhooks or Snapshots |
-| Total_Duration | Time in meeting | Calculated |
-| Room_History | Room visits with times | Snapshots |
+| Email | Participant email | Webhooks |
+| Main_Joined_IST | Meeting join time | Webhooks |
+| Main_Left_IST | Meeting leave time | Webhooks |
+| Room | Breakout room name | Snapshots |
+| Room_Joined_IST | Room entry time | Snapshots |
+| Room_Left_IST | Room exit time | Snapshots |
+| Duration_Minutes | Time in this room | Calculated |
 
 ### Example Output
 ```csv
-Name,Email,Main_Joined_IST,Main_Left_IST,Total_Duration,Room_History
-Abhishek Rathi,abhishek@example.com,09:30,11:00,1h 30m,1.8:Life In The Math Lane [09:30-10:00] -> 8.0:BREAK TIME [10:00-10:15] -> 1.8:Life In The Math Lane [10:15-11:00]
+Name,Email,Main_Joined_IST,Main_Left_IST,Room,Room_Joined_IST,Room_Left_IST,Duration_Minutes
+Abhishek Rathi,abhishek.rathi@verveadvisory.com,10:21,18:33,1.8:Life In The Math Lane,13:55,14:04,9
+Abhishek Rathi,abhishek.rathi@verveadvisory.com,10:21,18:33,8.0:BREAK TIME - Tea/Lunch/ Dinner,14:05,15:13,68
+Abhishek Rathi,abhishek.rathi@verveadvisory.com,10:21,18:33,1.3:Opera House,15:13,15:18,4
+Abhishek Rathi,abhishek.rathi@verveadvisory.com,10:21,18:33,1.1:It's Accrual World,15:32,18:16,163
 ```
+
+### Key Features
+- **No 0-minute entries** - Transition artifacts filtered out
+- **Same-room visits merged** - Consecutive visits combined
+- **Main times from webhooks** - Accurate meeting join/leave
+- **Room times from SDK** - 30-second polling precision
 
 ---
 
@@ -572,12 +586,53 @@ Special Zones
 
 | Rev | Date | Changes |
 |-----|------|---------|
+| 124 | 2026-04-01 | Fixed TIMESTAMP cast for webhook times |
+| 123 | 2026-04-01 | Added webhook_times CTE back |
+| 122 | 2026-04-01 | Added Main_Joined/Left_IST from webhooks |
+| 121 | 2026-04-01 | Filter 0-duration entries, re-merge same-room visits |
+| 120 | 2026-04-01 | Changed to one row per room visit format |
 | 119 | 2026-04-01 | Report uses webhooks + snapshots combined |
 | 118 | 2026-04-01 | SDK monitoring mode, simplified report |
 | 117 | 2026-04-01 | Fixed participant count (use name when email empty) |
 | 116 | 2026-04-01 | Added room_snapshots table, MonitorPanel component |
 | 111 | 2026-03-26 | Fixed room sequence calibration |
 | 105 | 2026-03-25 | Resume calibration feature |
+
+---
+
+## Cost Estimates (GCP)
+
+### Monthly Breakdown
+| Service | Cost | Notes |
+|---------|------|-------|
+| Cloud Run | ~$50-80/month | With min-instances=1 (always warm) |
+| Cloud Build | ~$5-10/month | Depends on deployment frequency |
+| Scout Bot VM | ~$27/month | e2-medium (2 vCPU, 4GB), 24/7 |
+| BigQuery | ~$1-5/month | Storage + queries |
+| Container Scanning | ~$5/month | Automatic security scans |
+| **Total** | **~$90-130/month** | |
+
+### Cost Optimization Tips
+1. **Reduce Cloud Run cost** - Set min-instances=0 (first request slower):
+   ```bash
+   gcloud run services update breakout-room-calibrator --region us-central1 --min-instances=0
+   ```
+
+2. **Stop VM after hours** - Save ~60% on VM costs:
+   ```bash
+   # Stop VM (e.g., 7 PM IST)
+   gcloud compute instances stop scout-bot-vm --zone=asia-south1-a
+
+   # Start VM (e.g., 9 AM IST)
+   gcloud compute instances start scout-bot-vm --zone=asia-south1-a
+   ```
+
+3. **Reduce deployments** - Each deployment costs ~$0.10-0.20 in Cloud Build
+
+### Check Current Billing
+```
+https://console.cloud.google.com/billing
+```
 
 ---
 
