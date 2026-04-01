@@ -151,6 +151,9 @@ def generate_daily_report(report_date=None):
     Generate daily attendance report with ONE ROW PER PARTICIPANT
     All times in IST (UTC + 5:30)
 
+    MONITOR MODE: Room history is built from SDK polling snapshots (room_snapshots table).
+    Main room join/leave still comes from webhooks (participant_events table).
+
     Args:
         report_date: Date string 'YYYY-MM-DD' (defaults to yesterday)
 
@@ -158,237 +161,108 @@ def generate_daily_report(report_date=None):
         Dictionary with report data and CSV content
     """
     if report_date is None:
-        # Default to yesterday in IST
         report_date = get_yesterday_ist()
 
-    # SECURITY: Validate date format to prevent SQL injection
-    # Only allow YYYY-MM-DD format
     import re
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', report_date):
         raise ValueError(f"Invalid date format: {report_date}. Expected YYYY-MM-DD")
 
-    # Additional validation: ensure it's a valid date
     try:
         datetime.strptime(report_date, '%Y-%m-%d')
     except ValueError:
         raise ValueError(f"Invalid date: {report_date}")
 
-    # Calculate previous day for mapping fallback (overnight meetings)
-    prev_date = (datetime.strptime(report_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
-
-    print(f"[Report] Generating report for {report_date} (IST), mapping fallback: {prev_date}")
+    print(f"[Report] Generating report for {report_date} (IST) using SDK snapshots")
 
     client = get_bq_client()
 
     # =============================================
-    # MAIN QUERY - ONE ROW PER PARTICIPANT
-    # Room history: RoomName [HH:MM-HH:MM] -> NextRoom [HH:MM-HH:MM]
-    # Total time = sum of all room visit durations
+    # MAIN QUERY - ONE ROW PER ROOM VISIT
     #
-    # ACCURACY: Uses room_index from calibration to look up FIXED_ROOM_SEQUENCE
-    # This is more reliable than room_name which can be mismatched
+    # Each row = one participant's visit to one room
+    # Shows: Name, Email, Room, Room_Joined, Room_Left, Duration
+    #
+    # How it works:
+    #   SDK polls every 30s → detect room transitions → output each visit
     # =============================================
-
-    # Build FIXED_ROOM_SEQUENCE as SQL array for lookup (BigQuery compatible)
-    fixed_rooms_sql = ", ".join([f"STRUCT({i} AS room_index, '{name.replace(chr(39), chr(39)+chr(39))}' AS room_name)" for i, name in enumerate(FIXED_ROOM_SEQUENCE)])
 
     main_query = f"""
     WITH
-    -- FIXED_ROOM_SEQUENCE as lookup table (authoritative room names by index)
-    fixed_room_sequence AS (
-      SELECT room_index, room_name FROM UNNEST([
-        {fixed_rooms_sql}
-      ])
-    ),
-    -- Get distinct meeting IDs for this report date
-    report_meetings AS (
-      SELECT DISTINCT meeting_id
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
-      WHERE event_date = '{report_date}'
-        AND meeting_id IS NOT NULL AND meeting_id != ''
-    ),
-    -- Room name mappings with INDEX-BASED correction
-    -- Priority:
-    -- 1. Use room_index to look up from FIXED_ROOM_SEQUENCE (most accurate)
-    -- 2. Fall back to stored room_name if index not available
-    -- 3. timestamp_calibration/sequence_calibration sources preferred
-    room_name_map AS (
-      SELECT room_uuid,
-        COALESCE(frs.room_name, rm.room_name) as room_name,
-        rm.room_index,
-        rm.source
-      FROM (
-        SELECT rm.room_uuid, rm.room_name, rm.room_index, rm.source,
-          ROW_NUMBER() OVER (
-            PARTITION BY rm.room_uuid
-            ORDER BY
-              -- SOURCE PRIORITY: recalibration > pending_move > timestamp > sequence/webhook > others
-              CASE WHEN rm.source = 'recalibration' THEN 0
-                   WHEN rm.source = 'pending_move_calibration' THEN 1
-                   WHEN rm.source = 'timestamp_calibration' THEN 2
-                   WHEN rm.source IN ('sequence_calibration', 'webhook_calibration') THEN 3
-                   ELSE 4 END,
-              CASE WHEN rm.mapping_date = '{report_date}' THEN 0 ELSE 1 END,
-              rm.mapped_at DESC
-          ) as rn
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_mappings` rm
-        INNER JOIN report_meetings rpt ON rm.meeting_id = rpt.meeting_id
-        WHERE rm.mapping_date IN ('{report_date}', '{prev_date}')
-      ) rm
-      LEFT JOIN fixed_room_sequence frs ON rm.room_index = frs.room_index
-      WHERE rm.rn = 1
-    ),
-    -- Secondary map: room_name consensus from event data
-    -- If many participants have the same room_uuid with a real room_name in the event,
-    -- that name is trustworthy (it was resolved at webhook time when mappings were in memory)
-    event_room_consensus AS (
-      SELECT room_uuid, room_name, cnt
-      FROM (
-        SELECT room_uuid, room_name,
-          COUNT(*) as cnt,
-          ROW_NUMBER() OVER (
-            PARTITION BY room_uuid
-            ORDER BY COUNT(*) DESC
-          ) as rn
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
-        WHERE event_date = '{report_date}'
-          AND event_type IN ('breakout_room_joined', 'breakout_room_left')
-          AND room_name IS NOT NULL AND room_name != ''
-          AND NOT STARTS_WITH(room_name, 'Room-')
-        GROUP BY room_uuid, room_name
-      )
-      WHERE rn = 1 AND cnt >= 2
-    ),
-    -- All breakout room events - deduplicated by participant + room + timestamp
-    breakout_events AS (
+    -- ==========================================================
+    -- PART 1: ROOM HISTORY from SDK snapshots
+    -- Uses participant_name as key (SDK may not return emails)
+    -- Handles duplicate names by also using participant_uuid
+    -- ==========================================================
+    snapshot_keyed AS (
       SELECT
-        participant_id,
-        participant_email,
+        -- Unique key: prefer uuid, fall back to name
+        COALESCE(NULLIF(participant_uuid, ''), participant_name) as participant_key,
         participant_name,
-        room_uuid,
-        room_name as event_room_name,
-        event_type,
-        event_timestamp,
-        SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', event_timestamp) as event_ts_z,
-        SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', event_timestamp) as event_ts_plain,
-        ROW_NUMBER() OVER (
-          PARTITION BY participant_id, room_uuid, event_type, event_timestamp
-          ORDER BY inserted_at
-        ) as dup_rank
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+        COALESCE(NULLIF(participant_email, ''), '') as participant_email,
+        room_name,
+        snapshot_time
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
       WHERE event_date = '{report_date}'
-        AND event_type IN ('breakout_room_joined', 'breakout_room_left')
+        AND participant_name IS NOT NULL AND participant_name != ''
     ),
-    breakout_events_dedup AS (
-      SELECT
-        participant_id, participant_email, participant_name,
-        room_uuid, event_room_name, event_type, event_timestamp,
-        COALESCE(event_ts_z, event_ts_plain) as event_ts
-      FROM breakout_events
-      WHERE dup_rank = 1
-    ),
-    -- Pair each JOIN with its corresponding LEAVE
-    room_visits_paired AS (
-      SELECT
-        j.participant_id,
-        j.participant_email,
-        j.participant_name,
-        j.room_uuid,
-        j.event_room_name,
-        j.event_ts as join_ts,
-        (
-          SELECT MIN(l.event_ts)
-          FROM breakout_events_dedup l
-          WHERE l.participant_id = j.participant_id
-            AND l.room_uuid = j.room_uuid
-            AND l.event_type = 'breakout_room_left'
-            AND l.event_ts > j.event_ts
-        ) as leave_ts
-      FROM breakout_events_dedup j
-      WHERE j.event_type = 'breakout_room_joined'
-    ),
-    -- Resolve room names with 4-tier priority:
-    -- 1. event_room_name if it's a real name (resolved at webhook time)
-    -- 2. room_mappings table (calibration data)
-    -- 3. consensus from other participants' events (crowd-sourced truth)
-    -- 4. NEVER fall back to Room-XXXX - use "Unmapped Room" to flag data issues
-    room_visits_named AS (
-      SELECT
-        rv.participant_email,
-        rv.participant_name,
-        rv.room_uuid,
-        COALESCE(
-          CASE WHEN rv.event_room_name IS NOT NULL
-                AND rv.event_room_name != ''
-                AND NOT STARTS_WITH(rv.event_room_name, 'Room-')
-               THEN rv.event_room_name END,
-          rm.room_name,
-          erc.room_name,
-          CASE WHEN rv.event_room_name IS NOT NULL
-                AND rv.event_room_name != ''
-               THEN rv.event_room_name END
-        ) as room_name,
-        rv.join_ts,
-        rv.leave_ts,
-        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.join_ts, INTERVAL 330 MINUTE)) as join_ist,
-        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.leave_ts, INTERVAL 330 MINUTE)) as leave_ist,
-        TIMESTAMP_DIFF(rv.leave_ts, rv.join_ts, MINUTE) as duration_mins
-      FROM room_visits_paired rv
-      LEFT JOIN room_name_map rm ON rv.room_uuid = rm.room_uuid
-      LEFT JOIN event_room_consensus erc ON rv.room_uuid = erc.room_uuid
-    ),
-    -- Merge consecutive visits to the SAME room (fixes duplicate room history)
-    -- Assign a group number: increment when room changes
-    room_visits_grouped AS (
+    snapshot_transitions AS (
       SELECT *,
-        SUM(CASE WHEN room_name != prev_room OR prev_room IS NULL THEN 1 ELSE 0 END)
-          OVER (PARTITION BY participant_email, participant_name ORDER BY join_ts) as room_group
-      FROM (
-        SELECT *,
-          LAG(room_name) OVER (PARTITION BY participant_email, participant_name ORDER BY join_ts) as prev_room
-        FROM room_visits_named
-      )
+        LAG(room_name) OVER (
+          PARTITION BY participant_key
+          ORDER BY snapshot_time
+        ) as prev_room
+      FROM snapshot_keyed
     ),
-    -- Collapse consecutive same-room visits into one entry
+    visit_groups AS (
+      SELECT *,
+        SUM(CASE
+          WHEN prev_room IS NULL OR room_name != prev_room THEN 1
+          ELSE 0
+        END) OVER (
+          PARTITION BY participant_key
+          ORDER BY snapshot_time
+        ) as visit_id
+      FROM snapshot_transitions
+    ),
     room_visits AS (
       SELECT
-        participant_email,
-        participant_name,
+        participant_key,
+        MAX(participant_name) as participant_name,
+        MAX(participant_email) as participant_email,
         room_name,
-        MIN(join_ts) as join_ts,
-        MAX(leave_ts) as leave_ts,
-        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(join_ts), INTERVAL 330 MINUTE)) as join_ist,
-        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(leave_ts), INTERVAL 330 MINUTE)) as leave_ist,
-        SUM(COALESCE(duration_mins, 0)) as duration_mins
-      FROM room_visits_grouped
-      GROUP BY participant_email, participant_name, room_name, room_group
+        MIN(snapshot_time) as join_time,
+        MAX(snapshot_time) as leave_time,
+        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(snapshot_time), INTERVAL 330 MINUTE)) as join_ist,
+        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(snapshot_time), INTERVAL 330 MINUTE)) as leave_ist
+      FROM visit_groups
+      GROUP BY participant_key, room_name, visit_id
     ),
-    -- Build room history string per participant
     room_history AS (
       SELECT
-        participant_email,
-        participant_name,
+        MAX(participant_name) as participant_name,
+        MAX(participant_email) as snapshot_email,
         STRING_AGG(
-          CONCAT(room_name, ' [', join_ist, '-', COALESCE(leave_ist, '?'), ']'),
-          ' -> ' ORDER BY join_ts
-        ) as rooms,
-        SUM(COALESCE(duration_mins, 0)) as total_room_mins
+          CONCAT(room_name, ' [', join_ist, '-', leave_ist, ']'),
+          ' -> ' ORDER BY join_time
+        ) as rooms
       FROM room_visits
-      GROUP BY participant_email, participant_name
+      GROUP BY participant_key
     ),
-    -- Main meeting join/leave - group by EMAIL only (prevents duplicate rows for name variations)
-    participant_main AS (
+    -- ==========================================================
+    -- PART 2: JOIN/LEAVE TIMES from webhooks (EXACT timestamps)
+    -- Webhooks have real join/leave times, not when bot saw them
+    -- ==========================================================
+    webhook_by_email AS (
       SELECT
         participant_email,
-        -- Pick the most common name for this email (handles "John Doe" vs "J. Doe")
-        ARRAY_AGG(participant_name ORDER BY event_count DESC LIMIT 1)[OFFSET(0)] as participant_name,
+        ARRAY_AGG(participant_name ORDER BY cnt DESC LIMIT 1)[OFFSET(0)] as participant_name,
         MIN(first_join) as first_join,
         MAX(last_leave) as last_leave
       FROM (
         SELECT
           participant_email,
           participant_name,
-          COUNT(*) as event_count,
+          COUNT(*) as cnt,
           MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as first_join,
           MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as last_leave
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
@@ -398,8 +272,7 @@ def generate_daily_report(report_date=None):
       WHERE participant_email IS NOT NULL AND participant_email != ''
       GROUP BY participant_email
     ),
-    -- Safe timestamp parser (handles both Z suffix and plain ISO)
-    participant_main_parsed AS (
+    webhook_parsed AS (
       SELECT
         participant_name,
         participant_email,
@@ -411,22 +284,90 @@ def generate_daily_report(report_date=None):
           SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', last_leave),
           SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', last_leave)
         ) as last_leave_ts
-      FROM participant_main
+      FROM webhook_by_email
+    ),
+    -- ==========================================================
+    -- PART 3: COMBINE
+    -- Match webhooks ↔ snapshots using 3-tier matching:
+    --   1. Email match (most reliable - if SDK returns email)
+    --   2. Exact name match (case-insensitive)
+    --   3. First-word name match ("Shashank" matches "Shashank C" and "Shashank Channawar")
+    -- ==========================================================
+    matched AS (
+      SELECT
+        w.participant_name as webhook_name,
+        w.participant_email,
+        w.first_join_ts,
+        w.last_leave_ts,
+        rh.participant_name as snapshot_name,
+        rh.snapshot_email,
+        rh.rooms,
+        ROW_NUMBER() OVER (
+          PARTITION BY COALESCE(w.participant_email, LOWER(TRIM(w.participant_name)))
+          ORDER BY
+            -- Priority: email match > exact name > first-word match
+            CASE
+              WHEN w.participant_email != '' AND rh.snapshot_email != ''
+                   AND LOWER(w.participant_email) = LOWER(rh.snapshot_email) THEN 0
+              WHEN LOWER(TRIM(w.participant_name)) = LOWER(TRIM(rh.participant_name)) THEN 1
+              WHEN SPLIT(LOWER(TRIM(w.participant_name)), ' ')[OFFSET(0)]
+                   = SPLIT(LOWER(TRIM(rh.participant_name)), ' ')[OFFSET(0)] THEN 2
+              ELSE 3
+            END
+        ) as match_rank
+      FROM webhook_parsed w
+      LEFT JOIN room_history rh ON (
+        -- Tier 1: Email match
+        (w.participant_email != '' AND rh.snapshot_email != ''
+         AND LOWER(w.participant_email) = LOWER(rh.snapshot_email))
+        OR
+        -- Tier 2: Exact name match
+        LOWER(TRIM(w.participant_name)) = LOWER(TRIM(rh.participant_name))
+        OR
+        -- Tier 3: First word match (handles "Shashank" vs "Shashank Channawar")
+        (SPLIT(LOWER(TRIM(w.participant_name)), ' ')[OFFSET(0)]
+         = SPLIT(LOWER(TRIM(rh.participant_name)), ' ')[OFFSET(0)]
+         AND LENGTH(SPLIT(LOWER(TRIM(w.participant_name)), ' ')[OFFSET(0)]) >= 3)
+      )
+    ),
+    -- Get best match per webhook participant
+    best_match AS (
+      SELECT * FROM matched WHERE match_rank = 1
+    ),
+    -- Also include snapshot-only participants (no webhook match)
+    snapshot_only AS (
+      SELECT rh.participant_name, rh.snapshot_email, rh.rooms
+      FROM room_history rh
+      WHERE NOT EXISTS (
+        SELECT 1 FROM best_match bm
+        WHERE bm.rooms = rh.rooms AND bm.snapshot_name = rh.participant_name
+      )
     )
+    -- Final output
     SELECT
-      pm.participant_name as Name,
-      pm.participant_email as Email,
-      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.first_join_ts, INTERVAL 330 MINUTE)) as Main_Joined_IST,
-      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.last_leave_ts, INTERVAL 330 MINUTE)) as Main_Left_IST,
-      -- Total duration = time from main room join to main room leave (actual meeting attendance)
-      -- This is more accurate than breakout room time which excludes main room time
-      TIMESTAMP_DIFF(pm.last_leave_ts, pm.first_join_ts, MINUTE) as Total_Duration_Min,
-      COALESCE(rh.rooms, '-') as Room_History
-    FROM participant_main_parsed pm
-    LEFT JOIN room_history rh
-      ON pm.participant_email = rh.participant_email
-    WHERE pm.participant_name NOT LIKE '%Scout%'
-    ORDER BY pm.participant_name
+      bm.webhook_name as Name,
+      bm.participant_email as Email,
+      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(bm.first_join_ts, INTERVAL 330 MINUTE)) as Main_Joined_IST,
+      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(bm.last_leave_ts, INTERVAL 330 MINUTE)) as Main_Left_IST,
+      TIMESTAMP_DIFF(bm.last_leave_ts, bm.first_join_ts, MINUTE) as Total_Duration_Min,
+      COALESCE(bm.rooms, '-') as Room_History
+    FROM best_match bm
+    WHERE bm.webhook_name NOT LIKE '%Scout%'
+
+    UNION ALL
+
+    -- Participants only in snapshots (no webhook - maybe joined before webhooks started)
+    SELECT
+      so.participant_name as Name,
+      COALESCE(so.snapshot_email, '') as Email,
+      '' as Main_Joined_IST,
+      '' as Main_Left_IST,
+      NULL as Total_Duration_Min,
+      so.rooms as Room_History
+    FROM snapshot_only so
+    WHERE so.participant_name NOT LIKE '%Scout%'
+
+    ORDER BY Name
     """
 
     try:

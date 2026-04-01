@@ -5,24 +5,36 @@ This file provides complete guidance to Claude Code when working with this repos
 ## Project Overview
 
 **Zoom Breakout Room Tracker** - A production system deployed on Google Cloud Run that:
-- Tracks participant activity in Zoom breakout rooms
+- Tracks participant activity in Zoom breakout rooms via **SDK Monitoring** (polls every 30s)
 - Captures camera ON/OFF status via Dashboard QoS API
-- Maps Zoom's webhook UUIDs to human-readable room names using Scout Bot calibration
+- **No calibration needed** - SDK provides room names directly
 - Generates daily attendance CSV reports with IST timestamps
+- Scout Bot VM auto-joins meetings; HR clicks app once to start monitoring
 
-**Cloud Run URL:** `https://breakout-room-calibrator-1041741270489.us-central1.run.app`
+**Cloud Run URLs:**
+- Primary: `https://breakout-room-calibrator-1041741270489.us-central1.run.app`
+- Alternate: `https://breakout-room-calibrator-r3wh42mg6q-uc.a.run.app`
+
 **GCP Project:** `variant-finance-data-project`
 **BigQuery Dataset:** `breakout_room_calibrator`
+**Current Revision:** 119
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
+│                    Scout Bot VM (GCP)                            │
+│   IP: 34.47.178.82 | User: dataapps | Pass: ScoutBot2026        │
+│   Auto-joins meeting → HR clicks app → Monitoring starts         │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ SDK polls every 30s
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
 │                         Cloud Run                                │
 │  ┌─────────────────┐    ┌──────────────────────────────────┐   │
 │  │  React App      │    │  Flask Server (app.py)           │   │
-│  │  (Zoom SDK)     │────│  - /webhook (Zoom events)        │   │
-│  │  /app endpoint  │    │  - /calibration/* (Scout Bot)    │   │
+│  │  (MonitorPanel) │────│  - /monitor/* (SDK polling)      │   │
+│  │  /app endpoint  │    │  - /webhook (Zoom events)        │   │
 │  └─────────────────┘    │  - /report/* (CSV generation)    │   │
 │                         │  - /qos/* (Camera tracking)       │   │
 │                         └──────────────────────────────────┘   │
@@ -32,7 +44,7 @@ This file provides complete guidance to Claude Code when working with this repos
                     ▼               ▼               ▼
             ┌──────────────┐ ┌──────────┐  ┌──────────────┐
             │   BigQuery   │ │ Zoom API │  │  SendGrid    │
-            │   4 tables   │ │  (QoS)   │  │  (Reports)   │
+            │   5 tables   │ │  (QoS)   │  │  (Reports)   │
             └──────────────┘ └──────────┘  └──────────────┘
 ```
 
@@ -40,11 +52,12 @@ This file provides complete guidance to Claude Code when working with this repos
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Main Flask server (~2700 lines) - webhooks, calibration, QoS, reports |
-| `report_generator.py` | Daily CSV report generation with IST timestamps |
-| `breakout-calibrator/` | React app using Zoom Apps SDK for calibration UI |
-| `breakout-calibrator/src/components/CalibrationPanel.jsx` | Main calibration UI component |
-| `breakout-calibrator/src/services/zoomService.js` | SDK calibration logic, bot detection |
+| `app.py` | Main Flask server - webhooks, monitoring, QoS, reports |
+| `report_generator.py` | Daily CSV report from snapshots + webhooks |
+| `breakout-calibrator/` | React app using Zoom Apps SDK |
+| `breakout-calibrator/src/components/MonitorPanel.jsx` | **SDK polling UI (primary)** |
+| `breakout-calibrator/src/components/CalibrationPanel.jsx` | Legacy calibration UI |
+| `breakout-calibrator/src/hooks/useZoomSdk.js` | Zoom SDK methods |
 | `breakout-calibrator/src/services/apiService.js` | Backend API communication |
 | `requirements.txt` | Python dependencies |
 | `Dockerfile` | Cloud Run deployment config |
@@ -71,19 +84,28 @@ gcloud run services logs tail breakout-room-calibrator --region us-central1
 
 | Table | Schema | Purpose |
 |-------|--------|---------|
-| `participant_events` | event_id, event_type, event_timestamp, event_date, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, room_uuid, room_name, inserted_at | All join/leave events (main room + breakout) |
-| `room_mappings` | mapping_id, meeting_id, meeting_uuid, room_uuid, room_name, room_index, mapping_date, mapped_at, source | UUID -> room name mappings per meeting |
+| `room_snapshots` | snapshot_id, snapshot_time, event_date, meeting_id, room_name, participant_name, participant_email, participant_uuid, inserted_at | **PRIMARY** - SDK polling data (every 30s) |
+| `participant_events` | event_id, event_type, event_timestamp, event_date, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, room_uuid, room_name, inserted_at | Webhook join/leave events |
+| `room_mappings` | mapping_id, meeting_id, meeting_uuid, room_uuid, room_name, room_index, mapping_date, mapped_at, source | UUID -> room name (legacy calibration) |
 | `camera_events` | event_id, event_type, event_timestamp, event_date, event_time, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, camera_on, room_name, duration_seconds, inserted_at | Camera ON/OFF events |
 | `qos_data` | qos_id, meeting_uuid, participant_id, participant_name, participant_email, join_time, leave_time, duration_minutes, attentiveness_score, camera_on_count, camera_on_minutes, camera_on_intervals, recorded_at, event_date | Quality of Service metrics from Dashboard API |
 
 ## API Endpoints Reference
+
+### Monitor Mode (SDK Polling) - PRIMARY
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/monitor/snapshot` | POST | Receive SDK polling data → saves to room_snapshots |
+| `/monitor/status` | GET | Check snapshot counts for today |
+| `/monitor/health` | GET | Check if monitoring active (HEALTHY/STALE/NO_DATA) |
+| `/monitor/sample` | GET | View sample snapshot data (last 50 rows) |
 
 ### Webhook
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/webhook` | POST | Receives Zoom webhook events (participant_joined, participant_left, breakout_room_joined, breakout_room_left, meeting.ended) |
 
-### Calibration
+### Calibration (Legacy)
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/calibration/start` | POST | Start calibration session for meeting |

@@ -1,53 +1,452 @@
 # Zoom Breakout Room Tracker
 
-A complete solution for tracking participant attendance in Zoom breakout rooms with proper room name resolution. Deployed on Google Cloud Run with BigQuery storage.
-
-## Overview
-
-This system captures participant activity in Zoom meetings and breakout rooms, storing data in BigQuery for reporting. It solves the challenge of mapping Zoom's internal room UUIDs to human-readable room names.
-
-### Key Features
-- Real-time participant join/leave tracking via Zoom Webhooks
-- Breakout room visit tracking with proper room names
-- Camera on/off event tracking
-- QoS data collection (duration, attentiveness)
-- Daily attendance reports with actual room names (not UUIDs)
+A complete solution for tracking participant attendance in Zoom breakout rooms using SDK Monitoring. Deployed on Google Cloud Run with BigQuery storage.
 
 ---
 
-## LATEST UPDATE (2026-03-26) - Fixed Room Sequence
+## Project Overview
 
-### Problem Solved
-Webhooks arriving out of order caused wrong room mappings (e.g., Manasvi More shown in 1.13 but actually in 1.16)
+This system captures participant activity in Zoom meetings and breakout rooms. The Zoom SDK polls every 30 seconds to capture who is in which room, storing data in BigQuery for daily reports.
 
-### Solution: Hardcoded FIXED_ROOM_SEQUENCE
-- All 66 room names hardcoded in exact order
-- Bot visits rooms in order (1.1 -> 1.2 -> 1.3...)
-- When calibration completes, webhooks sorted by timestamp
-- 1st webhook = Room 1.1, 2nd webhook = Room 1.2, etc.
-- **Cannot produce wrong mappings!**
+**Key Achievement:** No calibration needed! SDK provides room names directly.
 
-### 3-Layer Calibration Logic
+---
 
-**Layer 1: Real-time Sequence Matching**
-- As bot moves, webhooks matched by position
-- Saved with `source='sequence_calibration'`
+## Quick Reference
 
-**Layer 2: Timestamp Correction (Auto-runs on complete)**
-- Sorts ALL webhooks by timestamp
-- Re-matches to FIXED_ROOM_SEQUENCE
-- Saved with `source='timestamp_calibration'` (HIGHEST priority)
+### URLs
+| Service | URL |
+|---------|-----|
+| Cloud Run (Primary) | `https://breakout-room-calibrator-1041741270489.us-central1.run.app` |
+| Cloud Run (Alternate) | `https://breakout-room-calibrator-r3wh42mg6q-uc.a.run.app` |
+| Zoom App Home URL | `https://breakout-room-calibrator-1041741270489.us-central1.run.app/app` |
 
-**Layer 3: Fixed Sequence Fallback**
-- Uses hardcoded 66 room names
-- Deterministic and reliable
+### IDs & Credentials
+| Item | Value |
+|------|-------|
+| GCP Project ID | `variant-finance-data-project` |
+| BigQuery Dataset | `breakout_room_calibrator` |
+| Zoom Account ID | `xhKbAsmnSM6pNYYYurmqIA` |
+| Zoom Server-to-Server Client ID | `TqtBGqTAS3W1Jgf9a41w` |
+| Zoom App Client ID | `raEkn6HpTkWO_DCO3z5zGA` |
+| Zoom App ID | `RRYgo_e2QE697_mxkp3tzg` |
+| Meeting ID | `9034027764` |
+| Current Revision | **119** |
 
-### Report Priority
+### Scout Bot VM
+| Setting | Value |
+|---------|-------|
+| VM Name | `scout-bot-vm` |
+| External IP | `34.47.178.82` |
+| Zone | `asia-south1-a` |
+| Machine Type | `e2-medium` (2 vCPU, 4GB RAM) |
+| OS | Windows Server |
+| Username | `dataapps` |
+| Password | `ScoutBot2026` |
+
+---
+
+## Daily Workflow
+
 ```
-1. timestamp_calibration  <- Uses FIXED sequence (BEST)
-2. sequence_calibration   <- Real-time matching
-3. webhook_calibration    <- Legacy
-4. zoom_sdk_app           <- SDK fallback
+1. Meeting starts (e.g., 9:30 AM IST)
+   └── Scout Bot VM auto-joins meeting (scheduled task)
+
+2. HR connects via RDP (1 minute only)
+   └── IP: 34.47.178.82
+   └── Username: dataapps
+   └── Password: ScoutBot2026
+   └── Clicks: Apps → Breakout Room Calibrator
+   └── Monitoring auto-starts
+   └── HR disconnects (VM continues independently)
+
+3. SDK polls every 30 seconds
+   └── Captures: room names + participants
+   └── Saves to: BigQuery room_snapshots table
+
+4. 11:15 AM IST - Report auto-generated
+   └── Cloud Scheduler triggers /report/generate
+   └── CSV emailed to recipients
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Scout Bot VM (GCP)                            │
+│   Windows + Zoom Desktop                                         │
+│   Auto-joins meeting via scheduled task                          │
+│   HR clicks app once → monitoring starts                         │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ SDK polls every 30s
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Cloud Run (Flask + React)                     │
+│                                                                  │
+│  React App (/app)          Flask Server (app.py)                │
+│  - MonitorPanel.jsx        - /monitor/snapshot (save data)      │
+│  - useZoomSdk.js           - /report/generate (daily CSV)       │
+│  - Polls SDK every 30s     - /webhook (Zoom events)             │
+└─────────────────────────────────────────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+    ┌──────────────┐ ┌──────────┐  ┌──────────────┐
+    │   BigQuery   │ │ Zoom SDK │  │  SendGrid    │
+    │              │ │          │  │              │
+    │ room_snapshots│ │ Polling  │  │ Email CSV    │
+    │ participant_  │ │ Data     │  │ Reports      │
+    │ events       │ │          │  │              │
+    └──────────────┘ └──────────┘  └──────────────┘
+```
+
+---
+
+## BigQuery Tables
+
+### Dataset: `variant-finance-data-project.breakout_room_calibrator`
+
+### 1. room_snapshots (PRIMARY - SDK Monitoring)
+```sql
+CREATE TABLE room_snapshots (
+  snapshot_id STRING NOT NULL,
+  snapshot_time TIMESTAMP NOT NULL,
+  event_date STRING NOT NULL,          -- IST date (YYYY-MM-DD)
+  meeting_id STRING NOT NULL,
+  room_name STRING NOT NULL,           -- Actual room name from SDK
+  participant_name STRING,
+  participant_email STRING,            -- Often empty (SDK limitation)
+  participant_uuid STRING,
+  inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+```
+**Source:** SDK polls every 30s → POST `/monitor/snapshot`
+
+### 2. participant_events (Webhooks)
+```sql
+CREATE TABLE participant_events (
+  event_id STRING,
+  event_type STRING,                   -- participant_joined, participant_left
+  event_timestamp STRING,              -- Exact time from Zoom
+  event_date STRING,                   -- IST date
+  meeting_id STRING,
+  meeting_uuid STRING,
+  participant_id STRING,
+  participant_name STRING,
+  participant_email STRING,
+  room_uuid STRING,                    -- Base64-like UUID
+  room_name STRING,                    -- Mapped name (if calibrated)
+  inserted_at TIMESTAMP
+);
+```
+**Source:** Zoom webhooks → POST `/webhook`
+
+### 3. room_mappings (Legacy - Calibration)
+```sql
+CREATE TABLE room_mappings (
+  mapping_id STRING,
+  meeting_id STRING,
+  meeting_uuid STRING,
+  room_uuid STRING,
+  room_name STRING,
+  room_index INTEGER,
+  mapping_date DATE,
+  mapped_at TIMESTAMP,
+  source STRING                        -- webhook_calibration, sequential_calibration
+);
+```
+
+### 4. qos_data (Camera/Quality)
+```sql
+CREATE TABLE qos_data (
+  qos_id STRING,
+  meeting_uuid STRING,
+  participant_id STRING,
+  participant_name STRING,
+  participant_email STRING,
+  join_time STRING,
+  leave_time STRING,
+  duration_minutes FLOAT,
+  attentiveness_score FLOAT,
+  camera_on_count INTEGER,
+  camera_on_minutes FLOAT,
+  camera_on_intervals STRING,
+  recorded_at TIMESTAMP,
+  event_date STRING
+);
+```
+**Source:** Dashboard QoS API → `/qos/scheduled`
+
+### 5. camera_events
+```sql
+CREATE TABLE camera_events (
+  event_id STRING,
+  event_type STRING,                   -- camera_on, camera_off
+  event_timestamp STRING,
+  event_date STRING,
+  meeting_id STRING,
+  participant_name STRING,
+  camera_on BOOLEAN,
+  room_name STRING,
+  duration_seconds INTEGER,
+  inserted_at TIMESTAMP
+);
+```
+
+---
+
+## API Endpoints
+
+### Monitor Mode (SDK Polling)
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/monitor/snapshot` | POST | Receive SDK polling data → saves to room_snapshots |
+| `/monitor/status` | GET | Check snapshot counts for today |
+| `/monitor/health` | GET | Check if monitoring is active (HEALTHY/STALE/NO_DATA) |
+| `/monitor/sample` | GET | View sample snapshot data (last 50 rows) |
+
+### Reports
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/report/generate` | POST | Generate and email daily CSV |
+| `/report/preview/<date>` | GET | Preview report data as JSON |
+
+### Webhooks
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/webhook` | POST | Receive Zoom webhook events |
+
+### QoS / Camera
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/qos/scheduled` | POST | Scheduled QoS collection |
+| `/qos/collect` | POST | Manual QoS collection |
+
+### Health & Debug
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/health` | GET | Service health check |
+| `/mappings` | GET | Get current room mappings |
+| `/debug/bq-mappings` | GET | Check BigQuery mappings |
+
+---
+
+## Cloud Scheduler Jobs
+
+| Job | UTC Time | IST Time | Endpoint | Purpose |
+|-----|----------|----------|----------|---------|
+| `daily-qos-collection` | 04:00 | 9:30 AM | `/qos/scheduled` | Collect camera data |
+| `daily-attendance-report` | 05:45 | 11:15 AM | `/report/generate` | Email daily CSV |
+
+---
+
+## Commands Reference
+
+### Deploy to Cloud Run
+```bash
+cd C:\Users\shash\Downloads\zoom+tracker
+cd breakout-calibrator && npm run build && cd ..
+gcloud run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated --min-instances=1
+```
+
+### View Logs
+```bash
+# Recent logs
+gcloud run services logs read breakout-room-calibrator --region us-central1 --limit 100
+
+# Real-time logs
+gcloud run services logs tail breakout-room-calibrator --region us-central1
+```
+
+### Check Service Status
+```bash
+gcloud run services describe breakout-room-calibrator --region us-central1 --format="value(status.url)"
+```
+
+### Generate Report (curl)
+```bash
+curl -X POST "https://breakout-room-calibrator-1041741270489.us-central1.run.app/report/generate" \
+  -H "Content-Type: application/json" \
+  -d '{"date": "2026-04-01"}'
+```
+
+### Check Monitor Status
+```bash
+curl "https://breakout-room-calibrator-1041741270489.us-central1.run.app/monitor/status"
+```
+
+### Check Monitor Health
+```bash
+curl "https://breakout-room-calibrator-1041741270489.us-central1.run.app/monitor/health"
+```
+
+### View Sample Snapshots
+```bash
+curl "https://breakout-room-calibrator-1041741270489.us-central1.run.app/monitor/sample"
+```
+
+### Preview Report
+```bash
+curl "https://breakout-room-calibrator-1041741270489.us-central1.run.app/report/preview/2026-04-01"
+```
+
+---
+
+## Scout Bot VM Setup
+
+### Connect via RDP
+```
+IP: 34.47.178.82
+Username: dataapps
+Password: ScoutBot2026
+```
+
+### VM Automation Files
+```
+C:\ScoutBot\join_meeting.bat    -- Auto-join script
+Scheduled Task: ScoutBot-JoinMeeting
+```
+
+### Change Scheduled Task Time
+```cmd
+schtasks /change /tn "ScoutBot-JoinMeeting" /st 09:30
+```
+
+### Check Scheduled Task
+```cmd
+schtasks /query /tn "ScoutBot-JoinMeeting"
+```
+
+### VM Auto-login (Registry)
+```
+HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+- AutoAdminLogon = 1
+- DefaultUserName = dataapps
+- DefaultPassword = ScoutBot2026
+```
+
+### join_meeting.bat Content
+```batch
+@echo off
+timeout /t 60 /nobreak
+start "" "zoommtg://zoom.us/join?confno=9034027764"
+```
+
+---
+
+## How SDK Monitoring Works
+
+### Data Flow
+```
+1. Scout Bot VM joins Zoom meeting
+2. HR opens Zoom App (MonitorPanel)
+3. App auto-starts monitoring (if host/co-host)
+4. Every 30 seconds:
+   a. getBreakoutRoomList() → room names + UUIDs
+   b. getMeetingParticipants() → who's in which room
+   c. Build snapshot data
+   d. POST /monitor/snapshot → Cloud Run
+   e. Save to BigQuery room_snapshots table
+```
+
+### Room Transition Detection (SQL)
+```sql
+-- Compare consecutive snapshots for each participant
+SELECT
+  participant_name,
+  room_name,
+  snapshot_time,
+  LAG(room_name) OVER (PARTITION BY participant_name ORDER BY snapshot_time) as prev_room
+FROM room_snapshots
+
+-- When room_name != prev_room → room transition detected!
+```
+
+### Why No Calibration Needed
+```
+OLD METHOD (Calibration):
+- Webhooks send UUIDs like "n0a1FJhALeimJ5UPLUTxiw=="
+- Need Scout Bot to visit each room to map UUID → name
+- Takes 30+ minutes for 66 rooms
+
+NEW METHOD (SDK Monitoring):
+- SDK's getBreakoutRoomList() returns room names directly!
+- No UUID mapping needed
+- Just poll and store
+```
+
+---
+
+## Report Format
+
+### CSV Columns
+| Column | Description | Source |
+|--------|-------------|--------|
+| Name | Participant name | Snapshots |
+| Email | Email (often empty) | Webhooks/Snapshots |
+| Main_Joined_IST | First seen time | Webhooks or Snapshots |
+| Main_Left_IST | Last seen time | Webhooks or Snapshots |
+| Total_Duration | Time in meeting | Calculated |
+| Room_History | Room visits with times | Snapshots |
+
+### Example Output
+```csv
+Name,Email,Main_Joined_IST,Main_Left_IST,Total_Duration,Room_History
+Abhishek Rathi,abhishek@example.com,09:30,11:00,1h 30m,1.8:Life In The Math Lane [09:30-10:00] -> 8.0:BREAK TIME [10:00-10:15] -> 1.8:Life In The Math Lane [10:15-11:00]
+```
+
+---
+
+## Environment Variables (Cloud Run)
+
+### Required
+```
+ZOOM_CLIENT_ID=TqtBGqTAS3W1Jgf9a41w
+ZOOM_CLIENT_SECRET=<secret>
+ZOOM_WEBHOOK_SECRET=<secret>
+ZOOM_ACCOUNT_ID=xhKbAsmnSM6pNYYYurmqIA
+GCP_PROJECT_ID=variant-finance-data-project
+SENDGRID_API_KEY=<key>
+REPORT_EMAIL_TO=scout@verveadvisory.com;devendra.mandhana@verveadvisory.com
+```
+
+### Optional
+```
+SCOUT_BOT_NAME=Scout Bot
+BQ_DATASET=breakout_room_calibrator
+REPORT_EMAIL_FROM=reports@verveadvisory.com
+```
+
+---
+
+## Files Structure
+
+```
+zoom+tracker/
+├── app.py                    # Flask server (webhooks, monitoring, reports)
+├── report_generator.py       # Daily CSV generation from snapshots
+├── requirements.txt          # Python dependencies
+├── Dockerfile               # Cloud Run deployment
+├── CLAUDE.md                # Claude Code instructions
+├── README.md                # This file
+├── breakout-calibrator/     # React app (Zoom SDK)
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── MonitorPanel.jsx      # SDK polling UI
+│   │   │   ├── CalibrationPanel.jsx  # Legacy calibration UI
+│   │   │   └── StatusMessage.jsx
+│   │   ├── hooks/
+│   │   │   └── useZoomSdk.js         # Zoom SDK methods
+│   │   ├── services/
+│   │   │   ├── apiService.js
+│   │   │   └── zoomService.js
+│   │   └── App.jsx
+│   └── package.json
+└── vm-setup/
+    ├── setup_scout_bot.ps1   # PowerShell setup script
+    └── quick_setup.bat       # Batch setup script
 ```
 
 ---
@@ -55,8 +454,8 @@ Webhooks arriving out of order caused wrong room mappings (e.g., Manasvi More sh
 ## Fixed Room Sequence (66 Rooms)
 
 ```
-Floor 1 (1.1 to 1.34)
----------------------
+Floor 1 (1.1 - 1.34)
+--------------------
 1.1:It's Accrual World
 1.2:Between The Spreadsheet
 1.3:Opera House
@@ -92,8 +491,8 @@ Floor 1 (1.1 to 1.34)
 1.33:Interview Room - 2
 1.34:Interview/Meeting - Eagle Eyes
 
-Floor 2 (Vridam)
-----------------
+Floor 2
+-------
 2.0:Vridam - Wellness Meeting Lounge
 
 Floor 3 (Cloud Teams)
@@ -104,7 +503,7 @@ Floor 3 (Cloud Teams)
 3.4:Cloud Falcons
 3.5:Cloud Titans
 3.6:Cloud Guardians
-3.7:Inspiration Lounge /Meeting Room
+3.7:Inspiration Lounge/Meeting Room
 3.8:Agenda Chamber/Meeting Room
 3.9:ABAP AMS
 
@@ -120,16 +519,16 @@ Floor 4 (KPRC)
 Floor 5 (Accurest)
 ------------------
 5.1:Accurest - HR Oasis
-5.2:Accurest-Meeting Room:Strategist
+5.2:Accurest - Meeting Room: Strategist
 5.3:Accurest - Meeting Room: Pioneer
 5.4:Accurest - Automation Crafters
-5.5:Accurest-Learning / Meeting room
+5.5:Accurest - Learning/Meeting room
 5.6:Accurest - Sales Lounge
 5.7:Accurest - Focus Lab
 5.8:Accurest - Pattern Inbound
 5.9:Accurest - Pattern Planning
 5.10:Accurest - Himal's Suite
-5.11:Accurest Insight : Team Shubham
+5.11:Accurest Insight: Team Shubham
 5.12:Accurest - Creators
 5.13:Accurest - Interview Room
 
@@ -137,292 +536,57 @@ Special Zones
 -------------
 6.0:Silence Zone
 7.0:Masti Ki Pathshala
-8.0:BREAK TIME - Tea/Lunch/ Dinner
+8.0:BREAK TIME - Tea/Lunch/Dinner
 ```
-
----
-
-## Current Deployment
-
-- **Cloud Run URL:** `https://breakout-room-calibrator-r3wh42mg6q-uc.a.run.app`
-- **GCP Project:** `variant-finance-data-project`
-- **BigQuery Dataset:** `breakout_room_calibrator`
-- **Current Revision:** 93
-
----
-
-## Architecture
-
-```
-+------------------------------------------------------------------+
-|                         Cloud Run                                 |
-|  +------------------+    +-----------------------------------+    |
-|  |  React App       |    |  Flask Server (app.py)            |    |
-|  |  (Zoom SDK)      |----|  - /webhook (Zoom events)         |    |
-|  |  /app endpoint   |    |  - /calibration/* (Scout Bot)     |    |
-|  +------------------+    |  - /report/* (CSV generation)     |    |
-|                          |  - /qos/* (Camera tracking)        |    |
-|                          +-----------------------------------+    |
-+------------------------------------------------------------------+
-                                    |
-                    +---------------+---------------+
-                    v               v               v
-            +--------------+ +----------+  +--------------+
-            |   BigQuery   | | Zoom API |  |  SendGrid    |
-            |   5 tables   | |  (QoS)   |  |  (Reports)   |
-            +--------------+ +----------+  +--------------+
-```
-
----
-
-## Deployment Commands
-
-```bash
-# Full deployment
-cd C:\Users\shash\Downloads\zoom+tracker
-cd breakout-calibrator && npm run build && cd ..
-gcloud run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated --min-instances=1 --max-instances=1
-
-# View logs
-gcloud run services logs read breakout-room-calibrator --region us-central1 --limit 100
-
-# Tail logs real-time
-gcloud run services logs tail breakout-room-calibrator --region us-central1
-
-# Get current URL
-gcloud run services describe breakout-room-calibrator --region us-central1 --format="value(status.url)"
-```
-
----
-
-## API Endpoints
-
-### Calibration
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/calibration/start` | POST | Start calibration session |
-| `/calibration/mapping` | POST | Receive room mappings from SDK |
-| `/calibration/pending` | GET | Check pending room moves |
-| `/calibration/complete` | POST | Mark complete (triggers timestamp correction) |
-| `/calibration/verify` | POST | Verify bot location |
-| `/calibration/status` | GET | Get current status |
-| `/calibration/correct` | POST | Manual timestamp correction |
-| `/calibration/fixed-sequence` | GET | View hardcoded room sequence |
-| `/calibration/reload` | POST | Force reload mappings |
-
-### Reports
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/report/generate` | POST | Generate and email daily CSV |
-| `/report/preview/<date>` | GET | Preview report data |
-
-### QoS / Camera
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/qos/collect` | POST | Manual QoS collection |
-| `/qos/scheduled` | POST | Scheduled collection |
-| `/webhook` | POST | Zoom webhook events |
-| `/health` | GET | Health check |
-| `/mappings` | GET | Get current room mappings |
-
----
-
-## Cloud Scheduler Jobs
-
-| Job | Schedule (UTC) | IST Time | Endpoint |
-|-----|----------------|----------|----------|
-| `daily-qos-collection` | 03:45 | 9:15 AM | `/qos/scheduled` |
-| `daily-attendance-report` | 04:30 | 10:00 AM | `/report/generate` |
-
----
-
-## BigQuery Tables
-
-| Table | Purpose |
-|-------|---------|
-| `participant_events` | Join/leave events |
-| `room_mappings` | UUID -> room name (source priority matters) |
-| `camera_events` | Camera ON/OFF |
-| `qos_data` | Dashboard API metrics |
-| `calibration_state` | Calibration persistence for resume |
-
----
-
-## How Calibration Works Now
-
-1. **User starts calibration** from Zoom App UI
-2. **Scout Bot moves** through rooms in order (1.1 -> 1.2 -> 1.3...)
-3. **Each move** triggers a webhook with room_uuid
-4. **On completion**, `correct_calibration_by_timestamp()` runs:
-   - Sorts all Scout Bot webhooks by arrival timestamp
-   - 1st webhook = `1.1:It's Accrual World`
-   - 2nd webhook = `1.2:Between The Spreadsheet`
-   - ...continues for all 66 rooms
-5. **Report uses** `timestamp_calibration` source (highest priority)
-
-**Result:** Deterministic, accurate room mappings every time!
 
 ---
 
 ## Troubleshooting
 
-### Cloud Run URL Changed
-If URL changes after deployment:
-1. Get new URL: `gcloud run services describe breakout-room-calibrator --region us-central1 --format="value(status.url)"`
-2. Update Zoom webhook URL in Marketplace app
-3. Update Cloud Scheduler jobs:
-```bash
-gcloud scheduler jobs update http daily-qos-collection --location=us-central1 --uri='NEW_URL/qos/scheduled'
-gcloud scheduler jobs update http daily-attendance-report --location=us-central1 --uri='NEW_URL/report/generate'
-```
+### Monitor shows "STALE" or "NO_DATA"
+- Check if Zoom App is open on Scout Bot VM
+- Verify Scout Bot is host/co-host
+- Reconnect via RDP and click the app again
 
-### Webhook 401 Errors
-- Check for duplicate webhook subscriptions in Zoom Marketplace
-- Ensure only ONE subscription exists with correct URL
-- Verify webhook secret matches `ZOOM_WEBHOOK_SECRET` env var
+### Report shows empty Room History
+- Ensure monitoring started at meeting start
+- Check `/monitor/sample` for data
+- Verify `room_snapshots` table has data
 
-### Calibration Not Matching Webhooks
-If logs show `Calibration NOT in progress`:
-1. Stop current calibration
-2. Click "Start Calibration" in Zoom App UI
-3. This properly initializes the backend state
+### VM not joining meeting
+- Check scheduled task: `schtasks /query /tn "ScoutBot-JoinMeeting"`
+- Verify Zoom is installed and logged in
+- Check `C:\ScoutBot\join_meeting.bat` exists
 
-### BigQuery Streaming Buffer Error
-```
-UPDATE or DELETE statement over table would affect rows in the streaming buffer
-```
-- Recently inserted rows can't be modified
-- Wait ~30 minutes or use TRUNCATE TABLE
-- The system handles this gracefully
+### App not visible in Zoom
+- Add Scout Bot's email to Test Users in Zoom Marketplace
+- Or use direct install URL: `https://marketplace.zoom.us/apps/RRYgo_e2QE697_mxkp3tzg`
 
-### Room names show as "Room-XXXXXXXX"
-- Webhook calibration not completed
-- Run calibration with Scout Bot
-- Verify with BigQuery query
+### DNS/Connection errors
+- Both URLs work: try the alternate URL
+- Check internet connectivity
 
 ---
 
-## Session Log (2026-03-26)
+## Version History
 
-### Issues Found and Fixed
-
-1. **Room mapping inaccuracy**
-   - Problem: Webhooks arriving out of order
-   - Solution: Hardcoded FIXED_ROOM_SEQUENCE + timestamp sorting
-
-2. **Cloud Run URL changed**
-   - Old: `https://breakout-room-calibrator-1041741270489.us-central1.run.app`
-   - New: `https://breakout-room-calibrator-r3wh42mg6q-uc.a.run.app`
-   - Updated: Zoom webhook URL, Cloud Scheduler jobs
-
-3. **Duplicate webhook subscriptions**
-   - Caused 401 errors on new URL
-   - Solution: Remove old subscriptions from Zoom Marketplace
-
-4. **Calibration state not persisting**
-   - `calibration_in_progress: False` during active calibration
-   - Solution: Must start from Zoom App UI to initialize properly
-
-### Deployment History
-- Revision 93: Fixed room sequence (66 rooms) + timestamp correction
-- Revision 92: Increased calibration delays (5s move, 25s timeout)
-- Revision 91: SQL injection fixes, calibration state persistence
+| Rev | Date | Changes |
+|-----|------|---------|
+| 119 | 2026-04-01 | Report uses webhooks + snapshots combined |
+| 118 | 2026-04-01 | SDK monitoring mode, simplified report |
+| 117 | 2026-04-01 | Fixed participant count (use name when email empty) |
+| 116 | 2026-04-01 | Added room_snapshots table, MonitorPanel component |
+| 111 | 2026-03-26 | Fixed room sequence calibration |
+| 105 | 2026-03-25 | Resume calibration feature |
 
 ---
 
 ## Critical Knowledge
 
-1. **Camera webhooks DON'T exist** - Use Dashboard QoS API
-2. **UUID mismatch** - SDK uses GUIDs, webhooks use base64-like
-3. **QoS page_size max is 10** - Code fetches 200 pages
-4. **Send mapping BEFORE moving bot** - Frontend -> backend -> move
+1. **SDK provides room names** - No calibration needed!
+2. **Emails often empty** - SDK limitation, use participant_name
+3. **Bot must join at meeting start** - For accurate timing
+4. **VM runs independently** - HR can disconnect after opening app
 5. **IST dates** - All event_date stored in IST (UTC+5:30)
-6. **Single instance required** - `--max-instances=1` prevents state issues
-
----
-
-## Environment Variables
-
-Required in Cloud Run:
-```
-ZOOM_CLIENT_ID        # Server-to-Server OAuth app
-ZOOM_CLIENT_SECRET    # Server-to-Server OAuth app
-ZOOM_WEBHOOK_SECRET   # Webhook validation
-ZOOM_ACCOUNT_ID       # Account ID for API calls
-GCP_PROJECT_ID        # variant-finance-data-project
-SENDGRID_API_KEY      # For email reports
-REPORT_EMAIL_TO       # Recipients (comma separated)
-```
-
-Optional:
-```
-SCOUT_BOT_NAME        # Default: "Scout Bot"
-SCOUT_BOT_EMAIL       # Email for bot matching
-BQ_DATASET            # Default: "breakout_room_calibrator"
-REPORT_EMAIL_FROM     # Sender email for reports
-```
-
----
-
-## Files Structure
-
-| File | Purpose |
-|------|---------|
-| `app.py` | Main Flask server (~2800 lines) |
-| `report_generator.py` | Daily CSV report generation |
-| `breakout-calibrator/` | React app (Zoom SDK) |
-| `requirements.txt` | Python dependencies |
-| `Dockerfile` | Cloud Run deployment |
-| `CLAUDE.md` | Claude Code instructions |
-| `README.md` | This documentation |
-
----
-
-## Report Generation Commands
-
-```bash
-# For specific date:
-curl -X POST "https://breakout-room-calibrator-r3wh42mg6q-uc.a.run.app/report/generate" \
-  -H "Content-Type: application/json" \
-  -d '{"date": "2026-03-26"}'
-
-# Without date (defaults to yesterday):
-curl -X POST "https://breakout-room-calibrator-r3wh42mg6q-uc.a.run.app/report/generate" \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
-
----
-
-## The UUID Mapping Problem and Solution
-
-**Problem:** Zoom webhooks send room UUIDs like `n0a1FJhALeimJ5UPLUTxiw==` but we need room names like `1.1:It's Accrual World`. The SDK uses different UUID format `{E7F123FC-...}` than webhooks.
-
-**Solution:** Scout Bot Calibration with Fixed Sequence
-1. A participant named "Scout Bot" joins the meeting
-2. Host runs the Zoom App and clicks "Move Scout Bot"
-3. Scout Bot clicks "Join" on each room popup
-4. When Scout Bot enters a room, the webhook captures the webhook UUID
-5. On completion, webhooks sorted by timestamp and matched to FIXED_ROOM_SEQUENCE
-6. All future participant events use this mapping for proper room names
-
----
-
-## Zoom Credentials
-
-| Type | ID |
-|------|-----|
-| Account ID | `xhKbAsmnSM6pNYYYurmqIA` |
-| Server-to-Server Client ID | `TqtBGqTAS3W1Jgf9a41w` |
-| Zoom App Client ID | `raEkn6HpTkWO_DCO3z5zGA` |
-
----
-
-## Known Limitations (Zoom Platform)
-
-1. **UUID Format Mismatch** - SDK uses GUIDs, webhooks use base64-like strings
-2. **Cannot Force Participants** - SDK sends invite popup, user must click "Join"
-3. **Webhooks on Entry Only** - Only fires when participant actually enters room
-4. **REST API 404 for PMR** - Must use SDK for Personal Meeting Rooms
-
-**Bottom Line:** There is no way to automatically map webhook UUIDs to room names without someone physically entering each room. This is a Zoom platform limitation.
+6. **Two URLs work** - Primary and alternate Cloud Run URLs both valid
+7. **Camera webhooks don't exist** - Use Dashboard QoS API instead

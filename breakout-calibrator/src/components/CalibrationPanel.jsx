@@ -157,7 +157,22 @@ function CalibrationPanel() {
       const meetingUUID = await getMeetingUUID();
       const meetingId = meetingContext?.meetingID;
 
-      const breakoutRooms = await getBreakoutRooms();
+      const rawRooms = await getBreakoutRooms();
+      // Sort by prefix (1.1, 1.2, ..., 2.0, 3.1, ...) - SAME order as zoomService.js
+      const breakoutRooms = [...rawRooms].sort((a, b) => {
+        const nameA = a.breakoutRoomName || a.name || '';
+        const nameB = b.breakoutRoomName || b.name || '';
+        const matchA = nameA.match(/^(\d+)\.(\d+)/);
+        const matchB = nameB.match(/^(\d+)\.(\d+)/);
+        if (matchA && matchB) {
+          const diff = parseInt(matchA[1], 10) - parseInt(matchB[1], 10);
+          if (diff !== 0) return diff;
+          return parseInt(matchA[2], 10) - parseInt(matchB[2], 10);
+        }
+        if (matchA && !matchB) return -1;
+        if (!matchA && matchB) return 1;
+        return nameA.localeCompare(nameB);
+      });
       setRooms(breakoutRooms);
       setTotalRooms(breakoutRooms.length);
 
@@ -198,15 +213,24 @@ function CalibrationPanel() {
           }
 
           if (progress.step === 'moving_to_room') {
-            setDebugLogs(prev => [...prev, `[${progress.currentRoom}/${progress.totalRooms}] Moving: ${progress.roomName}`]);
+            setDebugLogs(prev => [...prev, `[${progress.currentRoom}/${progress.totalRooms}] ${progress.roomName}`]);
           }
 
           if (progress.step === 'waiting_webhook') {
-            setDebugLogs(prev => [...prev, `  ... waiting for webhook`]);
+            setDebugLogs(prev => [...prev, `  Webhook...`]);
           }
 
-          if (progress.step === 'room_mapped' && progress.webhookConfirmed) {
-            setDebugLogs(prev => [...prev, `  OK: ${progress.mapping.roomName}`]);
+          if (progress.step === 'verifying') {
+            setDebugLogs(prev => [...prev, `  SDK verify...`]);
+          }
+
+          if (progress.step === 'verify_warning') {
+            setDebugLogs(prev => [...prev, `  SDK: not confirmed (webhook OK)`]);
+          }
+
+          if (progress.step === 'room_mapped') {
+            const tag = progress.verified ? 'VERIFIED' : 'OK (webhook only)';
+            setDebugLogs(prev => [...prev, `  ${tag}: ${progress.mapping.roomName}`]);
           }
 
           if (progress.step === 'room_error') {

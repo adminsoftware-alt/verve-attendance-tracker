@@ -1,7 +1,20 @@
 /**
  * Zoom Calibration Service
- * Pure position-based calibration: move bot to room N, wait for webhook, that's room N.
- * Frontend BLOCKS on each room until webhook confirmed before moving to next.
+ * Pure position-based calibration with SDK cross-validation.
+ *
+ * CRITICAL RULE: You CANNOT skip rooms in position-based matching.
+ * If room N fails → STOP. Continuing would make webhook N+1 = room N on backend.
+ *
+ * Flow per room:
+ *   1. Return bot to main room (required by Zoom before joining breakout)
+ *   2. Move bot to room[i]
+ *   3. Wait for webhook (BLOCKING)
+ *   4. Backend assigns webhook UUID to room[i] by position
+ *   5. Frontend verifies bot is ACTUALLY in room[i] via SDK
+ *   6. If mismatch → STOP (wrong mapping detected)
+ *   7. Only then move to room[i+1]
+ *
+ * NO SKIPPING. Failure at any room = calibration stops = abort all mappings.
  */
 
 import { waitForWebhookConfirmation } from './apiService';
@@ -13,9 +26,11 @@ const BOT_EMAIL = process.env.REACT_APP_BOT_EMAIL || '';
 // TIMING CONSTANTS
 // ============================================================================
 const DEFAULT_MOVE_DELAY_MS = 5000; // Wait for Scout Bot to click Join
-const WEBHOOK_TIMEOUT_MS = 60000; // 60 seconds max wait for webhook (blocking)
+const WEBHOOK_TIMEOUT_MS = 60000; // 60 seconds max wait for webhook (BLOCKING)
 const MAX_MOVE_RETRIES = 1; // Max retries for SDK move call
 const POST_WEBHOOK_DELAY_MS = 2000; // Delay after webhook before next room
+const VERIFY_POLL_INTERVAL_MS = 2000; // Poll interval for SDK location check
+const VERIFY_POLL_TIMEOUT_MS = 10000; // Max time to wait for SDK verification
 
 // DELAY OPTIONS (user selectable in UI)
 export const DELAY_OPTIONS = {
@@ -63,7 +78,6 @@ export function findScoutBot(participants, botName = BOT_NAME, botEmail = BOT_EM
   console.log('Looking for bot:', botName);
   console.log('Participant names:', participants.map(p => getParticipantName(p)));
 
-  // Strategy 1: Exact email match
   if (normalizedBotEmail) {
     const byEmail = participants.find(p => getParticipantEmail(p).toLowerCase() === normalizedBotEmail);
     if (byEmail) {
@@ -72,7 +86,6 @@ export function findScoutBot(participants, botName = BOT_NAME, botEmail = BOT_EM
     }
   }
 
-  // Strategy 2: Name match
   const byName = participants.find(p => isBotNameMatch(getParticipantName(p), botName));
   if (byName) {
     console.log('Found scout bot by name match');
@@ -113,17 +126,103 @@ async function moveWithRetry(moveParticipantToRoom, botUUID, roomUUID, roomName,
   return { success: false, error: lastError, attempts: maxRetries + 1 };
 }
 
+// =============================================================================
+// SDK CROSS-VALIDATION
+// =============================================================================
+
 /**
- * Run the calibration sequence - PURE POSITION-BASED
+ * Verify bot is in the expected room by querying SDK breakout room list.
+ */
+async function verifyBotInRoom(getBreakoutRooms, expectedRoomName, botName = BOT_NAME) {
+  try {
+    const rooms = await getBreakoutRooms();
+
+    for (const room of rooms) {
+      const roomName = room.breakoutRoomName || room.name || 'Unknown';
+      const participants = room.participants || room.members || room.attendees || [];
+
+      for (const participant of participants) {
+        const pName = getParticipantName(participant);
+        if (isBotNameMatch(pName, botName)) {
+          if (roomName === expectedRoomName) {
+            return { verified: true, actualRoom: roomName };
+          } else {
+            return { verified: false, actualRoom: roomName, mismatch: true };
+          }
+        }
+      }
+    }
+
+    return { verified: false, actualRoom: null, notFound: true };
+  } catch (err) {
+    console.error('[Verify] SDK query failed:', err);
+    return { verified: false, actualRoom: null, error: err.message };
+  }
+}
+
+/**
+ * Poll SDK until bot is found in expected room or timeout.
+ */
+async function verifyBotInRoomWithPolling(getBreakoutRooms, expectedRoomName, timeoutMs = VERIFY_POLL_TIMEOUT_MS) {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeoutMs) {
+    const result = await verifyBotInRoom(getBreakoutRooms, expectedRoomName);
+
+    if (result.verified) return result;
+    if (result.mismatch) return result;
+
+    console.log(`[Verify] Bot not found yet, retrying in ${VERIFY_POLL_INTERVAL_MS}ms...`);
+    await sleep(VERIFY_POLL_INTERVAL_MS);
+  }
+
+  return { verified: false, actualRoom: null, timeout: true };
+}
+
+/**
+ * Sort SDK rooms to match a preferred order.
  *
- * Flow for each room:
- * 1. Move bot to room[i]
- * 2. Wait for webhook (BLOCKING - do NOT move to next room until confirmed)
- * 3. Backend assigns webhook UUID to room[i] by position
- * 4. Only then move to room[i+1]
+ * Sorts by prefix number (e.g., "1.1" < "1.2" < "2.0" < "3.1").
+ * This gives us a deterministic order regardless of SDK's random ordering.
+ * The backend will use the SAME room list (sent at calibration start).
+ */
+function sortRoomsByPrefix(rooms) {
+  return [...rooms].sort((a, b) => {
+    const nameA = a.breakoutRoomName || a.name || '';
+    const nameB = b.breakoutRoomName || b.name || '';
+
+    // Extract prefix like "1.1", "2.0", "3.10"
+    const matchA = nameA.match(/^(\d+)\.(\d+)/);
+    const matchB = nameB.match(/^(\d+)\.(\d+)/);
+
+    if (matchA && matchB) {
+      const majorA = parseInt(matchA[1], 10);
+      const majorB = parseInt(matchB[1], 10);
+      if (majorA !== majorB) return majorA - majorB;
+      const minorA = parseInt(matchA[2], 10);
+      const minorB = parseInt(matchB[2], 10);
+      return minorA - minorB;
+    }
+
+    // Rooms with prefix come before rooms without
+    if (matchA && !matchB) return -1;
+    if (!matchA && matchB) return 1;
+
+    // Fallback: alphabetical
+    return nameA.localeCompare(nameB);
+  });
+}
+
+/**
+ * Run the calibration sequence.
  *
- * If ANY room fails webhook confirmation, calibration stops and reports failure.
- * Caller should call abortCalibration() to clean up partial mappings.
+ * SINGLE SOURCE OF TRUTH: SDK room list, sorted by prefix.
+ * - Frontend sorts SDK rooms → sends sorted list to backend at /calibration/start
+ * - Backend stores this as its calibration_sequence
+ * - Frontend iterates same sorted list
+ * - Webhook #N = room #N in this list (both sides agree)
+ *
+ * NO SKIPPING ALLOWED. Any failure = STOP = abort all mappings.
  */
 export async function runCalibration({
   getBreakoutRooms,
@@ -138,17 +237,26 @@ export async function runCalibration({
   const roomMapping = [];
   const errors = [];
 
-  // Step 1: Get all breakout rooms
+  // Step 1: Get all breakout rooms from SDK
   onProgress?.({ step: 'fetching_rooms', message: 'Fetching breakout rooms...' });
-  const rooms = await getBreakoutRooms();
+  const rawRooms = await getBreakoutRooms();
 
-  if (!rooms || rooms.length === 0) {
+  if (!rawRooms || rawRooms.length === 0) {
     throw new Error('No breakout rooms found. Make sure breakout rooms are created and open.');
   }
 
+  // Sort rooms by prefix for deterministic order
+  const rooms = sortRoomsByPrefix(rawRooms);
+
+  console.log('[Calibration] Sorted room order:');
+  rooms.forEach((r, i) => {
+    const name = r.breakoutRoomName || r.name || '';
+    console.log(`  ${i + 1}. ${name}`);
+  });
+
   onProgress?.({
     step: 'rooms_found',
-    message: `Found ${rooms.length} breakout rooms`,
+    message: `Found ${rooms.length} breakout rooms (sorted by prefix)`,
     totalRooms: rooms.length
   });
 
@@ -167,8 +275,6 @@ export async function runCalibration({
   const botUUID = scoutBot.participantUUID || scoutBot.uuid || scoutBot.participantId || scoutBot.id;
   const botName = scoutBot.name || scoutBot.participantName || scoutBot.screenName || scoutBot.displayName || scoutBot.userName;
 
-  console.log('Using botUUID:', botUUID);
-
   onProgress?.({
     step: 'bot_found',
     message: `Found scout bot: ${botName} (UUID: ${botUUID})`,
@@ -184,14 +290,16 @@ export async function runCalibration({
     console.warn('Could not return bot to main room (may already be there):', err.message);
   }
 
-  // Step 4: Sequential room calibration - BLOCKING on each webhook
+  // Step 4: Sequential room calibration - NO SKIPPING
+  const totalRooms = rooms.length;
   const startIndex = startFromRoom > 0 ? startFromRoom : 0;
+
   if (startIndex > 0) {
     onProgress?.({
       step: 'resuming',
-      message: `Resuming from room ${startIndex + 1}/${rooms.length}`,
+      message: `Resuming from room ${startIndex + 1}/${totalRooms}`,
       currentRoom: startIndex,
-      totalRooms: rooms.length
+      totalRooms
     });
   }
 
@@ -200,96 +308,129 @@ export async function runCalibration({
     const roomName = room.breakoutRoomName || room.name || `Room ${i + 1}`;
     const roomUUID = room.breakoutRoomId || room.breakoutRoomUUID || room.breakoutroomid || room.uuid || room.id;
 
-    // Notify UI: moving to room
+    // Return to main room before each move (except first - already done in Step 3)
+    if (i > startIndex) {
+      onProgress?.({
+        step: 'returning_to_main',
+        message: `[${i + 1}/${totalRooms}] Returning to main room...`,
+        currentRoom: i + 1,
+        totalRooms
+      });
+      try {
+        await moveToMainRoom(botUUID);
+        await sleep(2000);
+      } catch (err) {
+        console.warn(`Could not return to main before room ${i + 1}:`, err.message);
+      }
+    }
+
+    // --- PHASE 1: Move bot to room ---
     onProgress?.({
       step: 'moving_to_room',
-      message: `[${i + 1}/${rooms.length}] Moving to: ${roomName}`,
+      message: `[${i + 1}/${totalRooms}] Moving to: ${roomName}`,
       currentRoom: i + 1,
-      totalRooms: rooms.length,
+      totalRooms,
       roomName,
       roomUUID,
       botUUID
     });
 
-    // Move bot to room
     const moveResult = await moveWithRetry(moveParticipantToRoom, botUUID, roomUUID, roomName);
 
     if (!moveResult.success) {
-      console.error(`Move FAILED for ${roomName}:`, moveResult.error);
+      // STOP - can't skip in position-based matching
       errors.push({ roomName, roomUUID, error: `Move failed: ${moveResult.error?.message}` });
-
       onProgress?.({
         step: 'room_error',
-        message: `FAILED to move to ${roomName} - STOPPING calibration`,
-        currentRoom: i + 1,
-        totalRooms: rooms.length,
+        message: `FAILED to move to ${roomName} - STOPPING`,
+        currentRoom: i + 1, totalRooms, roomName,
         error: 'Move failed'
       });
-
-      // STOP calibration on move failure - don't continue with wrong sequence
       break;
     }
 
     // Wait for bot to click Join
     onProgress?.({
       step: 'waiting_join',
-      message: `[${i + 1}/${rooms.length}] Waiting for bot to join ${roomName}...`,
+      message: `[${i + 1}/${totalRooms}] Waiting for bot to join ${roomName}...`,
       currentRoom: i + 1,
-      totalRooms: rooms.length
+      totalRooms
     });
     await sleep(delayMs);
 
-    // BLOCKING WAIT: Wait for webhook confirmation
-    // This is the KEY part - do NOT move to next room until this webhook is confirmed
+    // --- PHASE 2: Wait for webhook (BLOCKING) ---
     onProgress?.({
       step: 'waiting_webhook',
-      message: `[${i + 1}/${rooms.length}] Waiting for webhook: ${roomName}...`,
+      message: `[${i + 1}/${totalRooms}] Waiting for webhook: ${roomName}...`,
       currentRoom: i + 1,
-      totalRooms: rooms.length
+      totalRooms
     });
 
     const webhookResult = await waitForWebhookConfirmation(roomName, WEBHOOK_TIMEOUT_MS, 1000);
 
-    if (webhookResult.confirmed) {
-      console.log(`Webhook CONFIRMED for ${roomName}`);
-
-      const mapping = {
-        roomUUID,
-        roomName,
-        roomIndex: i,
-        timestamp: new Date().toISOString(),
-        webhookConfirmed: true
-      };
-      roomMapping.push(mapping);
-      onRoomMapped?.(mapping);
-
-      onProgress?.({
-        step: 'room_mapped',
-        message: `[${i + 1}/${rooms.length}] CONFIRMED: ${roomName}`,
-        currentRoom: i + 1,
-        totalRooms: rooms.length,
-        mapping,
-        verified: true,
-        webhookConfirmed: true
-      });
-
-      // Brief delay before moving to next room
-      await sleep(POST_WEBHOOK_DELAY_MS);
-    } else {
-      console.error(`Webhook TIMEOUT for ${roomName} - STOPPING calibration`);
-      errors.push({ roomName, roomUUID, error: 'Webhook timeout' });
-
+    if (!webhookResult.confirmed) {
+      // STOP - can't skip in position-based matching
+      errors.push({ roomName, roomUUID, error: 'Webhook timeout - bot may not have joined' });
       onProgress?.({
         step: 'room_error',
         message: `TIMEOUT waiting for webhook: ${roomName} - STOPPING`,
-        currentRoom: i + 1,
-        totalRooms: rooms.length,
+        currentRoom: i + 1, totalRooms, roomName,
         error: 'Webhook timeout'
       });
-
-      // STOP calibration on webhook timeout - continuing would corrupt the sequence
       break;
     }
+
+    // --- PHASE 3: SDK CROSS-VALIDATION ---
+    onProgress?.({
+      step: 'verifying',
+      message: `[${i + 1}/${totalRooms}] Verifying: ${roomName}...`,
+      currentRoom: i + 1,
+      totalRooms
+    });
+
+    const verifyResult = await verifyBotInRoomWithPolling(getBreakoutRooms, roomName);
+
+    if (verifyResult.mismatch) {
+      // STOP - wrong mapping detected
+      errors.push({ roomName, roomUUID, error: `Mismatch: bot in "${verifyResult.actualRoom}"` });
+      onProgress?.({
+        step: 'room_error',
+        message: `MISMATCH: Bot in "${verifyResult.actualRoom}", not "${roomName}" - STOPPING`,
+        currentRoom: i + 1, totalRooms, roomName,
+        error: `Mismatch: bot in "${verifyResult.actualRoom}"`
+      });
+      break;
+    }
+
+    if (!verifyResult.verified) {
+      // Bot not found via SDK - webhook was received so likely OK, just log warning
+      console.warn(`[Verify] Bot not found in "${roomName}" via SDK - webhook OK, continuing`);
+    }
+
+    // --- PHASE 4: Record mapping ---
+    const mapping = {
+      roomUUID,
+      roomName,
+      roomIndex: i,
+      timestamp: new Date().toISOString(),
+      webhookConfirmed: true,
+      sdkVerified: verifyResult.verified
+    };
+    roomMapping.push(mapping);
+    onRoomMapped?.(mapping);
+
+    onProgress?.({
+      step: 'room_mapped',
+      message: `[${i + 1}/${totalRooms}] ${verifyResult.verified ? 'VERIFIED' : 'CONFIRMED'}: ${roomName}`,
+      currentRoom: i + 1,
+      totalRooms,
+      mapping,
+      verified: verifyResult.verified,
+      webhookConfirmed: true
+    });
+
+    // Brief delay before next room
+    await sleep(POST_WEBHOOK_DELAY_MS);
   }
 
   // Step 5: Return bot to main room
@@ -306,7 +447,7 @@ export async function runCalibration({
   onProgress?.({
     step: 'complete',
     message: hasErrors
-      ? `Calibration STOPPED at room ${roomMapping.length + 1}/${rooms.length}. ${errors[0]?.error}`
+      ? `Calibration STOPPED at room ${roomMapping.length + 1}/${totalRooms}. ${errors[0]?.error}`
       : `Calibration complete! All ${roomMapping.length} rooms mapped.`,
     totalMapped: roomMapping.length,
     errors: errors.length
@@ -315,7 +456,7 @@ export async function runCalibration({
   return {
     success: !hasErrors,
     roomMapping,
-    totalRooms: rooms.length,
+    totalRooms,
     mappedRooms: roomMapping.length,
     errors
   };

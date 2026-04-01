@@ -1,11 +1,11 @@
 import React from 'react';
-import CalibrationPanel from './components/CalibrationPanel';
+import MonitorPanel from './components/MonitorPanel';
 import './App.css';
 
 function App() {
   return (
     <div className="App">
-      <CalibrationPanel />
+      <MonitorPanel />
     </div>
   );
 }

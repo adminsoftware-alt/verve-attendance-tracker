@@ -2057,10 +2057,12 @@ def handle_breakout_room_join(data):
             return
 
         # =====================================================================
-        # PURE POSITION-BASED MATCHING
+        # PURE POSITION-BASED MATCHING WITH SAFETY CHECKS
         # The nth webhook from calibration participant = nth room in sequence
         # Frontend waits for each webhook before moving to next room,
         # so there is ZERO ambiguity - webhook N always = room N
+        #
+        # SAFETY: Reject duplicate room_uuids (same room can't be mapped twice)
         # =====================================================================
         room_name = None
         matched_index = -1
@@ -2070,6 +2072,16 @@ def handle_breakout_room_join(data):
             next_idx = meeting_state.calibration_next_index
 
             print(f"  -> POSITION-BASED MATCHING: sequence={len(sequence)} rooms, next_index={next_idx}")
+
+            # SAFETY CHECK: Reject duplicate room_uuid (stale/duplicate webhook)
+            already_seen = any(
+                entry.get('webhook_uuid') == room_uuid and entry.get('matched')
+                for entry in sequence
+            )
+            if already_seen:
+                print(f"  -> DUPLICATE REJECTED: room_uuid {room_uuid[:20]}... already mapped to another room")
+                print(f"  -> Calibration participant in breakout room, skipping event storage")
+                return
 
             if sequence and next_idx < len(sequence):
                 entry = sequence[next_idx]
@@ -2455,6 +2467,205 @@ def health_check():
     })
 
 
+# ==============================================================================
+# MONITOR MODE - SDK Polling (replaces calibration)
+# SDK getBreakoutRoomList() returns room names + participants directly.
+# No UUID mapping needed. React app polls every 30s and sends snapshots here.
+# ==============================================================================
+
+@app.route('/monitor/snapshot', methods=['POST'])
+def monitor_snapshot():
+    """
+    Receive a room snapshot from SDK polling.
+    Called every 30s by React app running on Scout Bot's Zoom client.
+    Stores who is in which room at this moment.
+    """
+    data = request.json or {}
+    meeting_id = data.get('meeting_id', '')
+    rooms = data.get('rooms', [])
+
+    if not meeting_id or not rooms:
+        return jsonify({'error': 'meeting_id and rooms required'}), 400
+
+    now = datetime.utcnow()
+    today = get_ist_date()
+    snapshot_time = now.isoformat()
+
+    rows = []
+    total_participants = 0
+
+    for room in rooms:
+        room_name = room.get('room_name', '')
+        if not room_name:
+            continue
+
+        participants = room.get('participants', [])
+        for p in participants:
+            p_name = p.get('name', '') or p.get('participant_name', '') or ''
+            p_email = p.get('email', '') or p.get('participant_email', '') or ''
+            p_uuid = p.get('uuid', '') or p.get('participant_uuid', '') or ''
+
+            # Skip Scout Bot itself
+            if 'scout' in p_name.lower() and 'bot' in p_name.lower():
+                continue
+
+            rows.append({
+                'snapshot_id': str(uuid_lib.uuid4()),
+                'snapshot_time': snapshot_time,
+                'event_date': today,
+                'meeting_id': str(meeting_id),
+                'room_name': room_name,
+                'participant_name': p_name,
+                'participant_email': p_email,
+                'participant_uuid': p_uuid
+            })
+            total_participants += 1
+
+    if rows:
+        try:
+            client = get_bq_client()
+            table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots"
+            errors = client.insert_rows_json(table_id, rows)
+            if errors:
+                print(f"[Monitor] BigQuery insert errors: {errors[:3]}")
+                return jsonify({'success': False, 'error': str(errors[:3])}), 500
+            print(f"[Monitor] Saved snapshot: {len(rooms)} rooms, {total_participants} participants")
+        except Exception as e:
+            print(f"[Monitor] BigQuery error: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    return jsonify({
+        'success': True,
+        'rooms': len(rooms),
+        'participants': total_participants,
+        'snapshot_time': snapshot_time
+    })
+
+
+@app.route('/monitor/status', methods=['GET'])
+def monitor_status():
+    """Check how many snapshots exist for today"""
+    today = get_ist_date()
+    try:
+        client = get_bq_client()
+        query = f"""
+        SELECT
+          COUNT(DISTINCT snapshot_time) as snapshot_count,
+          COUNT(DISTINCT room_name) as room_count,
+          COUNT(DISTINCT COALESCE(NULLIF(participant_email, ''), participant_name)) as participant_count,
+          MIN(snapshot_time) as first_snapshot,
+          MAX(snapshot_time) as last_snapshot
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+        WHERE event_date = '{today}'
+        """
+        result = list(client.query(query).result())
+        row = result[0] if result else {}
+        return jsonify({
+            'success': True,
+            'date': today,
+            'snapshots': row.get('snapshot_count', 0),
+            'rooms': row.get('room_count', 0),
+            'participants': row.get('participant_count', 0),
+            'first_snapshot': str(row.get('first_snapshot', '')),
+            'last_snapshot': str(row.get('last_snapshot', ''))
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/monitor/sample', methods=['GET'])
+def monitor_sample():
+    """Get sample snapshot data for debugging"""
+    today = get_ist_date()
+    try:
+        client = get_bq_client()
+        query = f"""
+        SELECT snapshot_time, room_name, participant_name, participant_email
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+        WHERE event_date = '{today}'
+        ORDER BY snapshot_time DESC
+        LIMIT 50
+        """
+        results = list(client.query(query).result())
+        return jsonify({
+            'success': True,
+            'date': today,
+            'count': len(results),
+            'data': [dict(r) for r in results]
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/monitor/health', methods=['GET'])
+def monitor_health():
+    """
+    End-to-end health check for the monitoring system.
+    Returns whether snapshots are being received and how fresh they are.
+    Call this from the VM to verify everything is working.
+
+    Status:
+      - HEALTHY: snapshots received within last 5 minutes
+      - STALE: snapshots exist today but last one is >5 minutes old
+      - NO_DATA: no snapshots today
+      - ERROR: BigQuery query failed
+    """
+    today = get_ist_date()
+    try:
+        client = get_bq_client()
+        query = f"""
+        SELECT
+          COUNT(DISTINCT snapshot_time) as snapshot_count,
+          COUNT(DISTINCT room_name) as room_count,
+          COUNT(DISTINCT COALESCE(NULLIF(participant_email, ''), participant_name)) as participant_count,
+          MIN(snapshot_time) as first_snapshot,
+          MAX(snapshot_time) as last_snapshot,
+          TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(snapshot_time), SECOND) as seconds_since_last
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+        WHERE event_date = '{today}'
+        """
+        result = list(client.query(query).result())
+        row = result[0] if result else {}
+
+        snapshot_count = row.get('snapshot_count', 0) or 0
+        seconds_since = row.get('seconds_since_last', None)
+
+        if snapshot_count == 0:
+            status = 'NO_DATA'
+            message = 'No snapshots received today. Is the Zoom App running?'
+        elif seconds_since is not None and seconds_since <= 300:
+            status = 'HEALTHY'
+            message = f'Receiving snapshots. Last one {seconds_since}s ago.'
+        else:
+            status = 'STALE'
+            mins_ago = int(seconds_since / 60) if seconds_since else '?'
+            message = f'Last snapshot was {mins_ago} minutes ago. Check if Zoom App is still open.'
+
+        # Check if we should send alert (during meeting hours IST: 9 AM - 8 PM)
+        ist_hour = (datetime.utcnow() + timedelta(hours=5, minutes=30)).hour
+        is_meeting_hours = 9 <= ist_hour <= 20
+        should_alert = status in ('STALE', 'NO_DATA') and is_meeting_hours
+
+        return jsonify({
+            'status': status,
+            'message': message,
+            'date': today,
+            'snapshots_today': snapshot_count,
+            'rooms_seen': row.get('room_count', 0) or 0,
+            'participants_seen': row.get('participant_count', 0) or 0,
+            'first_snapshot': str(row.get('first_snapshot', '')),
+            'last_snapshot': str(row.get('last_snapshot', '')),
+            'seconds_since_last': seconds_since,
+            'is_meeting_hours': is_meeting_hours,
+            'needs_attention': should_alert
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'ERROR',
+            'message': str(e)
+        }), 500
+
+
 # Rate limiter for signature error logging
 _sig_error_state = {'count': 0, 'last_log': 0}
 
@@ -2650,37 +2861,15 @@ def calibration_start():
     meeting_state.calibration_participant_name = calibration_participant_name
     meeting_state.calibration_participant_uuid = calibration_participant_uuid
 
-    # SEQUENCE-BASED MATCHING: Use FIXED_ROOM_SEQUENCE as authoritative source
-    # This is more reliable than frontend order since bot always visits in this exact sequence
+    # SINGLE SOURCE OF TRUTH: Use the room sequence sent by frontend.
+    # Frontend sorts SDK rooms by prefix (1.1, 1.2, ..., 2.0, 3.1, ...) and sends them here.
+    # Backend uses this EXACT list for position-based matching.
+    # NO hardcoded FIXED_ROOM_SEQUENCE - it can get out of sync with actual Zoom rooms.
     meeting_state.calibration_sequence = []
-    meeting_state.calibration_next_index = resume_from  # Start from resume point
+    meeting_state.calibration_next_index = resume_from
 
-    # PRIORITY 1: Use FIXED_ROOM_SEQUENCE (most reliable - hardcoded order)
-    if USE_FIXED_SEQUENCE and FIXED_ROOM_SEQUENCE:
-        print(f"[Calibration] Using FIXED_ROOM_SEQUENCE ({len(FIXED_ROOM_SEQUENCE)} rooms)")
-        for i, room_name in enumerate(FIXED_ROOM_SEQUENCE):
-            meeting_state.calibration_sequence.append({
-                'room_name': room_name,
-                'room_index': i,
-                'sdk_uuid': None,  # Will be filled from frontend if available
-                'webhook_uuid': None,  # Will be filled when webhook arrives
-                'matched': False
-            })
-
-        # Also store SDK UUIDs from frontend for cross-reference (secondary source)
-        for room in room_sequence:
-            room_name = room.get('room_name') or room.get('name') or room.get('breakoutRoomName')
-            room_uuid = room.get('room_uuid') or room.get('uuid') or room.get('breakoutRoomId')
-            if room_uuid and room_name:
-                # Find matching room in sequence and add SDK UUID
-                for seq_room in meeting_state.calibration_sequence:
-                    if seq_room['room_name'] == room_name:
-                        seq_room['sdk_uuid'] = room_uuid
-                        meeting_state.add_room_mapping(room_uuid, room_name)
-                        break
-    else:
-        # Fallback: Use frontend sequence (original behavior)
-        print(f"[Calibration] Using frontend room sequence ({len(room_sequence)} rooms)")
+    if room_sequence and len(room_sequence) > 0:
+        print(f"[Calibration] Using frontend SDK room sequence ({len(room_sequence)} rooms)")
         for idx, room in enumerate(room_sequence):
             room_name = room.get('room_name') or room.get('name') or room.get('breakoutRoomName')
             room_uuid = room.get('room_uuid') or room.get('uuid') or room.get('breakoutRoomId')
@@ -2694,6 +2883,17 @@ def calibration_start():
                 })
                 if room_uuid:
                     meeting_state.add_room_mapping(room_uuid, room_name)
+    elif USE_FIXED_SEQUENCE and FIXED_ROOM_SEQUENCE:
+        # Fallback ONLY if frontend sends no rooms (shouldn't happen)
+        print(f"[Calibration] WARNING: No frontend rooms, falling back to FIXED_ROOM_SEQUENCE ({len(FIXED_ROOM_SEQUENCE)} rooms)")
+        for i, room_name in enumerate(FIXED_ROOM_SEQUENCE):
+            meeting_state.calibration_sequence.append({
+                'room_name': room_name,
+                'room_index': i,
+                'sdk_uuid': None,
+                'webhook_uuid': None,
+                'matched': False
+            })
 
     # SAVE CALIBRATION STATE TO BIGQUERY (persistence)
     state_data = {
@@ -3667,11 +3867,28 @@ def calibration_live_rooms():
 
         results = list(client.query(query, job_config=job_config).result())
 
+        # First get mapping status to fix room names
+        mapping_query = f"""
+        SELECT DISTINCT room_uuid, room_name, source
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+        WHERE mapping_date = @today AND meeting_id = @meeting_id
+        """
+        mapping_results = list(client.query(mapping_query, job_config=job_config).result())
+        mapped_uuids = {r.room_uuid: {'name': r.room_name, 'source': r.source} for r in mapping_results}
+
         rooms = []
         for row in results:
+            room_uuid = row.room_uuid
+            # Use mapped room name if available, otherwise fall back to stored name
+            if room_uuid in mapped_uuids:
+                room_name = mapped_uuids[room_uuid]['name']
+            else:
+                # Also check in-memory mappings
+                room_name = meeting_state.get_room_name(room_uuid) or row.room_name
+
             rooms.append({
-                'room_uuid': row.room_uuid,
-                'room_name': row.room_name,
+                'room_uuid': room_uuid,
+                'room_name': room_name,
                 'participants': [
                     {
                         'name': p['participant_name'],
@@ -3682,15 +3899,6 @@ def calibration_live_rooms():
                 ],
                 'participant_count': len(row.participants)
             })
-
-        # Also get mapping status for each room
-        mapping_query = f"""
-        SELECT DISTINCT room_uuid, room_name, source
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
-        WHERE mapping_date = @today AND meeting_id = @meeting_id
-        """
-        mapping_results = list(client.query(mapping_query, job_config=job_config).result())
-        mapped_uuids = {r.room_uuid: {'name': r.room_name, 'source': r.source} for r in mapping_results}
 
         return jsonify({
             'success': True,
@@ -4084,6 +4292,157 @@ def preview_report(date):
         report = generate_daily_report(date)
         return jsonify(report)
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/report/live/<date>', methods=['GET'])
+def live_attendance_report(date):
+    """
+    Generate live attendance report for ONGOING meetings.
+    Shows participants with join times even if they haven't left yet.
+    Use this when meeting is still in progress.
+
+    GET /report/live/2026-03-31
+    """
+    import re
+    from report_generator import FIXED_ROOM_SEQUENCE
+
+    # Validate date format
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+        return jsonify({'error': f'Invalid date format: {date}. Expected YYYY-MM-DD'}), 400
+
+    try:
+        client = get_bq_client()
+
+        # Query to get all participant join events for today with room history
+        query = f"""
+        WITH
+        -- Room name mappings
+        room_name_map AS (
+          SELECT room_uuid, room_name,
+            ROW_NUMBER() OVER (
+              PARTITION BY room_uuid
+              ORDER BY
+                CASE WHEN source = 'sequential_calibration' THEN 0
+                     WHEN source = 'webhook_calibration' THEN 1
+                     ELSE 2 END,
+                mapped_at DESC
+            ) as rn
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+          WHERE mapping_date = @target_date
+        ),
+        -- All events for today
+        all_events AS (
+          SELECT
+            participant_id,
+            participant_name,
+            participant_email,
+            event_type,
+            event_timestamp,
+            room_uuid,
+            room_name as event_room_name,
+            SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', event_timestamp) as event_ts
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}`
+          WHERE event_date = @target_date
+            AND participant_name NOT LIKE '%Scout%'
+        ),
+        -- First main room join per participant
+        first_joins AS (
+          SELECT
+            participant_email,
+            MIN(CASE WHEN event_type = 'participant_joined' THEN event_ts END) as first_join_ts
+          FROM all_events
+          GROUP BY participant_email
+        ),
+        -- Current room per participant (latest breakout_room_joined)
+        current_rooms AS (
+          SELECT
+            e.participant_email,
+            e.room_uuid,
+            COALESCE(
+              CASE WHEN e.event_room_name IS NOT NULL
+                   AND e.event_room_name != ''
+                   AND NOT STARTS_WITH(e.event_room_name, 'Room-')
+                   THEN e.event_room_name END,
+              rm.room_name,
+              e.event_room_name
+            ) as current_room,
+            e.event_ts as room_joined_ts
+          FROM (
+            SELECT *, ROW_NUMBER() OVER (
+              PARTITION BY participant_email
+              ORDER BY event_ts DESC
+            ) as rn
+            FROM all_events
+            WHERE event_type = 'breakout_room_joined'
+          ) e
+          LEFT JOIN room_name_map rm ON e.room_uuid = rm.room_uuid AND rm.rn = 1
+          WHERE e.rn = 1
+        ),
+        -- Participant names (pick most common)
+        participant_names AS (
+          SELECT
+            participant_email,
+            ARRAY_AGG(participant_name ORDER BY cnt DESC LIMIT 1)[OFFSET(0)] as participant_name
+          FROM (
+            SELECT participant_email, participant_name, COUNT(*) as cnt
+            FROM all_events
+            WHERE participant_email IS NOT NULL AND participant_email != ''
+            GROUP BY participant_email, participant_name
+          )
+          GROUP BY participant_email
+        )
+        SELECT
+          pn.participant_name as Name,
+          pn.participant_email as Email,
+          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(fj.first_join_ts, INTERVAL 330 MINUTE)) as Joined_IST,
+          COALESCE(cr.current_room, 'Main Room') as Current_Room,
+          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(cr.room_joined_ts, INTERVAL 330 MINUTE)) as Room_Joined_IST
+        FROM participant_names pn
+        LEFT JOIN first_joins fj ON pn.participant_email = fj.participant_email
+        LEFT JOIN current_rooms cr ON pn.participant_email = cr.participant_email
+        WHERE pn.participant_email IS NOT NULL AND pn.participant_email != ''
+        ORDER BY pn.participant_name
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("target_date", "STRING", date)
+            ]
+        )
+
+        results = list(client.query(query, job_config=job_config).result())
+
+        # Build CSV content
+        import io
+        import csv
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['Name', 'Email', 'Joined_IST', 'Current_Room', 'Room_Joined_IST'])
+
+        participants = []
+        for row in results:
+            participants.append(dict(row.items()))
+            writer.writerow([
+                row.get('Name', '') or '',
+                row.get('Email', '') or '',
+                row.get('Joined_IST', '') or '',
+                row.get('Current_Room', '') or 'Main Room',
+                row.get('Room_Joined_IST', '') or ''
+            ])
+
+        return jsonify({
+            'report_date': date,
+            'report_type': 'live_attendance',
+            'generated_at': datetime.utcnow().isoformat(),
+            'total_participants': len(participants),
+            'participants': participants,
+            'csv_content': output.getvalue()
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 

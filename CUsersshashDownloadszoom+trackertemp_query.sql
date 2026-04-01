@@ -1,0 +1,1 @@
+SELECT participant_name, event_type, room_name, event_timestamp FROM variant-finance-data-project.breakout_room_calibrator.participant_events WHERE participant_email = shashank.channawar@verveadvisory.com ORDER BY event_timestamp DESC LIMIT 10
