@@ -6296,7 +6296,7 @@ def list_known_participants():
         query = f"""
         SELECT DISTINCT participant_name, participant_email
         FROM `{dataset_ref}.room_snapshots`
-        WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+        WHERE SAFE.PARSE_DATE('%Y-%m-%d', event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
           AND LOWER(participant_name) NOT LIKE '%scout%'
           AND participant_name IS NOT NULL AND participant_name != ''
         ORDER BY participant_name
