@@ -5877,27 +5877,48 @@ def attendance_summary(date=None):
             END as main_room_after_mins
           FROM all_participants ap
         ),
-        -- Build main room visit records
+        -- Detect gaps between consecutive breakout visits (= time in main room)
+        breakout_with_next AS (
+          SELECT
+            participant_key,
+            leave_time as this_leave,
+            LEAD(join_time) OVER (PARTITION BY participant_key ORDER BY join_time) as next_join
+          FROM breakout_visits_final
+        ),
+        -- Main room visits: before first breakout, between breakout rooms, after last breakout
         main_room_visits AS (
+          -- Before first breakout room
           SELECT
             participant_key,
             '0.Main Room' as room_name,
             main_joined as join_time,
             COALESCE(first_breakout, main_left) as leave_time,
-            main_room_before_mins as duration_mins,
-            0 as visit_order
+            main_room_before_mins as duration_mins
           FROM main_room_time
           WHERE main_room_before_mins > 0 AND main_joined IS NOT NULL
 
           UNION ALL
 
+          -- Between breakout rooms (gaps = returns to main room)
+          SELECT
+            bwn.participant_key,
+            '0.Main Room' as room_name,
+            bwn.this_leave as join_time,
+            bwn.next_join as leave_time,
+            TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) as duration_mins
+          FROM breakout_with_next bwn
+          WHERE bwn.next_join IS NOT NULL
+            AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) > 0
+
+          UNION ALL
+
+          -- After last breakout room
           SELECT
             participant_key,
             '0.Main Room' as room_name,
             last_breakout as join_time,
             main_left as leave_time,
-            main_room_after_mins as duration_mins,
-            999 as visit_order
+            main_room_after_mins as duration_mins
           FROM main_room_time
           WHERE main_room_after_mins > 0 AND last_breakout IS NOT NULL AND main_left IS NOT NULL
         ),
@@ -6345,12 +6366,28 @@ def add_team_member(team_id):
             return jsonify({'success': False, 'error': 'participant_name is required'}), 400
 
         participant_email = (data.get('participant_email') or '').strip()
-        member_id = str(uuid_lib.uuid4())
 
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
         table_ref = f"{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}"
 
+        # Check for duplicate member (case-insensitive name match)
+        dup_check_query = f"""
+            SELECT member_id FROM `{table_ref}`
+            WHERE team_id = @team_id AND LOWER(TRIM(participant_name)) = LOWER(@name)
+            LIMIT 1
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("name", "STRING", participant_name)
+            ]
+        )
+        dup_result = list(client.query(dup_check_query, job_config=job_config).result())
+        if dup_result:
+            return jsonify({'success': False, 'error': f"'{participant_name}' is already a member of this team"}), 409
+
+        member_id = str(uuid_lib.uuid4())
         rows = [{'member_id': member_id, 'team_id': team_id,
                  'participant_name': participant_name,
                  'participant_email': participant_email,
@@ -6395,15 +6432,21 @@ def remove_team_member(team_id, member_id):
 
 @app.route('/teams/participants', methods=['GET'])
 def list_known_participants():
-    """Get distinct participants from recent snapshots (for adding to teams)"""
+    """Get distinct participants from recent snapshots (for adding to teams)
+    Query params:
+        days: lookback period in days (default 90, max 365)
+    """
     try:
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
+        # Allow custom lookback period (default 90 days, max 365)
+        days = min(int(request.args.get('days', 90)), 365)
+
         query = f"""
         SELECT DISTINCT participant_name, participant_email
         FROM `{dataset_ref}.room_snapshots`
-        WHERE SAFE.PARSE_DATE('%Y-%m-%d', event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+        WHERE SAFE.PARSE_DATE('%Y-%m-%d', event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
           AND LOWER(participant_name) NOT LIKE '%scout%'
           AND participant_name IS NOT NULL AND participant_name != ''
         ORDER BY participant_name
@@ -6593,6 +6636,7 @@ def team_attendance(team_id, date):
         present_names = {r.participant_name.lower().strip() for r in rows}
 
         # Also get webhook-only participants (those in main meeting but never in breakout rooms)
+        # This query also calculates break_mins from gaps between leave→rejoin
         webhook_only_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
@@ -6600,29 +6644,65 @@ def team_attendance(team_id, date):
             ]
         )
         webhook_only_q = f"""
-        SELECT
-            pe.participant_name,
-            tm.participant_email,
-            FORMAT_TIMESTAMP('%H:%M',
-                MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
-                    THEN TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END)) as joined_ist,
-            FORMAT_TIMESTAMP('%H:%M',
-                MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
-                    THEN TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END)) as left_ist,
-            TIMESTAMP_DIFF(
-                MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
-                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
-                MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
-                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
-                MINUTE) as duration_mins
-        FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-        INNER JOIN `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
-            ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
-            AND tm.team_id = @team_id
-        WHERE pe.event_date = @report_date
-          AND pe.participant_name IS NOT NULL
-          AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-        GROUP BY pe.participant_name, tm.participant_email
+        WITH participant_events AS (
+            SELECT
+                pe.participant_name,
+                tm.participant_email,
+                pe.event_type,
+                CAST(pe.event_timestamp AS TIMESTAMP) as event_ts,
+                ROW_NUMBER() OVER (PARTITION BY pe.participant_name ORDER BY pe.event_timestamp) as rn
+            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+            INNER JOIN `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
+                ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+                AND tm.team_id = @team_id
+            WHERE pe.event_date = @report_date
+              AND pe.participant_name IS NOT NULL
+              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+              AND pe.event_type IN ('participant_joined', 'meeting.participant_joined',
+                                    'participant_left', 'meeting.participant_left')
+        ),
+        with_next AS (
+            SELECT *,
+                LEAD(event_ts) OVER (PARTITION BY participant_name ORDER BY rn) as next_event_ts,
+                LEAD(event_type) OVER (PARTITION BY participant_name ORDER BY rn) as next_event_type
+            FROM participant_events
+        ),
+        breaks AS (
+            SELECT participant_name,
+                   TIMESTAMP_DIFF(next_event_ts, event_ts, MINUTE) as gap_mins
+            FROM with_next
+            WHERE event_type IN ('participant_left', 'meeting.participant_left')
+              AND next_event_type IN ('participant_joined', 'meeting.participant_joined')
+        ),
+        break_totals AS (
+            SELECT participant_name, SUM(gap_mins) as break_mins
+            FROM breaks
+            GROUP BY participant_name
+        ),
+        summary AS (
+            SELECT
+                pe.participant_name,
+                pe.participant_email,
+                FORMAT_TIMESTAMP('%H:%M',
+                    MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
+                        THEN TIMESTAMP_ADD(pe.event_ts, INTERVAL 330 MINUTE) END)) as joined_ist,
+                FORMAT_TIMESTAMP('%H:%M',
+                    MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
+                        THEN TIMESTAMP_ADD(pe.event_ts, INTERVAL 330 MINUTE) END)) as left_ist,
+                TIMESTAMP_DIFF(
+                    MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
+                        THEN pe.event_ts END),
+                    MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
+                        THEN pe.event_ts END),
+                    MINUTE) as total_span_mins
+            FROM participant_events pe
+            GROUP BY pe.participant_name, pe.participant_email
+        )
+        SELECT s.participant_name, s.participant_email, s.joined_ist, s.left_ist,
+               COALESCE(s.total_span_mins, 0) - COALESCE(b.break_mins, 0) as duration_mins,
+               COALESCE(b.break_mins, 0) as break_mins
+        FROM summary s
+        LEFT JOIN break_totals b ON s.participant_name = b.participant_name
         """
         webhook_rows = {r.participant_name.lower().strip(): r
                         for r in client.query(webhook_only_q, job_config=webhook_only_config).result()}
@@ -6666,6 +6746,7 @@ def team_attendance(team_id, date):
             if name_lower not in snapshot_names and name_lower in webhook_rows:
                 wr = webhook_rows[name_lower]
                 dur = wr.duration_mins or 0
+                wb_break = getattr(wr, 'break_mins', 0) or 0  # Break time from leave→rejoin gaps
                 if dur >= 300:
                     status = 'present'
                 elif dur >= 240:
@@ -6680,7 +6761,7 @@ def team_attendance(team_id, date):
                     'total_duration_mins': dur,
                     'breakout_mins': 0,
                     'main_room_mins': dur,
-                    'break_minutes': 0,
+                    'break_minutes': wb_break,
                     'isolation_minutes': 0,
                     'status': status
                 })
@@ -6813,6 +6894,25 @@ def team_attendance_range(team_id):
               AND ro.occupant_count = 1
               AND s.room_name IS NOT NULL AND s.room_name != ''
             GROUP BY s.event_date, s.participant_name
+        ),
+        -- Main meeting time from webhooks
+        daily_webhook AS (
+            SELECT
+                pe.event_date,
+                pe.participant_name,
+                TIMESTAMP_DIFF(
+                    MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
+                        THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
+                    MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
+                        THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
+                    MINUTE) as meeting_duration_mins
+            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+            WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
+              AND pe.participant_name IS NOT NULL
+              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+            GROUP BY pe.event_date, pe.participant_name
         )
         SELECT
             ds.event_date,
@@ -6823,11 +6923,14 @@ def team_attendance_range(team_id):
             ds.active_mins,
             COALESCE(ROUND(db.break_seconds / 60), 0) as break_mins,
             COALESCE(db.break_count, 0) as break_count,
-            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins
+            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
+            COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
+            GREATEST(COALESCE(dw.meeting_duration_mins, 0) - ds.active_mins, 0) as main_room_mins
         FROM daily_stats ds
         LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_name = db.participant_name
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_name = di.participant_name
+        LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(dw.participant_name))
         ORDER BY ds.event_date, ds.participant_name
         """
 
@@ -6857,13 +6960,15 @@ def team_attendance_range(team_id):
         ).result())
         all_member_names = [m.participant_name for m in all_members]
 
-        # Build daily_data with hour-based status
+        # Build daily_data with hour-based status (use meeting duration if available)
         daily_data = []
         for r in rows:
-            active = r.active_mins
-            if active >= 300:
+            meeting_dur = r.meeting_duration_mins if hasattr(r, 'meeting_duration_mins') and r.meeting_duration_mins else 0
+            total_mins = max(r.active_mins, meeting_dur) if meeting_dur > 0 else r.active_mins
+            main_room = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
+            if total_mins >= 300:
                 status = 'Present'
-            elif active >= 240:
+            elif total_mins >= 240:
                 status = 'Half Day'
             else:
                 status = 'Absent'
@@ -6873,7 +6978,9 @@ def team_attendance_range(team_id):
                 'email': r.participant_email or '',
                 'first_seen_ist': r.first_seen_ist,
                 'last_seen_ist': r.last_seen_ist,
-                'active_minutes': active,
+                'active_minutes': total_mins,
+                'breakout_minutes': r.active_mins,
+                'main_room_minutes': int(main_room),
                 'break_minutes': int(r.break_mins),
                 'isolation_minutes': int(r.isolation_mins),
                 'status': status
@@ -7150,6 +7257,25 @@ def team_monthly_report(team_id):
               AND ro.occupant_count = 1
               AND s.room_name IS NOT NULL AND s.room_name != ''
             GROUP BY s.event_date, s.participant_name
+        ),
+        -- Main meeting time from webhooks
+        daily_webhook AS (
+            SELECT
+                pe.event_date,
+                pe.participant_name,
+                TIMESTAMP_DIFF(
+                    MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
+                        THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
+                    MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
+                        THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
+                    MINUTE) as meeting_duration_mins
+            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+            WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
+              AND pe.participant_name IS NOT NULL
+              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+            GROUP BY pe.event_date, pe.participant_name
         )
 
         SELECT
@@ -7160,11 +7286,14 @@ def team_monthly_report(team_id):
             FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
             ds.active_mins,
             COALESCE(ROUND(db.break_seconds / 60), 0) as break_mins,
-            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins
+            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
+            COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
+            GREATEST(COALESCE(dw.meeting_duration_mins, 0) - ds.active_mins, 0) as main_room_mins
         FROM daily_stats ds
         LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_name = db.participant_name
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_name = di.participant_name
+        LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(dw.participant_name))
         ORDER BY ds.participant_name, ds.event_date
         """
 
@@ -7184,13 +7313,15 @@ def team_monthly_report(team_id):
             output = io.StringIO()
             writer = csv.writer(output)
             writer.writerow(['Date', 'Name', 'Email', 'Status', 'First_Seen_IST', 'Last_Seen_IST',
-                             'Active_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
+                             'Total_Minutes', 'Breakout_Minutes', 'Main_Room_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
             for r in rows:
-                active = r.active_mins or 0
-                status = 'Present' if active >= 300 else 'Half Day' if active >= 240 else 'Absent'
+                meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
+                total = max(r.active_mins or 0, meeting_dur) if meeting_dur > 0 else (r.active_mins or 0)
+                main_room = r.main_room_mins if r.main_room_mins else 0
+                status = 'Present' if total >= 300 else 'Half Day' if total >= 240 else 'Absent'
                 writer.writerow([r.event_date, r.participant_name, r.participant_email or '',
-                                 status, r.first_seen_ist, r.last_seen_ist, active,
-                                 r.break_mins, r.isolation_mins])
+                                 status, r.first_seen_ist, r.last_seen_ist, total,
+                                 r.active_mins or 0, int(main_room), r.break_mins, r.isolation_mins])
 
             csv_content = output.getvalue()
             filename = f"team_{team_name.replace(' ', '_')}_{year}_{month:02d}.csv"
@@ -7203,8 +7334,10 @@ def team_monthly_report(team_id):
         # JSON response for dashboard display
         data = []
         for r in rows:
-            active = r.active_mins or 0
-            status = 'Present' if active >= 300 else 'Half Day' if active >= 240 else 'Absent'
+            meeting_dur = r.meeting_duration_mins if hasattr(r, 'meeting_duration_mins') and r.meeting_duration_mins else 0
+            total_mins = max(r.active_mins or 0, meeting_dur) if meeting_dur > 0 else (r.active_mins or 0)
+            main_room = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
+            status = 'Present' if total_mins >= 300 else 'Half Day' if total_mins >= 240 else 'Absent'
             data.append({
                 'date': str(r.event_date),
                 'name': r.participant_name,
@@ -7212,7 +7345,9 @@ def team_monthly_report(team_id):
                 'status': status,
                 'first_seen_ist': r.first_seen_ist,
                 'last_seen_ist': r.last_seen_ist,
-                'active_minutes': active,
+                'active_minutes': total_mins,
+                'breakout_minutes': r.active_mins or 0,
+                'main_room_minutes': int(main_room),
                 'break_minutes': int(r.break_mins),
                 'isolation_minutes': int(r.isolation_mins)
             })
@@ -7290,6 +7425,491 @@ def team_monthly_report(team_id):
     except Exception as e:
         print(f"[Teams] Monthly report error: {e}")
         traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# HISTORICAL TRENDS - Month-over-month analysis
+# ==============================================================================
+
+@app.route('/teams/<team_id>/trends', methods=['GET'])
+def team_historical_trends(team_id):
+    """Get historical trends for a team - monthly aggregated data
+    Query params:
+        months: number of months to look back (default 6, max 12)
+    """
+    try:
+        ensure_team_tables_once()
+        months = min(int(request.args.get('months', 6)), 12)
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Get team info
+        team_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )
+        team_rows = list(client.query(
+            f"SELECT team_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id",
+            job_config=team_config
+        ).result())
+        if not team_rows:
+            return jsonify({'success': False, 'error': 'Team not found'}), 404
+        team_name = team_rows[0].team_name
+
+        # Monthly trends query
+        query = f"""
+        WITH team_members AS (
+            SELECT participant_name FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
+        ),
+        monthly_data AS (
+            SELECT
+                FORMAT_DATE('%Y-%m', SAFE.PARSE_DATE('%Y-%m-%d', s.event_date)) as month,
+                s.participant_name,
+                COUNT(DISTINCT s.event_date) as days_present,
+                SUM(30) / 60.0 as total_hours  -- Each snapshot = 30s
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_members tm ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+            WHERE SAFE.PARSE_DATE('%Y-%m-%d', s.event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL @months MONTH)
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+            GROUP BY month, s.participant_name
+        )
+        SELECT
+            month,
+            COUNT(DISTINCT participant_name) as unique_members,
+            SUM(days_present) as total_member_days,
+            ROUND(AVG(days_present), 1) as avg_days_per_member,
+            ROUND(SUM(total_hours), 1) as total_hours,
+            ROUND(AVG(total_hours), 1) as avg_hours_per_member
+        FROM monthly_data
+        GROUP BY month
+        ORDER BY month
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("months", "INT64", months)
+            ]
+        )
+        rows = list(client.query(query, job_config=job_config).result())
+
+        trends = []
+        for r in rows:
+            trends.append({
+                'month': r.month,
+                'unique_members': r.unique_members,
+                'total_member_days': r.total_member_days,
+                'avg_days_per_member': float(r.avg_days_per_member) if r.avg_days_per_member else 0,
+                'total_hours': float(r.total_hours) if r.total_hours else 0,
+                'avg_hours_per_member': float(r.avg_hours_per_member) if r.avg_hours_per_member else 0
+            })
+
+        return jsonify({
+            'success': True,
+            'team_id': team_id,
+            'team_name': team_name,
+            'months_lookback': months,
+            'trends': trends
+        })
+    except Exception as e:
+        print(f"[Teams] Trends error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# LEAVE MANAGEMENT - Track excused vs unexcused absences
+# ==============================================================================
+
+# Table: team_leave_records (team_id, member_name, leave_date, leave_type, reason, approved_by, created_at)
+BQ_LEAVE_TABLE = 'team_leave_records'
+
+def ensure_leave_table():
+    """Create leave records table if it doesn't exist"""
+    client = get_bq_client()
+    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_LEAVE_TABLE}"
+    schema = [
+        bigquery.SchemaField("leave_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("team_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("member_name", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("leave_date", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("leave_type", "STRING", mode="REQUIRED"),  # 'planned', 'sick', 'emergency', 'unexcused'
+        bigquery.SchemaField("reason", "STRING"),
+        bigquery.SchemaField("approved_by", "STRING"),
+        bigquery.SchemaField("created_at", "TIMESTAMP")
+    ]
+    table = bigquery.Table(table_id, schema=schema)
+    try:
+        client.get_table(table_id)
+    except:
+        client.create_table(table)
+        print(f"[Leave] Created table {table_id}")
+
+
+@app.route('/teams/<team_id>/leave', methods=['GET'])
+def get_team_leave(team_id):
+    """Get leave records for a team
+    Query params:
+        start_date: YYYY-MM-DD (default: start of month)
+        end_date: YYYY-MM-DD (default: today)
+    """
+    try:
+        ensure_leave_table()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        now = get_ist_now()
+        start_date = request.args.get('start_date', f"{now.year}-{now.month:02d}-01")
+        end_date = request.args.get('end_date', now.strftime('%Y-%m-%d'))
+
+        query = f"""
+        SELECT leave_id, member_name, leave_date, leave_type, reason, approved_by, created_at
+        FROM `{dataset_ref}.{BQ_LEAVE_TABLE}`
+        WHERE team_id = @team_id AND leave_date >= @start_date AND leave_date <= @end_date
+        ORDER BY leave_date, member_name
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
+                bigquery.ScalarQueryParameter("end_date", "STRING", end_date)
+            ]
+        )
+        rows = list(client.query(query, job_config=job_config).result())
+        records = [{
+            'leave_id': r.leave_id,
+            'member_name': r.member_name,
+            'leave_date': r.leave_date,
+            'leave_type': r.leave_type,
+            'reason': r.reason or '',
+            'approved_by': r.approved_by or '',
+            'created_at': r.created_at.isoformat() if r.created_at else None
+        } for r in rows]
+
+        return jsonify({'success': True, 'records': records})
+    except Exception as e:
+        print(f"[Leave] Get error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/leave', methods=['POST'])
+def add_team_leave(team_id):
+    """Add a leave record for a team member
+    Body: {member_name, leave_date, leave_type, reason?, approved_by?}
+    """
+    try:
+        ensure_leave_table()
+        data = request.json or {}
+        member_name = (data.get('member_name') or '').strip()
+        leave_date = (data.get('leave_date') or '').strip()
+        leave_type = (data.get('leave_type') or 'planned').strip().lower()
+        reason = (data.get('reason') or '').strip()
+        approved_by = (data.get('approved_by') or '').strip()
+
+        if not member_name or not leave_date:
+            return jsonify({'success': False, 'error': 'member_name and leave_date required'}), 400
+
+        valid_types = ['planned', 'sick', 'emergency', 'unexcused', 'holiday', 'wfh']
+        if leave_type not in valid_types:
+            return jsonify({'success': False, 'error': f'leave_type must be one of: {valid_types}'}), 400
+
+        client = get_bq_client()
+        table_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_LEAVE_TABLE}"
+
+        # Check for existing leave on same date
+        dup_query = f"""
+        SELECT leave_id FROM `{table_ref}`
+        WHERE team_id = @team_id AND LOWER(TRIM(member_name)) = LOWER(@name) AND leave_date = @date
+        LIMIT 1
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("name", "STRING", member_name),
+                bigquery.ScalarQueryParameter("date", "STRING", leave_date)
+            ]
+        )
+        existing = list(client.query(dup_query, job_config=job_config).result())
+        if existing:
+            return jsonify({'success': False, 'error': 'Leave record already exists for this date'}), 409
+
+        leave_id = str(uuid_lib.uuid4())
+        rows = [{
+            'leave_id': leave_id,
+            'team_id': team_id,
+            'member_name': member_name,
+            'leave_date': leave_date,
+            'leave_type': leave_type,
+            'reason': reason,
+            'approved_by': approved_by,
+            'created_at': datetime.utcnow().isoformat()
+        }]
+        errors = client.insert_rows_json(table_ref, rows)
+        if errors:
+            return jsonify({'success': False, 'error': str(errors)}), 500
+
+        print(f"[Leave] Added {leave_type} leave for {member_name} on {leave_date}")
+        return jsonify({'success': True, 'leave_id': leave_id})
+    except Exception as e:
+        print(f"[Leave] Add error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/leave/<leave_id>', methods=['DELETE'])
+def delete_team_leave(team_id, leave_id):
+    """Delete a leave record"""
+    try:
+        ensure_leave_table()
+        client = get_bq_client()
+        table_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_LEAVE_TABLE}"
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("leave_id", "STRING", leave_id)
+            ]
+        )
+        client.query(f"DELETE FROM `{table_ref}` WHERE team_id = @team_id AND leave_id = @leave_id",
+                     job_config=job_config).result()
+
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Leave] Delete error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/attendance-with-leave/<date>', methods=['GET'])
+def team_attendance_with_leave(team_id, date):
+    """Get team attendance with leave status integrated
+    Enhances the regular attendance with leave info for absent members
+    """
+    try:
+        # Get regular attendance
+        ensure_team_tables_once()
+        ensure_leave_table()
+
+        # First get regular attendance data
+        from flask import g
+        g.skip_leave_check = True  # Flag to prevent recursion
+
+        # Call the existing attendance endpoint internally
+        report_date = validate_date_format(date)
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Get leave records for this date
+        leave_query = f"""
+        SELECT member_name, leave_type, reason
+        FROM `{dataset_ref}.{BQ_LEAVE_TABLE}`
+        WHERE team_id = @team_id AND leave_date = @date
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("date", "STRING", report_date)
+            ]
+        )
+        leave_rows = {r.member_name.lower().strip(): {'type': r.leave_type, 'reason': r.reason}
+                      for r in client.query(leave_query, job_config=job_config).result()}
+
+        # Get the regular attendance response
+        with app.test_request_context(f'/teams/{team_id}/attendance/{date}'):
+            response = team_attendance(team_id, date)
+            if isinstance(response, tuple):
+                data = response[0].get_json()
+            else:
+                data = response.get_json()
+
+        if not data.get('success'):
+            return jsonify(data)
+
+        # Enhance participants with leave info
+        for p in data.get('participants', []):
+            name_key = p['name'].lower().strip()
+            if name_key in leave_rows:
+                p['leave_type'] = leave_rows[name_key]['type']
+                p['leave_reason'] = leave_rows[name_key]['reason']
+                # Update status based on leave type
+                if p['status'] == 'absent':
+                    if leave_rows[name_key]['type'] in ['planned', 'sick', 'emergency', 'holiday']:
+                        p['status'] = 'excused'
+                    elif leave_rows[name_key]['type'] == 'wfh':
+                        p['status'] = 'wfh'
+            else:
+                p['leave_type'] = None
+                p['leave_reason'] = None
+
+        return jsonify(data)
+    except Exception as e:
+        print(f"[Leave] Attendance with leave error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# CUSTOM TEAM TAGS - Department, Project, Location metadata
+# ==============================================================================
+
+BQ_TEAM_TAGS_TABLE = 'team_tags'
+
+def ensure_team_tags_table():
+    """Create team tags table if it doesn't exist"""
+    client = get_bq_client()
+    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TEAM_TAGS_TABLE}"
+    schema = [
+        bigquery.SchemaField("team_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("tag_key", "STRING", mode="REQUIRED"),  # e.g., 'department', 'project', 'location'
+        bigquery.SchemaField("tag_value", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP")
+    ]
+    table = bigquery.Table(table_id, schema=schema)
+    try:
+        client.get_table(table_id)
+    except:
+        client.create_table(table)
+        print(f"[Tags] Created table {table_id}")
+
+
+@app.route('/teams/<team_id>/tags', methods=['GET'])
+def get_team_tags(team_id):
+    """Get all tags for a team"""
+    try:
+        ensure_team_tags_table()
+        client = get_bq_client()
+        table_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TEAM_TAGS_TABLE}"
+
+        query = f"SELECT tag_key, tag_value FROM `{table_ref}` WHERE team_id = @team_id"
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )
+        rows = list(client.query(query, job_config=job_config).result())
+        tags = {r.tag_key: r.tag_value for r in rows}
+
+        return jsonify({'success': True, 'team_id': team_id, 'tags': tags})
+    except Exception as e:
+        print(f"[Tags] Get error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/tags', methods=['POST', 'PUT'])
+def set_team_tags(team_id):
+    """Set tags for a team (upsert behavior)
+    Body: {tags: {department: 'Engineering', project: 'Alpha', location: 'Remote'}}
+    """
+    try:
+        ensure_team_tags_table()
+        data = request.json or {}
+        tags = data.get('tags', {})
+
+        if not tags:
+            return jsonify({'success': False, 'error': 'tags object required'}), 400
+
+        client = get_bq_client()
+        table_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TEAM_TAGS_TABLE}"
+
+        # Delete existing tags for this team and re-insert
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )
+        client.query(f"DELETE FROM `{table_ref}` WHERE team_id = @team_id", job_config=job_config).result()
+
+        # Insert new tags
+        rows = []
+        for key, value in tags.items():
+            if value:  # Skip empty values
+                rows.append({
+                    'team_id': team_id,
+                    'tag_key': key.strip().lower(),
+                    'tag_value': str(value).strip(),
+                    'updated_at': datetime.utcnow().isoformat()
+                })
+
+        if rows:
+            errors = client.insert_rows_json(table_ref, rows)
+            if errors:
+                return jsonify({'success': False, 'error': str(errors)}), 500
+
+        print(f"[Tags] Updated tags for team {team_id}: {list(tags.keys())}")
+        return jsonify({'success': True, 'tags_count': len(rows)})
+    except Exception as e:
+        print(f"[Tags] Set error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/tags/<tag_key>', methods=['DELETE'])
+def delete_team_tag(team_id, tag_key):
+    """Delete a specific tag from a team"""
+    try:
+        ensure_team_tags_table()
+        client = get_bq_client()
+        table_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TEAM_TAGS_TABLE}"
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("tag_key", "STRING", tag_key.lower())
+            ]
+        )
+        client.query(f"DELETE FROM `{table_ref}` WHERE team_id = @team_id AND tag_key = @tag_key",
+                     job_config=job_config).result()
+
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Tags] Delete error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/by-tag', methods=['GET'])
+def list_teams_by_tag():
+    """List teams filtered by tag
+    Query params:
+        tag_key: the tag to filter by (e.g., 'department')
+        tag_value: the value to match (e.g., 'Engineering')
+    """
+    try:
+        ensure_team_tags_table()
+        ensure_team_tables_once()
+        tag_key = request.args.get('tag_key', '').strip().lower()
+        tag_value = request.args.get('tag_value', '').strip()
+
+        if not tag_key:
+            return jsonify({'success': False, 'error': 'tag_key required'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        query = f"""
+        SELECT t.team_id, t.team_name, t.manager_name, tt.tag_value
+        FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` t
+        INNER JOIN `{dataset_ref}.{BQ_TEAM_TAGS_TABLE}` tt ON t.team_id = tt.team_id
+        WHERE tt.tag_key = @tag_key
+        """
+        params = [bigquery.ScalarQueryParameter("tag_key", "STRING", tag_key)]
+
+        if tag_value:
+            query += " AND LOWER(tt.tag_value) = LOWER(@tag_value)"
+            params.append(bigquery.ScalarQueryParameter("tag_value", "STRING", tag_value))
+
+        query += " ORDER BY t.team_name"
+
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        rows = list(client.query(query, job_config=job_config).result())
+
+        teams = [{
+            'team_id': r.team_id,
+            'team_name': r.team_name,
+            'manager_name': r.manager_name,
+            f'{tag_key}': r.tag_value
+        } for r in rows]
+
+        return jsonify({'success': True, 'teams': teams, 'filter': {'tag_key': tag_key, 'tag_value': tag_value}})
+    except Exception as e:
+        print(f"[Tags] Filter error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
