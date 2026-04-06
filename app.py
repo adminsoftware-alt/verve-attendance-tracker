@@ -6446,7 +6446,7 @@ def team_attendance(team_id, date):
                 COUNT(*) * 30 as isolation_seconds
             FROM isolation_snapshots
             GROUP BY participant_name
-        )
+        ),
 
         -- Main meeting time from webhooks (participant_joined / participant_left)
         webhook_times AS (
@@ -7154,6 +7154,49 @@ def team_monthly_report(team_id):
             member_summary[name]['total_active_mins'] += r['active_minutes']
             member_summary[name]['total_break_mins'] += r['break_minutes']
             member_summary[name]['total_isolation_mins'] += r['isolation_minutes']
+
+        # Employee-wise CSV: grouped by employee with summary + daily rows
+        if request.args.get('format') == 'employee_csv':
+            import csv
+            import io
+            output = io.StringIO()
+            writer = csv.writer(output)
+
+            # Group daily data by employee
+            emp_data = {}
+            for r in data:
+                name = r['name']
+                if name not in emp_data:
+                    emp_data[name] = []
+                emp_data[name].append(r)
+
+            for name in sorted(emp_data.keys()):
+                emp_rows = emp_data[name]
+                summary = member_summary.get(name, {})
+                email = emp_rows[0].get('email', '') if emp_rows else ''
+
+                # Employee header
+                writer.writerow([])
+                writer.writerow([f'EMPLOYEE: {name}'])
+                writer.writerow([f'Email: {email}'])
+                writer.writerow([f'Team: {team_name}'])
+                writer.writerow([f'Period: {start_date} to {end_date}'])
+                writer.writerow([f'Days Present: {summary.get("days_present", 0)}',
+                                 f'Total Active: {summary.get("total_active_mins", 0)} min',
+                                 f'Total Break: {summary.get("total_break_mins", 0)} min',
+                                 f'Total Isolation: {summary.get("total_isolation_mins", 0)} min'])
+                writer.writerow([])
+                writer.writerow(['Date', 'Status', 'First_Seen_IST', 'Last_Seen_IST',
+                                 'Active_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
+                for r in sorted(emp_rows, key=lambda x: x['date']):
+                    writer.writerow([r['date'], r.get('status', ''), r['first_seen_ist'], r['last_seen_ist'],
+                                     r['active_minutes'], r['break_minutes'], r['isolation_minutes']])
+                writer.writerow([])
+
+            csv_content = output.getvalue()
+            filename = f"team_{team_name.replace(' ', '_')}_employee_report_{year}_{month:02d}.csv"
+            return Response(csv_content, mimetype='text/csv',
+                            headers={'Content-Disposition': f'attachment; filename={filename}'})
 
         return jsonify({
             'success': True,
