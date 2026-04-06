@@ -1,0 +1,49 @@
+steps:
+  # Build React Zoom SDK app
+  - name: 'node:20'
+    dir: 'breakout-calibrator'
+    entrypoint: 'npm'
+    args: ['ci']
+
+  - name: 'node:20'
+    dir: 'breakout-calibrator'
+    entrypoint: 'npm'
+    args: ['run', 'build']
+
+  # Deploy Backend API to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'breakout-room-calibrator'
+      - '--source=.'
+      - '--region=us-central1'
+      - '--allow-unauthenticated'
+      - '--min-instances=1'
+
+  # Build Frontend
+  - name: 'node:20'
+    dir: 'attedance_manager'
+    entrypoint: 'npm'
+    args: ['install']
+
+  - name: 'node:20'
+    dir: 'attedance_manager'
+    entrypoint: 'npm'
+    args: ['run', 'build']
+
+  # Deploy Frontend to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'attendance-frontend'
+      - '--source=attedance_manager'
+      - '--region=us-central1'
+      - '--allow-unauthenticated'
+      - '--port=8080'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: '1800s'
