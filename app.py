@@ -5912,25 +5912,32 @@ def attendance_summary(date=None):
           SELECT participant_key, room_name, join_time, leave_time, duration_mins
           FROM main_room_visits
           WHERE duration_mins > 0
+        ),
+        -- Aggregate room visits per participant
+        room_visits_agg AS (
+          SELECT
+            participant_key,
+            SUM(duration_mins) as total_duration_mins,
+            ARRAY_AGG(
+              STRUCT(
+                room_name,
+                FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(join_time, INTERVAL 330 MINUTE)) as room_joined_ist,
+                FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(leave_time, INTERVAL 330 MINUTE)) as room_left_ist,
+                duration_mins as room_duration_mins
+              ) ORDER BY join_time
+            ) as room_visits
+          FROM all_room_visits
+          GROUP BY participant_key
         )
         SELECT
           mrt.participant_name as name,
           mrt.participant_email as email,
           FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(COALESCE(mrt.main_joined, mrt.first_breakout), INTERVAL 330 MINUTE)) as first_seen_ist,
           FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(COALESCE(mrt.main_left, mrt.last_breakout), INTERVAL 330 MINUTE)) as last_seen_ist,
-          COALESCE(mrt.main_joined, mrt.first_breakout) as sort_time,
-          COALESCE((SELECT SUM(duration_mins) FROM all_room_visits arv WHERE arv.participant_key = mrt.participant_key), 0) as total_duration_mins,
-          ARRAY(
-            SELECT AS STRUCT
-              room_name,
-              FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(join_time, INTERVAL 330 MINUTE)) as room_joined_ist,
-              FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(leave_time, INTERVAL 330 MINUTE)) as room_left_ist,
-              duration_mins as room_duration_mins
-            FROM all_room_visits arv
-            WHERE arv.participant_key = mrt.participant_key
-            ORDER BY join_time
-          ) as room_visits
+          COALESCE(rva.total_duration_mins, 0) as total_duration_mins,
+          COALESCE(rva.room_visits, []) as room_visits
         FROM main_room_time mrt
+        LEFT JOIN room_visits_agg rva ON mrt.participant_key = rva.participant_key
         WHERE mrt.participant_name IS NOT NULL
         ORDER BY mrt.participant_name
         """
