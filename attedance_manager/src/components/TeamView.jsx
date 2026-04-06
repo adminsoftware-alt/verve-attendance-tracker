@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   fetchTeams, fetchTeamAttendance, fetchTeamAttendanceRange,
-  fetchTeamMonthlyReport, getTeamRangeCsvUrl, getTeamMonthlyCsvUrl, getTeamMonthlyEmployeeCsvUrl
+  fetchTeamMonthlyReport, getTeamRangeCsvUrl, getTeamMonthlyCsvUrl,
+  getTeamMonthlyEmployeeCsvUrl, getTeamSummaryCsvUrl
 } from '../utils/zoomApi';
 
 function istDate() {
@@ -121,6 +122,10 @@ export default function TeamView({ user }) {
     if (!selectedTeam) return;
     window.open(getTeamMonthlyEmployeeCsvUrl(selectedTeam, year, month), '_blank');
   };
+  const downloadSummaryCsv = () => {
+    if (!selectedTeam) return;
+    window.open(getTeamSummaryCsvUrl(selectedTeam, year, month), '_blank');
+  };
 
   if (loading && teams.length === 0) return <div style={s.loader}>Loading...</div>;
 
@@ -181,7 +186,8 @@ export default function TeamView({ user }) {
               ))}
             </select>
             <button onClick={downloadMonthlyCsv} style={s.csvBtn}>CSV</button>
-            <button onClick={downloadEmployeeCsv} style={s.empCsvBtn}>Employee CSV</button>
+            <button onClick={downloadEmployeeCsv} style={s.empCsvBtn}>Report Cards</button>
+            <button onClick={downloadSummaryCsv} style={s.summCsvBtn}>Team Summary</button>
           </div>
         )}
         <button onClick={loadAttendance} disabled={dataLoading} style={s.refreshBtn}>
@@ -447,6 +453,7 @@ const s = {
   refreshBtn: { padding: '8px 16px', background: '#f1f5f9', color: '#475569', border: '1px solid #e5e7eb', borderRadius: 8, fontSize: 12, cursor: 'pointer' },
   csvBtn: { padding: '7px 14px', background: '#10b981', color: '#fff', border: 'none', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' },
   empCsvBtn: { padding: '7px 14px', background: '#8b5cf6', color: '#fff', border: 'none', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' },
+  summCsvBtn: { padding: '7px 14px', background: '#0f172a', color: '#fff', border: 'none', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' },
 
   error: { padding: '10px 14px', background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: 10, fontSize: 13, marginBottom: 16 },
   loader: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '50vh', color: '#94a3b8' },

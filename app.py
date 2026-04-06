@@ -7368,7 +7368,22 @@ def team_monthly_report(team_id):
             member_summary[name]['total_break_mins'] += r['break_minutes']
             member_summary[name]['total_isolation_mins'] += r['isolation_minutes']
 
-        # Employee-wise CSV: grouped by employee with summary + daily rows
+        # Get all team members (for absent day detection)
+        all_members_q = list(client.query(
+            f"SELECT participant_name, participant_email FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id",
+            job_config=team_config
+        ).result())
+        all_member_names = {m.participant_name: (m.participant_email or '') for m in all_members_q}
+
+        # Count working days in the month (exclude weekends)
+        from datetime import date as date_cls
+        working_days = 0
+        for d in range(1, last_day + 1):
+            dt = date_cls(year, month, d)
+            if dt.weekday() < 5:  # Mon-Fri
+                working_days += 1
+
+        # Employee Report Card CSV
         if request.args.get('format') == 'employee_csv':
             import csv
             import io
@@ -7378,36 +7393,128 @@ def team_monthly_report(team_id):
             # Group daily data by employee
             emp_data = {}
             for r in data:
-                name = r['name']
-                if name not in emp_data:
-                    emp_data[name] = []
-                emp_data[name].append(r)
+                emp_data.setdefault(r['name'], []).append(r)
 
-            for name in sorted(emp_data.keys()):
-                emp_rows = emp_data[name]
+            for name in sorted(all_member_names.keys()):
+                emp_rows = sorted(emp_data.get(name, []), key=lambda x: x['date'])
                 summary = member_summary.get(name, {})
-                email = emp_rows[0].get('email', '') if emp_rows else ''
+                email = all_member_names.get(name, '')
+                days_present = summary.get('days_present', 0)
+                total_active = summary.get('total_active_mins', 0)
+                total_break = summary.get('total_break_mins', 0)
+                total_iso = summary.get('total_isolation_mins', 0)
+                days_absent = working_days - days_present
+                att_pct = round(days_present / working_days * 100) if working_days else 0
+                avg_hours = round(total_active / days_present) if days_present else 0
+                avg_break = round(total_break / days_present) if days_present else 0
 
-                # Employee header
+                def fmt(m):
+                    if not m: return '0m'
+                    return f'{m // 60}h {m % 60}m' if m >= 60 else f'{m}m'
+
+                # Report Card Header
                 writer.writerow([])
-                writer.writerow([f'EMPLOYEE: {name}'])
+                writer.writerow(['=' * 60])
+                writer.writerow([f'EMPLOYEE REPORT CARD - {["","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][month]} {year}'])
+                writer.writerow(['=' * 60])
+                writer.writerow([f'Name: {name}'])
                 writer.writerow([f'Email: {email}'])
                 writer.writerow([f'Team: {team_name}'])
-                writer.writerow([f'Period: {start_date} to {end_date}'])
-                writer.writerow([f'Days Present: {summary.get("days_present", 0)}',
-                                 f'Total Active: {summary.get("total_active_mins", 0)} min',
-                                 f'Total Break: {summary.get("total_break_mins", 0)} min',
-                                 f'Total Isolation: {summary.get("total_isolation_mins", 0)} min'])
                 writer.writerow([])
-                writer.writerow(['Date', 'Status', 'First_Seen_IST', 'Last_Seen_IST',
-                                 'Active_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
-                for r in sorted(emp_rows, key=lambda x: x['date']):
-                    writer.writerow([r['date'], r.get('status', ''), r['first_seen_ist'], r['last_seen_ist'],
-                                     r['active_minutes'], r['break_minutes'], r['isolation_minutes']])
+
+                # Summary section
+                writer.writerow(['SUMMARY'])
+                writer.writerow(['-' * 40])
+                writer.writerow(['Working Days', 'Present', 'Half Day', 'Absent', 'Attendance %'])
+                present_days = len([r for r in emp_rows if r.get('status') == 'Present'])
+                half_days = len([r for r in emp_rows if r.get('status') == 'Half Day'])
+                absent_days = working_days - present_days - half_days
+                writer.writerow([working_days, present_days, half_days, absent_days, f'{att_pct}%'])
+                writer.writerow([])
+                writer.writerow(['Avg Daily Hours', 'Total Break', 'Avg Break/Day', 'Total Isolation'])
+                writer.writerow([fmt(avg_hours), fmt(total_break), fmt(avg_break), fmt(total_iso)])
+                writer.writerow([])
+
+                # Day-wise breakdown
+                writer.writerow(['DAY-WISE BREAKDOWN'])
+                writer.writerow(['-' * 40])
+                writer.writerow(['Date', 'Day', 'Status', 'In', 'Out', 'Total', 'Breakout', 'Main Room', 'Break', 'Isolation'])
+
+                # Build set of dates that have data
+                data_dates = {r['date'] for r in emp_rows}
+
+                for d in range(1, last_day + 1):
+                    dt = date_cls(year, month, d)
+                    date_str = f'{year}-{month:02d}-{d:02d}'
+                    day_name = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][dt.weekday()]
+                    is_weekend = dt.weekday() >= 5
+
+                    if date_str in data_dates:
+                        r = next(x for x in emp_rows if x['date'] == date_str)
+                        writer.writerow([
+                            date_str, day_name, r.get('status', ''),
+                            r.get('first_seen_ist', '-'), r.get('last_seen_ist', '-'),
+                            fmt(r.get('active_minutes', 0)),
+                            fmt(r.get('breakout_minutes', 0)),
+                            fmt(r.get('main_room_minutes', 0)),
+                            fmt(r.get('break_minutes', 0)),
+                            fmt(r.get('isolation_minutes', 0))
+                        ])
+                    elif is_weekend:
+                        writer.writerow([date_str, day_name, 'Weekend', '-', '-', '-', '-', '-', '-', '-'])
+                    else:
+                        writer.writerow([date_str, day_name, 'Absent', '-', '-', '0m', '0m', '0m', '0m', '0m'])
+
                 writer.writerow([])
 
             csv_content = output.getvalue()
-            filename = f"team_{team_name.replace(' ', '_')}_employee_report_{year}_{month:02d}.csv"
+            filename = f"team_{team_name.replace(' ', '_')}_employee_reports_{year}_{month:02d}.csv"
+            return Response(csv_content, mimetype='text/csv',
+                            headers={'Content-Disposition': f'attachment; filename={filename}'})
+
+        # Team Summary CSV: all members side-by-side
+        if request.args.get('format') == 'team_summary_csv':
+            import csv
+            import io
+            output = io.StringIO()
+            writer = csv.writer(output)
+
+            writer.writerow([f'TEAM SUMMARY - {["","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][month]} {year}'])
+            writer.writerow([f'Team: {team_name}'])
+            writer.writerow([f'Working Days: {working_days}'])
+            writer.writerow([])
+
+            writer.writerow(['Name', 'Email', 'Present', 'Half Day', 'Absent', 'Attendance %',
+                             'Total Hours', 'Avg Hours/Day', 'Total Break', 'Avg Break/Day', 'Total Isolation'])
+
+            # Group data by employee
+            emp_data = {}
+            for r in data:
+                emp_data.setdefault(r['name'], []).append(r)
+
+            for name in sorted(all_member_names.keys()):
+                emp_rows = emp_data.get(name, [])
+                email = all_member_names.get(name, '')
+                present_days = len([r for r in emp_rows if r.get('status') == 'Present'])
+                half_days = len([r for r in emp_rows if r.get('status') == 'Half Day'])
+                absent_days = working_days - present_days - half_days
+                att_pct = round((present_days + half_days) / working_days * 100) if working_days else 0
+                total_active = sum(r.get('active_minutes', 0) for r in emp_rows)
+                total_break = sum(r.get('break_minutes', 0) for r in emp_rows)
+                total_iso = sum(r.get('isolation_minutes', 0) for r in emp_rows)
+                working_count = present_days + half_days
+                avg_active = round(total_active / working_count) if working_count else 0
+                avg_break = round(total_break / working_count) if working_count else 0
+
+                def fmt(m):
+                    if not m: return '0m'
+                    return f'{m // 60}h {m % 60}m' if m >= 60 else f'{m}m'
+
+                writer.writerow([name, email, present_days, half_days, absent_days, f'{att_pct}%',
+                                 fmt(total_active), fmt(avg_active), fmt(total_break), fmt(avg_break), fmt(total_iso)])
+
+            csv_content = output.getvalue()
+            filename = f"team_{team_name.replace(' ', '_')}_summary_{year}_{month:02d}.csv"
             return Response(csv_content, mimetype='text/csv',
                             headers={'Content-Disposition': f'attachment; filename={filename}'})
 

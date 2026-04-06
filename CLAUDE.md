@@ -12,12 +12,16 @@ This file provides complete guidance to Claude Code when working with this repos
 - Scout Bot VM auto-joins meetings; HR clicks app once to start monitoring
 
 **Cloud Run URLs:**
-- Primary: `https://breakout-room-calibrator-1041741270489.us-central1.run.app`
-- Alternate: `https://breakout-room-calibrator-r3wh42mg6q-uc.a.run.app`
+- Backend API: `https://breakout-room-calibrator-1073587167150.us-central1.run.app`
+- Frontend UI: `https://attendance-frontend-1073587167150.us-central1.run.app`
+- Zoom App Home: `https://breakout-room-calibrator-1073587167150.us-central1.run.app/app`
 
-**GCP Project:** `variant-finance-data-project`
+**GCP Project:** `verve-attendance-tracker` (Project #: 1073587167150)
 **BigQuery Dataset:** `breakout_room_calibrator`
-**Current Revision:** 119
+**GitHub Repo:** `adminsoftware-alt/verve-attendance-tracker`
+**Current Revision:** 130
+
+**Auto-Deploy:** Push to `main` triggers Cloud Build
 
 ## Architecture
 
@@ -65,19 +69,26 @@ This file provides complete guidance to Claude Code when working with this repos
 ## Build and Deploy Commands
 
 ```bash
-# Full deployment (build React + deploy to Cloud Run)
+# AUTO-DEPLOY: Push to main triggers Cloud Build (preferred method)
+git add . && git commit -m "message" && git push origin main
+
+# Manual deployment - Backend (build React + deploy to Cloud Run)
 cd C:\Users\shash\Downloads\zoom+tracker
 cd breakout-calibrator && npm run build && cd ..
-gcloud run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated --min-instances=1
+gcloud.cmd run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated --min-instances=1 --project=verve-attendance-tracker
+
+# Manual deployment - Frontend
+cd attedance_manager
+gcloud.cmd run deploy attendance-frontend --source . --region us-central1 --allow-unauthenticated --port 8080 --project=verve-attendance-tracker
 
 # React app only (local dev)
 cd breakout-calibrator && npm start
 
 # View Cloud Run logs
-gcloud run services logs read breakout-room-calibrator --region us-central1 --limit 100
+gcloud.cmd run services logs read breakout-room-calibrator --region us-central1 --limit 100 --project=verve-attendance-tracker
 
 # Tail logs in real-time
-gcloud run services logs tail breakout-room-calibrator --region us-central1
+gcloud.cmd run services logs tail breakout-room-calibrator --region us-central1 --project=verve-attendance-tracker
 ```
 
 ## BigQuery Tables

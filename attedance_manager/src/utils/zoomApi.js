@@ -214,3 +214,7 @@ export function getTeamMonthlyCsvUrl(teamId, year, month) {
 export function getTeamMonthlyEmployeeCsvUrl(teamId, year, month) {
   return `${ZOOM_API_BASE}/teams/${teamId}/report/monthly?year=${year}&month=${month}&format=employee_csv`;
 }
+
+export function getTeamSummaryCsvUrl(teamId, year, month) {
+  return `${ZOOM_API_BASE}/teams/${teamId}/report/monthly?year=${year}&month=${month}&format=team_summary_csv`;
+}

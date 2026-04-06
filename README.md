@@ -17,21 +17,30 @@ This system captures participant activity in Zoom meetings and breakout rooms. T
 ### URLs
 | Service | URL |
 |---------|-----|
-| Cloud Run (Primary) | `https://breakout-room-calibrator-1041741270489.us-central1.run.app` |
-| Cloud Run (Alternate) | `https://breakout-room-calibrator-r3wh42mg6q-uc.a.run.app` |
-| Zoom App Home URL | `https://breakout-room-calibrator-1041741270489.us-central1.run.app/app` |
+| **Frontend (UI)** | `https://attendance-frontend-1073587167150.us-central1.run.app` |
+| **Backend API** | `https://breakout-room-calibrator-1073587167150.us-central1.run.app` |
+| **Zoom App Home** | `https://breakout-room-calibrator-1073587167150.us-central1.run.app/app` |
 
 ### IDs & Credentials
 | Item | Value |
 |------|-------|
-| GCP Project ID | `variant-finance-data-project` |
+| GCP Project ID | `verve-attendance-tracker` |
+| GCP Project Number | `1073587167150` |
 | BigQuery Dataset | `breakout_room_calibrator` |
+| GitHub Repo | `adminsoftware-alt/verve-attendance-tracker` |
 | Zoom Account ID | `xhKbAsmnSM6pNYYYurmqIA` |
-| Zoom Server-to-Server Client ID | `TqtBGqTAS3W1Jgf9a41w` |
-| Zoom App Client ID | `raEkn6HpTkWO_DCO3z5zGA` |
 | Zoom App ID | `RRYgo_e2QE697_mxkp3tzg` |
 | Meeting ID | `9034027764` |
-| Current Revision | **124** |
+| Current Revision | **130** |
+
+### Login Credentials (BigQuery app_users table)
+| Username | Password | Role |
+|----------|----------|------|
+| admin | verve2026 | admin |
+| hr1 | verve2026 | user |
+| hr2 | verve2026 | user |
+| manager1 | verve2026 | manager |
+| manager2 | verve2026 | manager |
 
 ### Scout Bot VM
 | Setting | Value |
@@ -43,31 +52,6 @@ This system captures participant activity in Zoom meetings and breakout rooms. T
 | OS | Windows Server |
 | Username | `dataapps` |
 | Password | `ScoutBot2026` |
-
----
-
-## Daily Workflow
-
-```
-1. Meeting starts (e.g., 9:30 AM IST)
-   └── Scout Bot VM auto-joins meeting (scheduled task)
-
-2. HR connects via RDP (1 minute only)
-   └── IP: 34.47.178.82
-   └── Username: dataapps
-   └── Password: ScoutBot2026
-   └── Clicks: Apps → Breakout Room Calibrator
-   └── Monitoring auto-starts
-   └── HR disconnects (VM continues independently)
-
-3. SDK polls every 30 seconds
-   └── Captures: room names + participants
-   └── Saves to: BigQuery room_snapshots table
-
-4. 11:15 AM IST - Report auto-generated
-   └── Cloud Scheduler triggers /report/generate
-   └── CSV emailed to recipients
-```
 
 ---
 
@@ -83,354 +67,22 @@ This system captures participant activity in Zoom meetings and breakout rooms. T
                             │ SDK polls every 30s
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Cloud Run (Flask + React)                     │
+│                Cloud Run Services (verve-attendance-tracker)     │
 │                                                                  │
-│  React App (/app)          Flask Server (app.py)                │
-│  - MonitorPanel.jsx        - /monitor/snapshot (save data)      │
-│  - useZoomSdk.js           - /report/generate (daily CSV)       │
-│  - Polls SDK every 30s     - /webhook (Zoom events)             │
+│  attendance-frontend        breakout-room-calibrator            │
+│  (React + Vite)             (Flask + React SDK App)             │
+│  - Login UI                 - /monitor/* (SDK polling)          │
+│  - Team Management          - /teams/* (Teams API)              │
+│  - Reports Dashboard        - /auth/* (BigQuery auth)           │
+│                             - /data/* (Attendance data)         │
 └─────────────────────────────────────────────────────────────────┘
                             │
             ┌───────────────┼───────────────┐
             ▼               ▼               ▼
     ┌──────────────┐ ┌──────────┐  ┌──────────────┐
     │   BigQuery   │ │ Zoom SDK │  │  SendGrid    │
-    │              │ │          │  │              │
-    │ room_snapshots│ │ Polling  │  │ Email CSV    │
-    │ participant_  │ │ Data     │  │ Reports      │
-    │ events       │ │          │  │              │
+    │  11 tables   │ │ Polling  │  │ Email CSV    │
     └──────────────┘ └──────────┘  └──────────────┘
-```
-
----
-
-## BigQuery Tables
-
-### Dataset: `variant-finance-data-project.breakout_room_calibrator`
-
-### 1. room_snapshots (PRIMARY - SDK Monitoring)
-```sql
-CREATE TABLE room_snapshots (
-  snapshot_id STRING NOT NULL,
-  snapshot_time TIMESTAMP NOT NULL,
-  event_date STRING NOT NULL,          -- IST date (YYYY-MM-DD)
-  meeting_id STRING NOT NULL,
-  room_name STRING NOT NULL,           -- Actual room name from SDK
-  participant_name STRING,
-  participant_email STRING,            -- Often empty (SDK limitation)
-  participant_uuid STRING,
-  inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
-);
-```
-**Source:** SDK polls every 30s → POST `/monitor/snapshot`
-
-### 2. participant_events (Webhooks)
-```sql
-CREATE TABLE participant_events (
-  event_id STRING,
-  event_type STRING,                   -- participant_joined, participant_left
-  event_timestamp STRING,              -- Exact time from Zoom
-  event_date STRING,                   -- IST date
-  meeting_id STRING,
-  meeting_uuid STRING,
-  participant_id STRING,
-  participant_name STRING,
-  participant_email STRING,
-  room_uuid STRING,                    -- Base64-like UUID
-  room_name STRING,                    -- Mapped name (if calibrated)
-  inserted_at TIMESTAMP
-);
-```
-**Source:** Zoom webhooks → POST `/webhook`
-
-### 3. room_mappings (Legacy - Calibration)
-```sql
-CREATE TABLE room_mappings (
-  mapping_id STRING,
-  meeting_id STRING,
-  meeting_uuid STRING,
-  room_uuid STRING,
-  room_name STRING,
-  room_index INTEGER,
-  mapping_date DATE,
-  mapped_at TIMESTAMP,
-  source STRING                        -- webhook_calibration, sequential_calibration
-);
-```
-
-### 4. qos_data (Camera/Quality)
-```sql
-CREATE TABLE qos_data (
-  qos_id STRING,
-  meeting_uuid STRING,
-  participant_id STRING,
-  participant_name STRING,
-  participant_email STRING,
-  join_time STRING,
-  leave_time STRING,
-  duration_minutes FLOAT,
-  attentiveness_score FLOAT,
-  camera_on_count INTEGER,
-  camera_on_minutes FLOAT,
-  camera_on_intervals STRING,
-  recorded_at TIMESTAMP,
-  event_date STRING
-);
-```
-**Source:** Dashboard QoS API → `/qos/scheduled`
-
-### 5. camera_events
-```sql
-CREATE TABLE camera_events (
-  event_id STRING,
-  event_type STRING,                   -- camera_on, camera_off
-  event_timestamp STRING,
-  event_date STRING,
-  meeting_id STRING,
-  participant_name STRING,
-  camera_on BOOLEAN,
-  room_name STRING,
-  duration_seconds INTEGER,
-  inserted_at TIMESTAMP
-);
-```
-
----
-
-## API Endpoints
-
-### Monitor Mode (SDK Polling)
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/monitor/snapshot` | POST | Receive SDK polling data → saves to room_snapshots |
-| `/monitor/status` | GET | Check snapshot counts for today |
-| `/monitor/health` | GET | Check if monitoring is active (HEALTHY/STALE/NO_DATA) |
-| `/monitor/sample` | GET | View sample snapshot data (last 50 rows) |
-
-### Reports
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/report/generate` | POST | Generate and email daily CSV |
-| `/report/preview/<date>` | GET | Preview report data as JSON |
-
-### Webhooks
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/webhook` | POST | Receive Zoom webhook events |
-
-### QoS / Camera
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/qos/scheduled` | POST | Scheduled QoS collection |
-| `/qos/collect` | POST | Manual QoS collection |
-
-### Health & Debug
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/health` | GET | Service health check |
-| `/mappings` | GET | Get current room mappings |
-| `/debug/bq-mappings` | GET | Check BigQuery mappings |
-
----
-
-## Cloud Scheduler Jobs
-
-| Job | UTC Time | IST Time | Endpoint | Purpose |
-|-----|----------|----------|----------|---------|
-| `daily-qos-collection` | 04:00 | 9:30 AM | `/qos/scheduled` | Collect camera data |
-| `daily-attendance-report` | 05:45 | 11:15 AM | `/report/generate` | Email daily CSV |
-
----
-
-## Commands Reference
-
-### Deploy to Cloud Run
-```bash
-cd C:\Users\shash\Downloads\zoom+tracker
-cd breakout-calibrator && npm run build && cd ..
-gcloud run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated --min-instances=1
-```
-
-### View Logs
-```bash
-# Recent logs
-gcloud run services logs read breakout-room-calibrator --region us-central1 --limit 100
-
-# Real-time logs
-gcloud run services logs tail breakout-room-calibrator --region us-central1
-```
-
-### Check Service Status
-```bash
-gcloud run services describe breakout-room-calibrator --region us-central1 --format="value(status.url)"
-```
-
-### Generate Report (curl)
-```bash
-curl -X POST "https://breakout-room-calibrator-1041741270489.us-central1.run.app/report/generate" \
-  -H "Content-Type: application/json" \
-  -d '{"date": "2026-04-01"}'
-```
-
-### Check Monitor Status
-```bash
-curl "https://breakout-room-calibrator-1041741270489.us-central1.run.app/monitor/status"
-```
-
-### Check Monitor Health
-```bash
-curl "https://breakout-room-calibrator-1041741270489.us-central1.run.app/monitor/health"
-```
-
-### View Sample Snapshots
-```bash
-curl "https://breakout-room-calibrator-1041741270489.us-central1.run.app/monitor/sample"
-```
-
-### Preview Report
-```bash
-curl "https://breakout-room-calibrator-1041741270489.us-central1.run.app/report/preview/2026-04-01"
-```
-
----
-
-## Scout Bot VM Setup
-
-### Connect via RDP
-```
-IP: 34.47.178.82
-Username: dataapps
-Password: ScoutBot2026
-```
-
-### VM Automation Files
-```
-C:\ScoutBot\join_meeting.bat    -- Auto-join script
-Scheduled Task: ScoutBot-JoinMeeting
-```
-
-### Change Scheduled Task Time
-```cmd
-schtasks /change /tn "ScoutBot-JoinMeeting" /st 09:30
-```
-
-### Check Scheduled Task
-```cmd
-schtasks /query /tn "ScoutBot-JoinMeeting"
-```
-
-### VM Auto-login (Registry)
-```
-HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
-- AutoAdminLogon = 1
-- DefaultUserName = dataapps
-- DefaultPassword = ScoutBot2026
-```
-
-### join_meeting.bat Content
-```batch
-@echo off
-timeout /t 60 /nobreak
-start "" "zoommtg://zoom.us/join?confno=9034027764"
-```
-
----
-
-## How SDK Monitoring Works
-
-### Data Flow
-```
-1. Scout Bot VM joins Zoom meeting
-2. HR opens Zoom App (MonitorPanel)
-3. App auto-starts monitoring (if host/co-host)
-4. Every 30 seconds:
-   a. getBreakoutRoomList() → room names + UUIDs
-   b. getMeetingParticipants() → who's in which room
-   c. Build snapshot data
-   d. POST /monitor/snapshot → Cloud Run
-   e. Save to BigQuery room_snapshots table
-```
-
-### Room Transition Detection (SQL)
-```sql
--- Compare consecutive snapshots for each participant
-SELECT
-  participant_name,
-  room_name,
-  snapshot_time,
-  LAG(room_name) OVER (PARTITION BY participant_name ORDER BY snapshot_time) as prev_room
-FROM room_snapshots
-
--- When room_name != prev_room → room transition detected!
-```
-
-### Why No Calibration Needed
-```
-OLD METHOD (Calibration):
-- Webhooks send UUIDs like "n0a1FJhALeimJ5UPLUTxiw=="
-- Need Scout Bot to visit each room to map UUID → name
-- Takes 30+ minutes for 66 rooms
-
-NEW METHOD (SDK Monitoring):
-- SDK's getBreakoutRoomList() returns room names directly!
-- No UUID mapping needed
-- Just poll and store
-```
-
----
-
-## Report Format (Rev 124+)
-
-### One Row Per Room Visit
-Each room visit is a separate row (not concatenated with `->`)
-
-### CSV Columns
-| Column | Description | Source |
-|--------|-------------|--------|
-| Name | Participant name | Snapshots |
-| Email | Participant email | Webhooks |
-| Main_Joined_IST | Meeting join time | Webhooks |
-| Main_Left_IST | Meeting leave time | Webhooks |
-| Room | Breakout room name | Snapshots |
-| Room_Joined_IST | Room entry time | Snapshots |
-| Room_Left_IST | Room exit time | Snapshots |
-| Duration_Minutes | Time in this room | Calculated |
-
-### Example Output
-```csv
-Name,Email,Main_Joined_IST,Main_Left_IST,Room,Room_Joined_IST,Room_Left_IST,Duration_Minutes
-Abhishek Rathi,abhishek.rathi@verveadvisory.com,10:21,18:33,1.8:Life In The Math Lane,13:55,14:04,9
-Abhishek Rathi,abhishek.rathi@verveadvisory.com,10:21,18:33,8.0:BREAK TIME - Tea/Lunch/ Dinner,14:05,15:13,68
-Abhishek Rathi,abhishek.rathi@verveadvisory.com,10:21,18:33,1.3:Opera House,15:13,15:18,4
-Abhishek Rathi,abhishek.rathi@verveadvisory.com,10:21,18:33,1.1:It's Accrual World,15:32,18:16,163
-```
-
-### Key Features
-- **No 0-minute entries** - Transition artifacts filtered out
-- **Same-room visits merged** - Consecutive visits combined
-- **Main times from webhooks** - Accurate meeting join/leave
-- **Room times from SDK** - 30-second polling precision
-
----
-
-## Environment Variables (Cloud Run)
-
-### Required
-```
-ZOOM_CLIENT_ID=TqtBGqTAS3W1Jgf9a41w
-ZOOM_CLIENT_SECRET=<secret>
-ZOOM_WEBHOOK_SECRET=<secret>
-ZOOM_ACCOUNT_ID=xhKbAsmnSM6pNYYYurmqIA
-GCP_PROJECT_ID=variant-finance-data-project
-SENDGRID_API_KEY=<key>
-REPORT_EMAIL_TO=scout@verveadvisory.com;devendra.mandhana@verveadvisory.com
-```
-
-### Optional
-```
-SCOUT_BOT_NAME=Scout Bot
-BQ_DATASET=breakout_room_calibrator
-REPORT_EMAIL_FROM=reports@verveadvisory.com
 ```
 
 ---
@@ -439,24 +91,32 @@ REPORT_EMAIL_FROM=reports@verveadvisory.com
 
 ```
 zoom+tracker/
-├── app.py                    # Flask server (webhooks, monitoring, reports)
-├── report_generator.py       # Daily CSV generation from snapshots
+├── app.py                    # Flask server (all endpoints)
+├── report_generator.py       # Daily CSV generation
 ├── requirements.txt          # Python dependencies
-├── Dockerfile               # Cloud Run deployment
+├── Dockerfile               # Backend Cloud Run deployment
+├── cloudbuild.yaml          # Auto-deploy config (GitHub trigger)
 ├── CLAUDE.md                # Claude Code instructions
 ├── README.md                # This file
-├── breakout-calibrator/     # React app (Zoom SDK)
+├── breakout-calibrator/     # React app (Zoom SDK) - served at /app
 │   ├── src/
 │   │   ├── components/
 │   │   │   ├── MonitorPanel.jsx      # SDK polling UI
-│   │   │   ├── CalibrationPanel.jsx  # Legacy calibration UI
+│   │   │   ├── CalibrationPanel.jsx  # Legacy calibration
 │   │   │   └── StatusMessage.jsx
 │   │   ├── hooks/
 │   │   │   └── useZoomSdk.js         # Zoom SDK methods
-│   │   ├── services/
-│   │   │   ├── apiService.js
-│   │   │   └── zoomService.js
-│   │   └── App.jsx
+│   │   └── services/
+│   │       └── apiService.js
+│   └── package.json
+├── attedance_manager/       # React frontend (attendance UI)
+│   ├── src/
+│   │   ├── components/      # Login, Dashboard, Team views
+│   │   └── utils/
+│   │       ├── storage.js   # Auth & data API calls
+│   │       └── zoomApi.js   # Zoom tracker API calls
+│   ├── Dockerfile           # Frontend Cloud Run deployment
+│   ├── nginx.conf          # SPA routing config
 │   └── package.json
 └── vm-setup/
     ├── setup_scout_bot.ps1   # PowerShell setup script
@@ -465,120 +125,168 @@ zoom+tracker/
 
 ---
 
-## Fixed Room Sequence (66 Rooms)
+## BigQuery Tables
 
+### Dataset: `verve-attendance-tracker.breakout_room_calibrator`
+
+| Table | Purpose |
+|-------|---------|
+| `room_snapshots` | **PRIMARY** - SDK polling data (every 30s) |
+| `participant_events` | Webhook join/leave events |
+| `room_mappings` | UUID -> room name (legacy calibration) |
+| `qos_data` | Dashboard QoS metrics |
+| `camera_events` | Camera ON/OFF events |
+| `teams` | Team definitions |
+| `team_members` | Team membership |
+| `team_tags` | Custom team metadata (department, project, etc.) |
+| `team_leave_records` | Leave/absence tracking |
+| `app_users` | Login credentials |
+| `attendance_reports` | Uploaded attendance data (from frontend) |
+
+---
+
+## API Endpoints
+
+### Auth (BigQuery-based)
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/auth/login` | POST | Validate username/password |
+| `/auth/users` | GET | List all users |
+
+### Attendance Data
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/data/attendance` | GET | Get all attendance data |
+| `/data/attendance/<date>` | GET | Get specific date |
+| `/data/attendance` | POST | Save attendance data |
+| `/data/attendance/<date>` | DELETE | Delete attendance data |
+| `/data/attendance/dates` | GET | List dates with data |
+
+### Monitor Mode (SDK Polling)
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/monitor/snapshot` | POST | Receive SDK polling data |
+| `/monitor/status` | GET | Check snapshot counts |
+| `/monitor/health` | GET | Check if monitoring active |
+
+### Live Attendance API
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/attendance/live?date=YYYY-MM-DD` | GET | Who's in which room NOW |
+| `/attendance/summary/<date>` | GET | Full attendance with room visits |
+| `/attendance/heatmap/<date>?interval=15` | GET | Room occupancy per time slot |
+
+### Teams Management
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/teams` | GET | List all teams |
+| `/teams` | POST | Create team |
+| `/teams/<id>` | GET/PUT/DELETE | Team CRUD |
+| `/teams/<id>/members` | POST | Add member (with duplicate check) |
+| `/teams/<id>/members/<mid>` | DELETE | Remove member |
+| `/teams/participants?days=90` | GET | List known participants (for adding) |
+
+### Team Attendance
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/teams/<id>/attendance/<date>` | GET | Daily team attendance with break/isolation |
+| `/teams/<id>/attendance-with-leave/<date>` | GET | Attendance with leave status |
+| `/teams/<id>/report/monthly` | GET | Monthly report (JSON or CSV) |
+| `/teams/<id>/trends?months=6` | GET | Historical trends (month-over-month) |
+
+### Leave Management
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/teams/<id>/leave` | GET | List leave records |
+| `/teams/<id>/leave` | POST | Add leave record |
+| `/teams/<id>/leave/<leave_id>` | DELETE | Delete leave record |
+
+### Team Tags (Custom Metadata)
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/teams/<id>/tags` | GET | Get team tags |
+| `/teams/<id>/tags` | POST/PUT | Set team tags |
+| `/teams/<id>/tags/<key>` | DELETE | Delete tag |
+| `/teams/by-tag?tag_key=&tag_value=` | GET | Filter teams by tag |
+
+### Reports
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/report/generate` | POST | Generate and email daily CSV |
+| `/report/preview/<date>` | GET | Preview report data |
+
+---
+
+## Deployment
+
+### Auto-Deploy (Cloud Build)
+Push to `main` branch triggers automatic deployment:
+1. Builds React SDK app (`breakout-calibrator`)
+2. Deploys backend to Cloud Run
+3. Builds React frontend (`attedance_manager`)
+4. Deploys frontend to Cloud Run
+
+```bash
+# Just push to main - Cloud Build handles the rest!
+git add .
+git commit -m "Your changes"
+git push origin main
 ```
-Floor 1 (1.1 - 1.34)
---------------------
-1.1:It's Accrual World
-1.2:Between The Spreadsheet
-1.3:Opera House
-1.4:Statue Of Liberty
-1.5:The Squad
-1.6:Visionary Vault - Team Kruta
-1.7:Inspiration Island - Team Kruta
-1.8:Life In The Math Lane
-1.9:Finance Pirates
-1.10:Number Nook - Team Ganesh
-1.11:Accountaholics
-1.12:The Forbidden City
-1.13:Dev's Professional Bungalow
-1.14:Innovation Station
-1.15:Precision Point
-1.16:Creative Corner - Team Dev
-1.17:Insight Lounge - Team Dev
-1.18:Synergy Space - Team Dev
-1.19:Numbers and Nuance
-1.20:Sales Wizard
-1.21:Sales Station
-1.22:Virtual Vista
-1.23:The Genius Lounge
-1.24:Emirates Palace
-1.25:Victoria Memorial
-1.26:Number Nexus
-1.27:Ledger Lounge
-1.28:The Capital Corner
-1.29:Meeting Room - Hawks Eye
-1.30:HR Connect Room
-1.31:HR Strategy Meeting Suite
-1.32:Interview Room - 1
-1.33:Interview Room - 2
-1.34:Interview/Meeting - Eagle Eyes
 
-Floor 2
--------
-2.0:Vridam - Wellness Meeting Lounge
+### Manual Deploy
+```bash
+# Backend (includes Zoom SDK app)
+cd C:\Users\shash\Downloads\zoom+tracker
+cd breakout-calibrator && npm run build && cd ..
+gcloud.cmd run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated --min-instances=1 --project=verve-attendance-tracker
 
-Floor 3 (Cloud Teams)
----------------------
-3.1:Cloud Gunners
-3.2:Cloud Knights
-3.3:Cloud Avengers
-3.4:Cloud Falcons
-3.5:Cloud Titans
-3.6:Cloud Guardians
-3.7:Inspiration Lounge/Meeting Room
-3.8:Agenda Chamber/Meeting Room
-3.9:ABAP AMS
+# Frontend (attendance manager)
+cd attedance_manager
+gcloud.cmd run deploy attendance-frontend --source . --region us-central1 --allow-unauthenticated --port 8080 --project=verve-attendance-tracker
+```
 
-Floor 4 (KPRC)
---------------
-4.1:KPRC - Legal Eagle
-4.2:KPRC - Corporate Crest
-4.3:KPRC - Innovation Lounge
-4.4:KPRC - Decision Dome
-4.5:KPRC - Focus Zone
-4.6:KPRC - Strategic Space
-
-Floor 5 (Accurest)
-------------------
-5.1:Accurest - HR Oasis
-5.2:Accurest - Meeting Room: Strategist
-5.3:Accurest - Meeting Room: Pioneer
-5.4:Accurest - Automation Crafters
-5.5:Accurest - Learning/Meeting room
-5.6:Accurest - Sales Lounge
-5.7:Accurest - Focus Lab
-5.8:Accurest - Pattern Inbound
-5.9:Accurest - Pattern Planning
-5.10:Accurest - Himal's Suite
-5.11:Accurest Insight: Team Shubham
-5.12:Accurest - Creators
-5.13:Accurest - Interview Room
-
-Special Zones
--------------
-6.0:Silence Zone
-7.0:Masti Ki Pathshala
-8.0:BREAK TIME - Tea/Lunch/Dinner
+### View Logs
+```bash
+gcloud.cmd run services logs read breakout-room-calibrator --region us-central1 --limit 100 --project=verve-attendance-tracker
 ```
 
 ---
 
-## Troubleshooting
+## Test Commands
 
-### Monitor shows "STALE" or "NO_DATA"
-- Check if Zoom App is open on Scout Bot VM
-- Verify Scout Bot is host/co-host
-- Reconnect via RDP and click the app again
+```bash
+# Health check
+curl "https://breakout-room-calibrator-1073587167150.us-central1.run.app/health"
 
-### Report shows empty Room History
-- Ensure monitoring started at meeting start
-- Check `/monitor/sample` for data
-- Verify `room_snapshots` table has data
+# Login test
+curl -X POST "https://breakout-room-calibrator-1073587167150.us-central1.run.app/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"verve2026"}'
 
-### VM not joining meeting
-- Check scheduled task: `schtasks /query /tn "ScoutBot-JoinMeeting"`
-- Verify Zoom is installed and logged in
-- Check `C:\ScoutBot\join_meeting.bat` exists
+# Generate report
+curl -X POST "https://breakout-room-calibrator-1073587167150.us-central1.run.app/report/generate" \
+  -H "Content-Type: application/json" \
+  -d '{"date": "2026-04-06"}'
 
-### App not visible in Zoom
-- Add Scout Bot's email to Test Users in Zoom Marketplace
-- Or use direct install URL: `https://marketplace.zoom.us/apps/RRYgo_e2QE697_mxkp3tzg`
+# Check monitor
+curl "https://breakout-room-calibrator-1073587167150.us-central1.run.app/monitor/health"
+```
 
-### DNS/Connection errors
-- Both URLs work: try the alternate URL
-- Check internet connectivity
+---
+
+## Scout Bot VM
+
+### Connect via RDP
+```
+IP: 34.47.178.82
+Username: dataapps
+Password: ScoutBot2026
+```
+
+### Change Scheduled Task Time
+```cmd
+schtasks /change /tn "ScoutBot-JoinMeeting" /st 09:30
+```
 
 ---
 
@@ -586,53 +294,24 @@ Special Zones
 
 | Rev | Date | Changes |
 |-----|------|---------|
-| 124 | 2026-04-01 | Fixed TIMESTAMP cast for webhook times |
-| 123 | 2026-04-01 | Added webhook_times CTE back |
-| 122 | 2026-04-01 | Added Main_Joined/Left_IST from webhooks |
-| 121 | 2026-04-01 | Filter 0-duration entries, re-merge same-room visits |
-| 120 | 2026-04-01 | Changed to one row per room visit format |
-| 119 | 2026-04-01 | Report uses webhooks + snapshots combined |
-| 118 | 2026-04-01 | SDK monitoring mode, simplified report |
-| 117 | 2026-04-01 | Fixed participant count (use name when email empty) |
-| 116 | 2026-04-01 | Added room_snapshots table, MonitorPanel component |
-| 111 | 2026-03-26 | Fixed room sequence calibration |
-| 105 | 2026-03-25 | Resume calibration feature |
+| 130 | 2026-04-06 | Bug fixes (duplicate members, break time, 90-day pool) + new features (Historical Trends, Leave Management, Team Tags) |
+| 129 | 2026-04-06 | Full GCP migration - new project, frontend on Cloud Run, BigQuery auth |
+| 128 | 2026-04-06 | Team management endpoints |
+| 126 | 2026-04-03 | Fixed meeting ID extraction |
+| 125 | 2026-04-03 | Added JSON attendance API |
+| 124 | 2026-04-01 | One row per room visit format |
 
 ---
 
-## Cost Estimates (GCP)
+## Cost Estimates (Monthly)
 
-### Monthly Breakdown
-| Service | Cost | Notes |
-|---------|------|-------|
-| Cloud Run | ~$50-80/month | With min-instances=1 (always warm) |
-| Cloud Build | ~$5-10/month | Depends on deployment frequency |
-| Scout Bot VM | ~$27/month | e2-medium (2 vCPU, 4GB), 24/7 |
-| BigQuery | ~$1-5/month | Storage + queries |
-| Container Scanning | ~$5/month | Automatic security scans |
-| **Total** | **~$90-130/month** | |
-
-### Cost Optimization Tips
-1. **Reduce Cloud Run cost** - Set min-instances=0 (first request slower):
-   ```bash
-   gcloud run services update breakout-room-calibrator --region us-central1 --min-instances=0
-   ```
-
-2. **Stop VM after hours** - Save ~60% on VM costs:
-   ```bash
-   # Stop VM (e.g., 7 PM IST)
-   gcloud compute instances stop scout-bot-vm --zone=asia-south1-a
-
-   # Start VM (e.g., 9 AM IST)
-   gcloud compute instances start scout-bot-vm --zone=asia-south1-a
-   ```
-
-3. **Reduce deployments** - Each deployment costs ~$0.10-0.20 in Cloud Build
-
-### Check Current Billing
-```
-https://console.cloud.google.com/billing
-```
+| Service | Cost |
+|---------|------|
+| Cloud Run (2 services) | ~$60-100 |
+| Scout Bot VM | ~$27 |
+| Cloud Build | ~$5-10 |
+| BigQuery | ~$1-5 |
+| **Total** | **~$95-145** |
 
 ---
 
@@ -640,8 +319,9 @@ https://console.cloud.google.com/billing
 
 1. **SDK provides room names** - No calibration needed!
 2. **Emails often empty** - SDK limitation, use participant_name
-3. **Bot must join at meeting start** - For accurate timing
+3. **Camera webhooks DON'T exist** - Use Dashboard QoS API
 4. **VM runs independently** - HR can disconnect after opening app
 5. **IST dates** - All event_date stored in IST (UTC+5:30)
-6. **Two URLs work** - Primary and alternate Cloud Run URLs both valid
-7. **Camera webhooks don't exist** - Use Dashboard QoS API instead
+6. **Full GCP stack** - No Vercel, no Supabase
+7. **Auth via BigQuery** - app_users table for login
+8. **Auto-deploy** - Push to main triggers Cloud Build
