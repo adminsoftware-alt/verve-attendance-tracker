@@ -5724,8 +5724,8 @@ def attendance_live():
 @app.route('/attendance/summary/<date>', methods=['GET'])
 def attendance_summary(date=None):
     """
-    Full attendance for a date - direct BigQuery, no CSV.
-    Total duration = first snapshot to last snapshot per participant.
+    Full attendance for a date - includes Main Room time from webhooks.
+    Combines webhook join/leave data with SDK room snapshots.
 
     GET /attendance/summary/2026-04-03
     """
@@ -5740,10 +5740,35 @@ def attendance_summary(date=None):
         client = get_bq_client()
         query = f"""
         WITH
-        -- Clean snapshots
+        -- Webhook events: main meeting join/leave
+        webhook_events AS (
+          SELECT
+            LOWER(TRIM(participant_name)) as participant_key,
+            participant_name,
+            COALESCE(NULLIF(participant_email, ''), '') as participant_email,
+            event_type,
+            event_timestamp
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+          WHERE event_date = '{date}'
+            AND participant_name IS NOT NULL AND participant_name != ''
+            AND LOWER(participant_name) NOT LIKE '%scout%'
+            AND event_type IN ('participant_joined', 'participant_left')
+        ),
+        -- Main meeting times from webhooks
+        webhook_times AS (
+          SELECT
+            participant_key,
+            MAX(participant_name) as participant_name,
+            MAX(participant_email) as participant_email,
+            MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as main_joined,
+            MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as main_left
+          FROM webhook_events
+          GROUP BY participant_key
+        ),
+        -- Clean snapshots (breakout rooms only)
         snapshot_clean AS (
           SELECT
-            COALESCE(NULLIF(participant_uuid, ''), participant_name) as participant_key,
+            LOWER(TRIM(participant_name)) as participant_key,
             participant_name,
             COALESCE(NULLIF(participant_email, ''), '') as participant_email,
             room_name,
@@ -5752,19 +5777,31 @@ def attendance_summary(date=None):
           WHERE event_date = '{date}'
             AND participant_name IS NOT NULL AND participant_name != ''
             AND room_name IS NOT NULL AND room_name != ''
-            AND participant_name NOT LIKE '%Scout%'
+            AND LOWER(participant_name) NOT LIKE '%scout%'
         ),
-        -- Per-participant first/last seen (duration computed later from actual room visits)
-        participant_duration AS (
+        -- Per-participant first/last seen in breakout rooms
+        participant_breakout_times AS (
           SELECT
             participant_key,
             MAX(participant_name) as participant_name,
             MAX(participant_email) as participant_email,
-            MIN(snapshot_time) as first_seen,
-            MAX(snapshot_time) as last_seen,
-            COUNT(DISTINCT snapshot_time) as snapshot_count
+            MIN(snapshot_time) as first_breakout,
+            MAX(snapshot_time) as last_breakout
           FROM snapshot_clean
           GROUP BY participant_key
+        ),
+        -- Combine webhook and snapshot participants
+        all_participants AS (
+          SELECT
+            COALESCE(w.participant_key, s.participant_key) as participant_key,
+            COALESCE(w.participant_name, s.participant_name) as participant_name,
+            COALESCE(NULLIF(w.participant_email, ''), s.participant_email, '') as participant_email,
+            w.main_joined,
+            w.main_left,
+            s.first_breakout,
+            s.last_breakout
+          FROM webhook_times w
+          FULL OUTER JOIN participant_breakout_times s ON w.participant_key = s.participant_key
         ),
         -- Detect room transitions
         snapshot_transitions AS (
@@ -5780,8 +5817,8 @@ def attendance_summary(date=None):
               OVER (PARTITION BY participant_key ORDER BY snapshot_time) as visit_id
           FROM snapshot_transitions
         ),
-        -- Room visits with duration
-        room_visits AS (
+        -- Breakout room visits with duration
+        breakout_visits AS (
           SELECT
             participant_key,
             room_name,
@@ -5791,13 +5828,12 @@ def attendance_summary(date=None):
             visit_id
           FROM visit_groups
           GROUP BY participant_key, room_name, visit_id
-          HAVING TIMESTAMP_DIFF(MAX(snapshot_time), MIN(snapshot_time), MINUTE) > 0
         ),
         -- Re-merge consecutive same-room visits
         remerge AS (
           SELECT *,
             LAG(room_name) OVER (PARTITION BY participant_key ORDER BY room_join_time) as prev_room_name
-          FROM room_visits
+          FROM breakout_visits
         ),
         remerge_groups AS (
           SELECT *,
@@ -5805,7 +5841,7 @@ def attendance_summary(date=None):
               OVER (PARTITION BY participant_key ORDER BY room_join_time) as merge_group
           FROM remerge
         ),
-        room_visits_final AS (
+        breakout_visits_final AS (
           SELECT
             participant_key,
             room_name,
@@ -5814,25 +5850,89 @@ def attendance_summary(date=None):
             TIMESTAMP_DIFF(MAX(room_leave_time), MIN(room_join_time), MINUTE) as duration_mins
           FROM remerge_groups
           GROUP BY participant_key, room_name, merge_group
+        ),
+        -- Calculate Main Room time (time in meeting but NOT in breakout rooms)
+        main_room_time AS (
+          SELECT
+            ap.participant_key,
+            ap.participant_name,
+            ap.participant_email,
+            ap.main_joined,
+            COALESCE(ap.main_left, ap.last_breakout, ap.main_joined) as main_left,
+            ap.first_breakout,
+            ap.last_breakout,
+            -- Main room time BEFORE first breakout
+            CASE
+              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NOT NULL
+              THEN GREATEST(0, TIMESTAMP_DIFF(ap.first_breakout, ap.main_joined, MINUTE))
+              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL AND ap.main_left IS NOT NULL
+              THEN GREATEST(0, TIMESTAMP_DIFF(ap.main_left, ap.main_joined, MINUTE))
+              ELSE 0
+            END as main_room_before_mins,
+            -- Main room time AFTER last breakout
+            CASE
+              WHEN ap.last_breakout IS NOT NULL AND ap.main_left IS NOT NULL
+              THEN GREATEST(0, TIMESTAMP_DIFF(ap.main_left, ap.last_breakout, MINUTE))
+              ELSE 0
+            END as main_room_after_mins
+          FROM all_participants ap
+        ),
+        -- Build main room visit records
+        main_room_visits AS (
+          SELECT
+            participant_key,
+            '0.Main Room' as room_name,
+            main_joined as join_time,
+            COALESCE(first_breakout, main_left) as leave_time,
+            main_room_before_mins as duration_mins,
+            0 as visit_order
+          FROM main_room_time
+          WHERE main_room_before_mins > 0 AND main_joined IS NOT NULL
+
+          UNION ALL
+
+          SELECT
+            participant_key,
+            '0.Main Room' as room_name,
+            last_breakout as join_time,
+            main_left as leave_time,
+            main_room_after_mins as duration_mins,
+            999 as visit_order
+          FROM main_room_time
+          WHERE main_room_after_mins > 0 AND last_breakout IS NOT NULL AND main_left IS NOT NULL
+        ),
+        -- Combine all room visits (main + breakout)
+        all_room_visits AS (
+          SELECT participant_key, room_name, join_time, leave_time, duration_mins
+          FROM breakout_visits_final
+          WHERE duration_mins > 0
+
+          UNION ALL
+
+          SELECT participant_key, room_name, join_time, leave_time, duration_mins
+          FROM main_room_visits
+          WHERE duration_mins > 0
         )
         SELECT
-          pd.participant_name as name,
-          pd.participant_email as email,
-          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.first_seen, INTERVAL 330 MINUTE)) as first_seen_ist,
-          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.last_seen, INTERVAL 330 MINUTE)) as last_seen_ist,
-          COALESCE(SUM(rv.duration_mins), 0) as total_duration_mins,
-          ARRAY_AGG(
-            STRUCT(
-              rv.room_name,
-              FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.join_time, INTERVAL 330 MINUTE)) as room_joined_ist,
-              FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.leave_time, INTERVAL 330 MINUTE)) as room_left_ist,
-              rv.duration_mins as room_duration_mins
-            ) ORDER BY rv.join_time
+          mrt.participant_name as name,
+          mrt.participant_email as email,
+          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(COALESCE(mrt.main_joined, mrt.first_breakout), INTERVAL 330 MINUTE)) as first_seen_ist,
+          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(COALESCE(mrt.main_left, mrt.last_breakout), INTERVAL 330 MINUTE)) as last_seen_ist,
+          COALESCE(mrt.main_joined, mrt.first_breakout) as sort_time,
+          COALESCE((SELECT SUM(duration_mins) FROM all_room_visits arv WHERE arv.participant_key = mrt.participant_key), 0) as total_duration_mins,
+          ARRAY(
+            SELECT AS STRUCT
+              room_name,
+              FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(join_time, INTERVAL 330 MINUTE)) as room_joined_ist,
+              FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(leave_time, INTERVAL 330 MINUTE)) as room_left_ist,
+              duration_mins as room_duration_mins
+            FROM all_room_visits arv
+            WHERE arv.participant_key = mrt.participant_key
+            ORDER BY join_time
           ) as room_visits
-        FROM participant_duration pd
-        LEFT JOIN room_visits_final rv ON pd.participant_key = rv.participant_key
-        GROUP BY pd.participant_name, pd.participant_email, pd.first_seen, pd.last_seen
-        ORDER BY pd.participant_name
+        FROM main_room_time mrt
+        WHERE mrt.participant_name IS NOT NULL
+        ORDER BY mrt.participant_name
         """
         results = list(client.query(query).result())
 
