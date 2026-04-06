@@ -6448,6 +6448,21 @@ def team_attendance(team_id, date):
             GROUP BY participant_name
         )
 
+        -- Main meeting time from webhooks (participant_joined / participant_left)
+        webhook_times AS (
+            SELECT
+                participant_name,
+                MIN(CASE WHEN event_type IN ('participant_joined', 'meeting.participant_joined')
+                    THEN TIMESTAMP_ADD(CAST(event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END) as meeting_joined,
+                MAX(CASE WHEN event_type IN ('participant_left', 'meeting.participant_left')
+                    THEN TIMESTAMP_ADD(CAST(event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END) as meeting_left
+            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}`
+            WHERE event_date = @report_date
+              AND participant_name IS NOT NULL AND participant_name != ''
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+            GROUP BY participant_name
+        )
+
         SELECT
             ps.participant_name,
             ps.participant_email,
@@ -6457,10 +6472,19 @@ def team_attendance(team_id, date):
             ps.snapshot_count,
             COALESCE(bs.total_break_seconds, 0) as break_seconds,
             COALESCE(bs.break_count, 0) as break_count,
-            COALESCE(iso.isolation_seconds, 0) as isolation_seconds
+            COALESCE(iso.isolation_seconds, 0) as isolation_seconds,
+            FORMAT_TIMESTAMP('%H:%M', wt.meeting_joined) as meeting_joined_ist,
+            FORMAT_TIMESTAMP('%H:%M', wt.meeting_left) as meeting_left_ist,
+            CASE WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
+                 THEN TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE)
+                 ELSE 0 END as meeting_duration_mins,
+            CASE WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
+                 THEN GREATEST(TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE) - ps.total_active_mins, 0)
+                 ELSE 0 END as main_room_mins
         FROM participant_summary ps
         LEFT JOIN break_summary bs ON ps.participant_name = bs.participant_name
         LEFT JOIN isolation_summary iso ON ps.participant_name = iso.participant_name
+        LEFT JOIN webhook_times wt ON LOWER(TRIM(ps.participant_name)) = LOWER(TRIM(wt.participant_name))
         ORDER BY ps.participant_name
         """
 
@@ -6491,39 +6515,119 @@ def team_attendance(team_id, date):
         all_members = list(client.query(members_q, job_config=team_config).result())
         present_names = {r.participant_name.lower().strip() for r in rows}
 
+        # Also get webhook-only participants (those in main meeting but never in breakout rooms)
+        webhook_only_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("report_date", "STRING", report_date)
+            ]
+        )
+        webhook_only_q = f"""
+        SELECT
+            pe.participant_name,
+            tm.participant_email,
+            FORMAT_TIMESTAMP('%H:%M',
+                MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
+                    THEN TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END)) as joined_ist,
+            FORMAT_TIMESTAMP('%H:%M',
+                MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
+                    THEN TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END)) as left_ist,
+            TIMESTAMP_DIFF(
+                MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
+                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
+                MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
+                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
+                MINUTE) as duration_mins
+        FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+        INNER JOIN `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
+            ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+            AND tm.team_id = @team_id
+        WHERE pe.event_date = @report_date
+          AND pe.participant_name IS NOT NULL
+          AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+        GROUP BY pe.participant_name, tm.participant_email
+        """
+        webhook_rows = {r.participant_name.lower().strip(): r
+                        for r in client.query(webhook_only_q, job_config=webhook_only_config).result()}
+
         participants = []
+        snapshot_names = set()
         for r in rows:
             break_mins = round(r.break_seconds / 60)
             iso_mins = round(r.isolation_seconds / 60)
+            # Total time = breakout room time + main room time
+            main_room = r.main_room_mins if r.main_room_mins else 0
+            meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
+            # Use the larger of: snapshot active time, or meeting duration (webhook)
+            total_mins = max(r.total_active_mins, meeting_dur) if meeting_dur > 0 else r.total_active_mins
+
+            # Hour-based status: >=5hr=Present, 4-5hr=Half Day, <4hr=Absent
+            if total_mins >= 300:
+                status = 'present'
+            elif total_mins >= 240:
+                status = 'half_day'
+            else:
+                status = 'absent'
+
             participants.append({
                 'name': r.participant_name,
                 'email': r.participant_email or '',
-                'first_seen_ist': r.first_seen_ist,
-                'last_seen_ist': r.last_seen_ist,
-                'total_duration_mins': r.total_active_mins,
+                'first_seen_ist': r.meeting_joined_ist or r.first_seen_ist,
+                'last_seen_ist': r.meeting_left_ist or r.last_seen_ist,
+                'total_duration_mins': total_mins,
+                'breakout_mins': r.total_active_mins,
+                'main_room_mins': main_room,
                 'break_minutes': break_mins,
-                'break_count': r.break_count,
                 'isolation_minutes': iso_mins,
-                'status': 'present'
+                'status': status
             })
+            snapshot_names.add(r.participant_name.lower().strip())
 
-        # Add absent members
+        # Add webhook-only participants (in main meeting but never went to breakout)
         for m in all_members:
-            if m.participant_name.lower().strip() not in present_names:
+            name_lower = m.participant_name.lower().strip()
+            if name_lower not in snapshot_names and name_lower in webhook_rows:
+                wr = webhook_rows[name_lower]
+                dur = wr.duration_mins or 0
+                if dur >= 300:
+                    status = 'present'
+                elif dur >= 240:
+                    status = 'half_day'
+                else:
+                    status = 'absent'
+                participants.append({
+                    'name': m.participant_name,
+                    'email': m.participant_email or '',
+                    'first_seen_ist': wr.joined_ist,
+                    'last_seen_ist': wr.left_ist,
+                    'total_duration_mins': dur,
+                    'breakout_mins': 0,
+                    'main_room_mins': dur,
+                    'break_minutes': 0,
+                    'isolation_minutes': 0,
+                    'status': status
+                })
+                snapshot_names.add(name_lower)
+
+        # Add fully absent members (not in snapshots and not in webhooks)
+        for m in all_members:
+            if m.participant_name.lower().strip() not in snapshot_names:
                 participants.append({
                     'name': m.participant_name,
                     'email': m.participant_email or '',
                     'first_seen_ist': None,
                     'last_seen_ist': None,
                     'total_duration_mins': 0,
+                    'breakout_mins': 0,
+                    'main_room_mins': 0,
                     'break_minutes': 0,
-                    'break_count': 0,
                     'isolation_minutes': 0,
                     'status': 'absent'
                 })
 
         total_members = len(all_members)
         present_count = len([p for p in participants if p['status'] == 'present'])
+        half_day_count = len([p for p in participants if p['status'] == 'half_day'])
 
         return jsonify({
             'success': True,
@@ -6533,11 +6637,323 @@ def team_attendance(team_id, date):
             'manager_name': manager_name,
             'total_members': total_members,
             'present_count': present_count,
-            'absent_count': total_members - present_count,
+            'half_day_count': half_day_count,
+            'absent_count': total_members - present_count - half_day_count,
             'participants': participants
         })
     except Exception as e:
         print(f"[Teams] Attendance error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/attendance/range', methods=['GET'])
+def team_attendance_range(team_id):
+    """Get team attendance for a date range. Query params: start, end"""
+    try:
+        ensure_team_tables_once()
+        start_date = validate_date_format(request.args.get('start'))
+        end_date = validate_date_format(request.args.get('end'))
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        query = f"""
+        WITH team_members AS (
+            SELECT participant_name, participant_email
+            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+            WHERE team_id = @team_id
+        ),
+        daily_stats AS (
+            SELECT
+                s.event_date,
+                s.participant_name,
+                MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as first_seen,
+                MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as last_seen,
+                TIMESTAMP_DIFF(
+                    MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)),
+                    MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)),
+                    MINUTE
+                ) as active_mins,
+                COUNT(DISTINCT s.snapshot_time) as snapshot_count
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND s.participant_name IS NOT NULL
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+            GROUP BY s.event_date, s.participant_name
+        ),
+        ordered_snaps AS (
+            SELECT
+                s.event_date,
+                s.participant_name,
+                s.snapshot_time,
+                LAG(s.snapshot_time) OVER (
+                    PARTITION BY s.event_date, s.participant_name ORDER BY s.snapshot_time
+                ) as prev_snapshot
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND s.participant_name IS NOT NULL
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+        ),
+        daily_breaks AS (
+            SELECT
+                event_date,
+                participant_name,
+                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60
+                    THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_seconds,
+                COUNT(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60 THEN 1 END) as break_count
+            FROM ordered_snaps
+            WHERE prev_snapshot IS NOT NULL
+            GROUP BY event_date, participant_name
+        ),
+        room_occupancy AS (
+            SELECT snapshot_time, room_name,
+                   COUNT(DISTINCT participant_name) as occupant_count
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date >= @start_date AND event_date <= @end_date
+              AND room_name IS NOT NULL AND room_name != ''
+              AND participant_name IS NOT NULL
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+            GROUP BY snapshot_time, room_name
+        ),
+        daily_isolation AS (
+            SELECT
+                s.event_date,
+                s.participant_name,
+                COUNT(*) * 30 as isolation_seconds
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+            INNER JOIN room_occupancy ro
+                ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND ro.occupant_count = 1
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+            GROUP BY s.event_date, s.participant_name
+        )
+        SELECT
+            ds.event_date,
+            ds.participant_name,
+            tm.participant_email,
+            FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
+            ds.active_mins,
+            COALESCE(ROUND(db.break_seconds / 60), 0) as break_mins,
+            COALESCE(db.break_count, 0) as break_count,
+            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins
+        FROM daily_stats ds
+        LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
+        LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_name = db.participant_name
+        LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_name = di.participant_name
+        ORDER BY ds.event_date, ds.participant_name
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
+                bigquery.ScalarQueryParameter("end_date", "STRING", end_date)
+            ]
+        )
+        rows = list(client.query(query, job_config=job_config).result())
+
+        # Team info
+        team_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )
+        team_rows = list(client.query(
+            f"SELECT team_name, manager_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id",
+            job_config=team_config
+        ).result())
+        team_name = team_rows[0].team_name if team_rows else 'Unknown'
+
+        # All team members for absent detection
+        all_members = list(client.query(
+            f"SELECT participant_name, participant_email FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id",
+            job_config=team_config
+        ).result())
+        all_member_names = [m.participant_name for m in all_members]
+
+        # Build daily_data with hour-based status
+        daily_data = []
+        for r in rows:
+            active = r.active_mins
+            if active >= 300:
+                status = 'Present'
+            elif active >= 240:
+                status = 'Half Day'
+            else:
+                status = 'Absent'
+            daily_data.append({
+                'date': str(r.event_date),
+                'name': r.participant_name,
+                'email': r.participant_email or '',
+                'first_seen_ist': r.first_seen_ist,
+                'last_seen_ist': r.last_seen_ist,
+                'active_minutes': active,
+                'break_minutes': int(r.break_mins),
+                'isolation_minutes': int(r.isolation_mins),
+                'status': status
+            })
+
+        # Per-member summary across date range
+        member_summary = {}
+        for r in daily_data:
+            name = r['name']
+            if name not in member_summary:
+                member_summary[name] = {
+                    'name': name, 'email': r['email'],
+                    'days_present': 0, 'total_active_mins': 0,
+                    'total_break_mins': 0, 'total_isolation_mins': 0
+                }
+            member_summary[name]['days_present'] += 1
+            member_summary[name]['total_active_mins'] += r['active_minutes']
+            member_summary[name]['total_break_mins'] += r['break_minutes']
+            member_summary[name]['total_isolation_mins'] += r['isolation_minutes']
+
+        # CSV export
+        if request.args.get('format') == 'csv':
+            import csv
+            import io
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Date', 'Name', 'Email', 'Status', 'First_Seen_IST', 'Last_Seen_IST',
+                             'Active_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
+            for r in daily_data:
+                writer.writerow([r['date'], r['name'], r['email'], r['status'],
+                                 r['first_seen_ist'], r['last_seen_ist'], r['active_minutes'],
+                                 r['break_minutes'], r['isolation_minutes']])
+            csv_content = output.getvalue()
+            filename = f"team_{team_name.replace(' ', '_')}_{start_date}_to_{end_date}.csv"
+            return Response(csv_content, mimetype='text/csv',
+                            headers={'Content-Disposition': f'attachment; filename={filename}'})
+
+        return jsonify({
+            'success': True,
+            'team_id': team_id,
+            'team_name': team_name,
+            'start_date': start_date,
+            'end_date': end_date,
+            'total_members': len(all_member_names),
+            'daily_data': daily_data,
+            'member_summary': list(member_summary.values())
+        })
+    except Exception as e:
+        print(f"[Teams] Range attendance error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/compare', methods=['GET'])
+def compare_teams():
+    """Compare multiple teams side-by-side. Query params: ids (comma-sep), date"""
+    try:
+        ensure_team_tables_once()
+        team_ids_str = request.args.get('ids', '')
+        if not team_ids_str:
+            return jsonify({'success': False, 'error': 'ids parameter required (comma-separated team IDs)'}), 400
+        team_ids = [tid.strip() for tid in team_ids_str.split(',') if tid.strip()]
+        report_date = validate_date_format(request.args.get('date'))
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        results = []
+        for team_id in team_ids:
+            # Team info
+            team_config = bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+            )
+            team_rows = list(client.query(
+                f"SELECT team_id, team_name, manager_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id",
+                job_config=team_config
+            ).result())
+            if not team_rows:
+                continue
+            t = team_rows[0]
+
+            # Members
+            all_members = list(client.query(
+                f"SELECT participant_name FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id",
+                job_config=team_config
+            ).result())
+            total_members = len(all_members)
+            member_names_lower = {m.participant_name.lower().strip() for m in all_members}
+
+            # Stats for the date
+            stats_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                    bigquery.ScalarQueryParameter("report_date", "STRING", report_date)
+                ]
+            )
+            stats_query = f"""
+            WITH team_members AS (
+                SELECT participant_name FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
+            ),
+            snaps AS (
+                SELECT
+                    s.participant_name,
+                    s.snapshot_time,
+                    TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
+                    LAG(s.snapshot_time) OVER (PARTITION BY s.participant_name ORDER BY s.snapshot_time) as prev_snapshot
+                FROM `{dataset_ref}.room_snapshots` s
+                INNER JOIN team_members tm ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+                WHERE s.event_date = @report_date
+                  AND s.room_name IS NOT NULL AND s.room_name != ''
+                  AND s.participant_name IS NOT NULL
+                  AND LOWER(s.participant_name) NOT LIKE '%scout%'
+            ),
+            per_person AS (
+                SELECT
+                    participant_name,
+                    MIN(snapshot_ist) as first_seen,
+                    MAX(snapshot_ist) as last_seen,
+                    TIMESTAMP_DIFF(MAX(snapshot_ist), MIN(snapshot_ist), MINUTE) as active_mins,
+                    SUM(CASE WHEN prev_snapshot IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60
+                        THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_secs
+                FROM snaps
+                GROUP BY participant_name
+            )
+            SELECT
+                COUNT(*) as present,
+                ROUND(AVG(active_mins), 0) as avg_active,
+                ROUND(AVG(break_secs / 60), 0) as avg_break,
+                FORMAT_TIMESTAMP('%H:%M', MIN(first_seen)) as earliest_arrival,
+                FORMAT_TIMESTAMP('%H:%M', MAX(last_seen)) as latest_departure
+            FROM per_person
+            """
+            stats_rows = list(client.query(stats_query, job_config=stats_config).result())
+            sr = stats_rows[0] if stats_rows else None
+
+            present_count = int(sr.present) if sr and sr.present else 0
+            results.append({
+                'team_id': t.team_id,
+                'team_name': t.team_name,
+                'manager_name': t.manager_name or '',
+                'total_members': total_members,
+                'present': present_count,
+                'absent': total_members - present_count,
+                'attendance_pct': round(present_count / total_members * 100) if total_members else 0,
+                'avg_active_mins': int(sr.avg_active) if sr and sr.avg_active else 0,
+                'avg_break_mins': int(sr.avg_break) if sr and sr.avg_break else 0,
+                'earliest_arrival': sr.earliest_arrival if sr else None,
+                'latest_departure': sr.latest_departure if sr else None
+            })
+
+        return jsonify({
+            'success': True,
+            'date': report_date,
+            'teams': results
+        })
+    except Exception as e:
+        print(f"[Teams] Compare error: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -6689,11 +7105,13 @@ def team_monthly_report(team_id):
             import io
             output = io.StringIO()
             writer = csv.writer(output)
-            writer.writerow(['Date', 'Name', 'Email', 'First_Seen_IST', 'Last_Seen_IST',
+            writer.writerow(['Date', 'Name', 'Email', 'Status', 'First_Seen_IST', 'Last_Seen_IST',
                              'Active_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
             for r in rows:
+                active = r.active_mins or 0
+                status = 'Present' if active >= 300 else 'Half Day' if active >= 240 else 'Absent'
                 writer.writerow([r.event_date, r.participant_name, r.participant_email or '',
-                                 r.first_seen_ist, r.last_seen_ist, r.active_mins,
+                                 status, r.first_seen_ist, r.last_seen_ist, active,
                                  r.break_mins, r.isolation_mins])
 
             csv_content = output.getvalue()
@@ -6707,13 +7125,16 @@ def team_monthly_report(team_id):
         # JSON response for dashboard display
         data = []
         for r in rows:
+            active = r.active_mins or 0
+            status = 'Present' if active >= 300 else 'Half Day' if active >= 240 else 'Absent'
             data.append({
                 'date': str(r.event_date),
                 'name': r.participant_name,
                 'email': r.participant_email or '',
+                'status': status,
                 'first_seen_ist': r.first_seen_ist,
                 'last_seen_ist': r.last_seen_ist,
-                'active_minutes': r.active_mins,
+                'active_minutes': active,
                 'break_minutes': int(r.break_mins),
                 'isolation_minutes': int(r.isolation_mins)
             })
@@ -6728,7 +7149,8 @@ def team_monthly_report(team_id):
                     'days_present': 0, 'total_active_mins': 0,
                     'total_break_mins': 0, 'total_isolation_mins': 0
                 }
-            member_summary[name]['days_present'] += 1
+            if r['status'] in ('Present', 'Half Day'):
+                member_summary[name]['days_present'] += 1
             member_summary[name]['total_active_mins'] += r['active_minutes']
             member_summary[name]['total_break_mins'] += r['break_minutes']
             member_summary[name]['total_isolation_mins'] += r['isolation_minutes']
