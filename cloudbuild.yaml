@@ -3,7 +3,7 @@ steps:
   - name: 'node:20'
     dir: 'breakout-calibrator'
     entrypoint: 'npm'
-    args: ['ci']
+    args: ['install']
 
   - name: 'node:20'
     dir: 'breakout-calibrator'
