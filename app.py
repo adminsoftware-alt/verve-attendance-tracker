@@ -2568,14 +2568,23 @@ def monitor_status():
         """
         result = list(client.query(query).result())
         row = result[0] if result else {}
+
+        # Format timestamps in IST for easy reading
+        first_snap = row.get('first_snapshot')
+        last_snap = row.get('last_snapshot')
+        first_ist = (first_snap + timedelta(hours=5, minutes=30)).strftime('%H:%M:%S') if first_snap else None
+        last_ist = (last_snap + timedelta(hours=5, minutes=30)).strftime('%H:%M:%S') if last_snap else None
+
         return jsonify({
             'success': True,
             'date': today,
             'snapshots': row.get('snapshot_count', 0),
             'rooms': row.get('room_count', 0),
             'participants': row.get('participant_count', 0),
-            'first_snapshot': str(row.get('first_snapshot', '')),
-            'last_snapshot': str(row.get('last_snapshot', ''))
+            'first_snapshot': str(first_snap) if first_snap else None,
+            'last_snapshot': str(last_snap) if last_snap else None,
+            'first_snapshot_ist': first_ist,
+            'last_snapshot_ist': last_ist
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -2654,15 +2663,25 @@ def monitor_health():
         is_meeting_hours = 9 <= ist_hour <= 20
         should_alert = status in ('STALE', 'NO_DATA') and is_meeting_hours
 
+        # Format timestamps in IST for easy reading
+        first_snap = row.get('first_snapshot')
+        last_snap = row.get('last_snapshot')
+        first_ist = (first_snap + timedelta(hours=5, minutes=30)).strftime('%H:%M:%S') if first_snap else None
+        last_ist = (last_snap + timedelta(hours=5, minutes=30)).strftime('%H:%M:%S') if last_snap else None
+        current_ist = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime('%H:%M:%S')
+
         return jsonify({
             'status': status,
             'message': message,
             'date': today,
+            'current_time_ist': current_ist,
             'snapshots_today': snapshot_count,
             'rooms_seen': row.get('room_count', 0) or 0,
             'participants_seen': row.get('participant_count', 0) or 0,
-            'first_snapshot': str(row.get('first_snapshot', '')),
-            'last_snapshot': str(row.get('last_snapshot', '')),
+            'first_snapshot': str(first_snap) if first_snap else None,
+            'last_snapshot': str(last_snap) if last_snap else None,
+            'first_snapshot_ist': first_ist,
+            'last_snapshot_ist': last_ist,
             'seconds_since_last': seconds_since,
             'is_meeting_hours': is_meeting_hours,
             'needs_attention': should_alert
