@@ -5986,16 +5986,6 @@ def attendance_heatmap(date=None):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/dashboard')
-@app.route('/dashboard/')
-def attendance_dashboard():
-    """Serve the standalone attendance dashboard HTML page"""
-    dashboard_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dashboard.html')
-    if os.path.exists(dashboard_path):
-        return send_from_directory(os.path.dirname(dashboard_path), 'dashboard.html')
-    return '<h1>Dashboard not found</h1><p>Place dashboard.html in the project root.</p>', 404
-
-
 # ==============================================================================
 # TEAM MANAGEMENT - CRUD for teams and members
 # ==============================================================================
