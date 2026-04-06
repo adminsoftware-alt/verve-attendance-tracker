@@ -24,6 +24,13 @@ function getParticipantEmail(p) {
   return p.email || p.participantEmail || p.user_email || '';
 }
 
+// Extract meeting ID from context (handles different SDK versions/formats)
+function extractMeetingId(context) {
+  if (!context) return '';
+  // Try various field names Zoom SDK might use
+  return String(context.meetingID || context.meetingId || context.mid || context.meeting_id || '');
+}
+
 function MonitorPanel() {
   const {
     isConfigured,
@@ -136,8 +143,9 @@ function MonitorPanel() {
       const totalParticipants = roomData.reduce((sum, r) => sum + r.participants.length, 0);
 
       // Send to backend
+      const meetingId = meetingIdRef.current || extractMeetingId(meetingContext);
       const response = await api.post('/monitor/snapshot', {
-        meeting_id: meetingIdRef.current || meetingContext?.meetingID || '',
+        meeting_id: meetingId,
         rooms: roomData
       });
 
@@ -167,7 +175,38 @@ function MonitorPanel() {
 
     try {
       const uuid = await getMeetingUUID();
-      meetingIdRef.current = meetingContext?.meetingID || '';
+
+      // Try multiple sources for meeting ID
+      let mid = extractMeetingId(meetingContext);
+
+      // Debug: log the full context to see what fields are available
+      addLog(`Meeting context: ${JSON.stringify(meetingContext)}`);
+
+      // Fallback: try to get meeting ID from getMeetingUUID response (some SDK versions include it)
+      if (!mid && uuid) {
+        // Some SDK versions return meeting ID as part of UUID or as separate field
+        // Also try extracting numeric part if UUID contains meeting ID
+        const numericMatch = uuid.match(/^(\d{9,11})/);
+        if (numericMatch) {
+          mid = numericMatch[1];
+          addLog(`Extracted meeting ID from UUID: ${mid}`);
+        }
+      }
+
+      // Last resort: Use the configured meeting ID (from env or hardcoded)
+      if (!mid) {
+        mid = process.env.REACT_APP_MEETING_ID || '9034027764';  // Fallback to known meeting ID
+        addLog(`Using fallback meeting ID: ${mid}`);
+      }
+
+      meetingIdRef.current = mid;
+
+      if (!meetingIdRef.current) {
+        addLog('ERROR: Could not get meeting ID from any source');
+        setErrors(prev => [...prev, 'Meeting ID not available - check SDK permissions']);
+        return;
+      }
+
       addLog(`Starting monitor for meeting ${meetingIdRef.current}`);
       addLog(`Meeting UUID: ${uuid}`);
 

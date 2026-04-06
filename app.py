@@ -17,7 +17,7 @@ HR Scout Bot Flow:
 6. Daily report generated and emailed
 """
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
 from google.cloud import bigquery
 from datetime import datetime, timedelta, timezone
@@ -90,12 +90,18 @@ CORS(app, resources={r"/*": {"origins": re.compile(r"https://.*\.(zoom\.us|zoom\
 @app.after_request
 def add_zoom_headers(response):
     # Do NOT set X-Frame-Options - allow Zoom to embed
-    # CORS headers - restrict to Zoom domains (flask-cors handles per-request origin matching)
+    # CORS headers - Zoom domains + attendance/dashboard endpoints open for external apps
     origin = request.headers.get('Origin', '')
+    path = request.path
     if origin and ('.zoom.us' in origin or '.zoom.com' in origin):
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    elif origin and (path.startswith('/attendance/') or path.startswith('/dashboard') or path.startswith('/teams')):
+        # Allow external apps (attendance manager) to call attendance & team APIs
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
 
     # OWASP Security Headers (required by Zoom Apps)
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
@@ -212,6 +218,8 @@ BQ_MAPPINGS_TABLE = 'room_mappings'
 BQ_CAMERA_TABLE = 'camera_events'
 BQ_QOS_TABLE = 'qos_data'
 BQ_CALIBRATION_STATE_TABLE = 'calibration_state'
+BQ_TEAMS_TABLE = 'teams'
+BQ_TEAM_MEMBERS_TABLE = 'team_members'
 
 # Email Configuration
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
@@ -2664,6 +2672,243 @@ def monitor_health():
             'status': 'ERROR',
             'message': str(e)
         }), 500
+
+
+# ═══════════════════════════════════════════════════════
+# SCOUT BOT HEALTH ALERT (called by Cloud Scheduler)
+# ═══════════════════════════════════════════════════════
+
+# Cooldown: don't send more than 1 alert per 30 minutes
+_alert_state = {'last_sent': 0, 'last_status': 'HEALTHY'}
+
+@app.route('/monitor/alert', methods=['POST', 'GET'])
+def monitor_alert():
+    """
+    Checks snapshot health and sends email alert to HR if Scout Bot
+    appears to have left the meeting or stopped sending snapshots.
+
+    Called by Cloud Scheduler every 5 minutes during meeting hours.
+    Has 30-minute cooldown to avoid email spam.
+
+    Alerts when:
+      - STALE: No snapshot for >5 minutes (bot may have disconnected)
+      - NO_DATA: No snapshots at all today (bot never joined)
+
+    Also alerts when bot RECOVERS (was down, now healthy again).
+    """
+    import time
+
+    today = get_ist_date()
+    ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    ist_hour = ist_now.hour
+    ist_time_str = ist_now.strftime('%H:%M IST')
+
+    # Only alert during meeting hours (9 AM - 8 PM IST)
+    if not (9 <= ist_hour <= 20):
+        return jsonify({
+            'action': 'skipped',
+            'reason': f'Outside meeting hours ({ist_time_str})',
+            'alert_sent': False
+        })
+
+    try:
+        client = get_bq_client()
+        query = f"""
+        SELECT
+          COUNT(DISTINCT snapshot_time) as snapshot_count,
+          COUNT(DISTINCT COALESCE(NULLIF(participant_email, ''), participant_name)) as participant_count,
+          MAX(snapshot_time) as last_snapshot,
+          TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(snapshot_time), SECOND) as seconds_since_last,
+          MAX(participant_name) as last_participant_seen
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+        WHERE event_date = '{today}'
+        """
+        result = list(client.query(query).result())
+        row = result[0] if result else {}
+
+        snapshot_count = row.get('snapshot_count', 0) or 0
+        seconds_since = row.get('seconds_since_last', None)
+        participant_count = row.get('participant_count', 0) or 0
+
+        # Determine status
+        if snapshot_count == 0:
+            status = 'NO_DATA'
+            problem = 'No snapshots received today. Scout Bot may not have joined the meeting.'
+            action = 'Check if the Scout Bot VM is running and the scheduled task triggered correctly.'
+        elif seconds_since is not None and seconds_since <= 300:
+            status = 'HEALTHY'
+            problem = None
+            action = None
+        else:
+            status = 'STALE'
+            mins_ago = int(seconds_since / 60) if seconds_since else '?'
+            problem = f'Last snapshot was {mins_ago} minutes ago. Scout Bot may have left the meeting or the Zoom App crashed.'
+            action = 'Check the Scout Bot VM. The bot may need to rejoin the meeting, or the Zoom App needs to be reopened.'
+
+        now = time.time()
+        cooldown = 1800  # 30 minutes
+        prev_status = _alert_state['last_status']
+
+        # Send alert if: problem detected AND cooldown expired
+        # Also send recovery notification if was down and now healthy
+        alert_sent = False
+        alert_type = None
+
+        if status in ('STALE', 'NO_DATA') and (now - _alert_state['last_sent']) > cooldown:
+            # Send problem alert
+            alert_sent = _send_scout_alert(
+                date=today,
+                status=status,
+                time_str=ist_time_str,
+                problem=problem,
+                action=action,
+                snapshot_count=snapshot_count,
+                participant_count=participant_count,
+                seconds_since=seconds_since,
+                alert_type='problem'
+            )
+            if alert_sent:
+                _alert_state['last_sent'] = now
+                alert_type = 'problem'
+
+        elif status == 'HEALTHY' and prev_status in ('STALE', 'NO_DATA'):
+            # Send recovery notification
+            alert_sent = _send_scout_alert(
+                date=today,
+                status='RECOVERED',
+                time_str=ist_time_str,
+                problem='Scout Bot is back online! Snapshots are being received again.',
+                action='No action needed. Monitoring has resumed normally.',
+                snapshot_count=snapshot_count,
+                participant_count=participant_count,
+                seconds_since=seconds_since,
+                alert_type='recovery'
+            )
+            alert_type = 'recovery'
+
+        _alert_state['last_status'] = status
+
+        return jsonify({
+            'status': status,
+            'date': today,
+            'time': ist_time_str,
+            'snapshots_today': snapshot_count,
+            'participants_today': participant_count,
+            'seconds_since_last': seconds_since,
+            'alert_sent': alert_sent,
+            'alert_type': alert_type,
+            'cooldown_remaining': max(0, int(cooldown - (now - _alert_state['last_sent'])))
+        })
+
+    except Exception as e:
+        print(f"[MonitorAlert] Error: {e}")
+        traceback.print_exc()
+        return jsonify({
+            'status': 'ERROR',
+            'message': str(e),
+            'alert_sent': False
+        }), 500
+
+
+def _send_scout_alert(date, status, time_str, problem, action, snapshot_count, participant_count, seconds_since, alert_type='problem'):
+    """Send Scout Bot health alert email via SendGrid"""
+    if not SENDGRID_API_KEY or not REPORT_EMAIL_TO:
+        print(f"[ScoutAlert] SendGrid not configured, skipping {alert_type} alert")
+        return False
+
+    try:
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To, Content
+
+        sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
+
+        if alert_type == 'recovery':
+            emoji = '\u2705'
+            color = '#059669'
+            bg_color = '#ecfdf5'
+            border_color = '#a7f3d0'
+            subject = f"{emoji} Scout Bot Recovered - {date} {time_str}"
+        else:
+            emoji = '\u{1F6A8}' if status == 'NO_DATA' else '\u26A0\uFE0F'
+            color = '#dc2626' if status == 'NO_DATA' else '#d97706'
+            bg_color = '#fef2f2' if status == 'NO_DATA' else '#fffbeb'
+            border_color = '#fecaca' if status == 'NO_DATA' else '#fde68a'
+            subject = f"{emoji} Scout Bot Alert: {status} - {date} {time_str}"
+
+        mins_ago = int(seconds_since / 60) if seconds_since else 'N/A'
+
+        html_content = f"""
+        <div style="font-family: 'Inter', Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <div style="background: linear-gradient(135deg, #0f2847, #1a365d); padding: 24px 30px; border-radius: 12px 12px 0 0;">
+            <h1 style="color: #fff; margin: 0; font-size: 20px;">
+              {emoji} Scout Bot Monitor
+            </h1>
+            <p style="color: rgba(255,255,255,0.7); margin: 4px 0 0; font-size: 13px;">
+              Verve Advisory - Attendance Tracker
+            </p>
+          </div>
+
+          <div style="background: {bg_color}; border: 1px solid {border_color}; border-top: none; padding: 20px 30px;">
+            <h2 style="color: {color}; margin: 0 0 8px; font-size: 18px;">
+              Status: {status}
+            </h2>
+            <p style="color: #374151; margin: 0; font-size: 14px; line-height: 1.6;">
+              {problem}
+            </p>
+          </div>
+
+          <div style="background: #fff; border: 1px solid #e5e7eb; border-top: none; padding: 20px 30px;">
+            <h3 style="color: #1e293b; margin: 0 0 12px; font-size: 14px;">Details</h3>
+            <table style="width: 100%; font-size: 13px; border-collapse: collapse;">
+              <tr><td style="padding: 6px 0; color: #64748b;">Date</td><td style="padding: 6px 0; font-weight: 600;">{date}</td></tr>
+              <tr><td style="padding: 6px 0; color: #64748b;">Time of Check</td><td style="padding: 6px 0; font-weight: 600;">{time_str}</td></tr>
+              <tr><td style="padding: 6px 0; color: #64748b;">Snapshots Today</td><td style="padding: 6px 0; font-weight: 600;">{snapshot_count}</td></tr>
+              <tr><td style="padding: 6px 0; color: #64748b;">Participants Seen</td><td style="padding: 6px 0; font-weight: 600;">{participant_count}</td></tr>
+              <tr><td style="padding: 6px 0; color: #64748b;">Last Snapshot</td><td style="padding: 6px 0; font-weight: 600;">{mins_ago} min ago</td></tr>
+            </table>
+          </div>
+
+          <div style="background: #f8fafc; border: 1px solid #e5e7eb; border-top: none; padding: 20px 30px; border-radius: 0 0 12px 12px;">
+            <h3 style="color: #1e293b; margin: 0 0 8px; font-size: 14px;">{'\u{1F527}' if alert_type != 'recovery' else '\u2705'} Action Required</h3>
+            <p style="color: #475569; margin: 0; font-size: 13px; line-height: 1.6;">{action}</p>
+
+            {'<div style="margin-top: 16px;"><h4 style="color: #1e293b; margin: 0 0 8px; font-size: 13px;">Quick Fix Steps:</h4><ol style="color: #475569; font-size: 13px; line-height: 1.8; padding-left: 20px;"><li>SSH into Scout Bot VM: <code style="background: #e2e8f0; padding: 2px 6px; border-radius: 4px;">34.47.178.82</code></li><li>Check if Zoom is running and the bot is in the meeting</li><li>If not, restart the scheduled task or manually join the meeting</li><li>Open the Zoom App to restart snapshot monitoring</li></ol></div>' if alert_type != 'recovery' else ''}
+
+            <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #e2e8f0;">
+              <a href="https://breakout-room-calibrator-1041741270489.us-central1.run.app/monitor/health"
+                 style="display: inline-block; padding: 8px 20px; background: #1a365d; color: #fff; text-decoration: none; border-radius: 8px; font-size: 13px; font-weight: 600;">
+                Check Health Dashboard
+              </a>
+              <a href="https://verve-attendance-tracker.vercel.app"
+                 style="display: inline-block; padding: 8px 20px; background: #fff; color: #1a365d; text-decoration: none; border-radius: 8px; font-size: 13px; font-weight: 600; border: 1px solid #d1d5db; margin-left: 8px;">
+                Open Attendance Tracker
+              </a>
+            </div>
+          </div>
+
+          <p style="color: #94a3b8; font-size: 11px; text-align: center; margin-top: 16px;">
+            Automated alert from Verve Attendance Tracker. Checks run every 5 minutes during 9 AM - 8 PM IST.
+          </p>
+        </div>
+        """
+
+        recipients = [r.strip() for r in REPORT_EMAIL_TO.replace(';', ',').split(',') if r.strip()]
+
+        mail = Mail(
+            from_email=Email(REPORT_EMAIL_FROM),
+            to_emails=[To(r) for r in recipients],
+            subject=subject,
+            html_content=Content("text/html", html_content)
+        )
+
+        response = sg.send(mail)
+        print(f"[ScoutAlert] {alert_type} email sent to {recipients}, status: {response.status_code}")
+        return response.status_code == 202
+
+    except Exception as e:
+        print(f"[ScoutAlert] Failed to send email: {e}")
+        traceback.print_exc()
+        return False
 
 
 # Rate limiter for signature error logging
@@ -5371,6 +5616,1146 @@ def test_camera_qos():
             'error': str(e),
             'meeting_id': meeting_id
         }), 500
+
+
+# ==============================================================================
+# ATTENDANCE DASHBOARD - Live View + Heatmap + Direct BigQuery Access
+# ==============================================================================
+
+@app.route('/attendance/live', methods=['GET'])
+def attendance_live():
+    """
+    Real-time: Who's in which room RIGHT NOW.
+    Returns latest snapshot data grouped by room.
+
+    GET /attendance/live
+    GET /attendance/live?date=2026-04-03
+    """
+    target_date = request.args.get('date', get_ist_date())
+    try:
+        target_date = validate_date_format(target_date)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    try:
+        client = get_bq_client()
+        query = f"""
+        WITH latest_snapshot AS (
+          SELECT MAX(snapshot_time) as max_time
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          WHERE event_date = '{target_date}'
+        ),
+        -- All room names seen during the entire day
+        all_rooms AS (
+          SELECT DISTINCT room_name
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          WHERE event_date = '{target_date}'
+            AND room_name IS NOT NULL AND room_name != ''
+        ),
+        -- Who is in each room at the latest snapshot
+        current_state AS (
+          SELECT
+            s.room_name,
+            s.participant_name,
+            s.participant_email,
+            s.snapshot_time
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` s
+          CROSS JOIN latest_snapshot ls
+          WHERE s.event_date = '{target_date}'
+            AND s.snapshot_time = ls.max_time
+            AND s.participant_name NOT LIKE '%Scout%'
+        )
+        SELECT
+          ar.room_name,
+          ARRAY_AGG(
+            STRUCT(cs.participant_name, cs.participant_email)
+          ) as participants,
+          COUNTIF(cs.participant_name IS NOT NULL) as participant_count,
+          MAX(cs.snapshot_time) as snapshot_time
+        FROM all_rooms ar
+        LEFT JOIN current_state cs ON ar.room_name = cs.room_name
+        GROUP BY ar.room_name
+        ORDER BY ar.room_name
+        """
+        results = list(client.query(query).result())
+
+        rooms = []
+        total_people = 0
+        occupied_count = 0
+        for row in results:
+            count = row.get('participant_count', 0)
+            # Filter out null participant entries from LEFT JOIN
+            participants = [dict(p) for p in row.get('participants', []) if p.get('participant_name')]
+            rooms.append({
+                'room_name': row.get('room_name', ''),
+                'participant_count': count,
+                'participants': participants
+            })
+            total_people += count
+            if count > 0:
+                occupied_count += 1
+
+        snapshot_time = ''
+        for row in results:
+            st = row.get('snapshot_time')
+            if st:
+                snapshot_time = str(st)
+                break
+
+        return jsonify({
+            'success': True,
+            'date': target_date,
+            'snapshot_time': snapshot_time,
+            'total_rooms': len(rooms),
+            'total_rooms_occupied': occupied_count,
+            'total_participants': total_people,
+            'rooms': rooms
+        })
+
+    except Exception as e:
+        print(f"[Attendance] Live error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/attendance/summary', methods=['GET'])
+@app.route('/attendance/summary/<date>', methods=['GET'])
+def attendance_summary(date=None):
+    """
+    Full attendance for a date - direct BigQuery, no CSV.
+    Total duration = first snapshot to last snapshot per participant.
+
+    GET /attendance/summary/2026-04-03
+    """
+    if date is None:
+        date = request.args.get('date', get_ist_date())
+    try:
+        date = validate_date_format(date)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    try:
+        client = get_bq_client()
+        query = f"""
+        WITH
+        -- Clean snapshots
+        snapshot_clean AS (
+          SELECT
+            COALESCE(NULLIF(participant_uuid, ''), participant_name) as participant_key,
+            participant_name,
+            COALESCE(NULLIF(participant_email, ''), '') as participant_email,
+            room_name,
+            snapshot_time
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          WHERE event_date = '{date}'
+            AND participant_name IS NOT NULL AND participant_name != ''
+            AND room_name IS NOT NULL AND room_name != ''
+            AND participant_name NOT LIKE '%Scout%'
+        ),
+        -- Per-participant first/last seen (duration computed later from actual room visits)
+        participant_duration AS (
+          SELECT
+            participant_key,
+            MAX(participant_name) as participant_name,
+            MAX(participant_email) as participant_email,
+            MIN(snapshot_time) as first_seen,
+            MAX(snapshot_time) as last_seen,
+            COUNT(DISTINCT snapshot_time) as snapshot_count
+          FROM snapshot_clean
+          GROUP BY participant_key
+        ),
+        -- Detect room transitions
+        snapshot_transitions AS (
+          SELECT *,
+            LAG(room_name) OVER (
+              PARTITION BY participant_key ORDER BY snapshot_time
+            ) as prev_room
+          FROM snapshot_clean
+        ),
+        visit_groups AS (
+          SELECT *,
+            SUM(CASE WHEN prev_room IS NULL OR room_name != prev_room THEN 1 ELSE 0 END)
+              OVER (PARTITION BY participant_key ORDER BY snapshot_time) as visit_id
+          FROM snapshot_transitions
+        ),
+        -- Room visits with duration
+        room_visits AS (
+          SELECT
+            participant_key,
+            room_name,
+            MIN(snapshot_time) as room_join_time,
+            MAX(snapshot_time) as room_leave_time,
+            TIMESTAMP_DIFF(MAX(snapshot_time), MIN(snapshot_time), MINUTE) as room_duration_mins,
+            visit_id
+          FROM visit_groups
+          GROUP BY participant_key, room_name, visit_id
+          HAVING TIMESTAMP_DIFF(MAX(snapshot_time), MIN(snapshot_time), MINUTE) > 0
+        ),
+        -- Re-merge consecutive same-room visits
+        remerge AS (
+          SELECT *,
+            LAG(room_name) OVER (PARTITION BY participant_key ORDER BY room_join_time) as prev_room_name
+          FROM room_visits
+        ),
+        remerge_groups AS (
+          SELECT *,
+            SUM(CASE WHEN prev_room_name IS NULL OR room_name != prev_room_name THEN 1 ELSE 0 END)
+              OVER (PARTITION BY participant_key ORDER BY room_join_time) as merge_group
+          FROM remerge
+        ),
+        room_visits_final AS (
+          SELECT
+            participant_key,
+            room_name,
+            MIN(room_join_time) as join_time,
+            MAX(room_leave_time) as leave_time,
+            TIMESTAMP_DIFF(MAX(room_leave_time), MIN(room_join_time), MINUTE) as duration_mins
+          FROM remerge_groups
+          GROUP BY participant_key, room_name, merge_group
+        )
+        SELECT
+          pd.participant_name as name,
+          pd.participant_email as email,
+          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.first_seen, INTERVAL 330 MINUTE)) as first_seen_ist,
+          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.last_seen, INTERVAL 330 MINUTE)) as last_seen_ist,
+          COALESCE(SUM(rv.duration_mins), 0) as total_duration_mins,
+          ARRAY_AGG(
+            STRUCT(
+              rv.room_name,
+              FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.join_time, INTERVAL 330 MINUTE)) as room_joined_ist,
+              FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(rv.leave_time, INTERVAL 330 MINUTE)) as room_left_ist,
+              rv.duration_mins as room_duration_mins
+            ) ORDER BY rv.join_time
+          ) as room_visits
+        FROM participant_duration pd
+        LEFT JOIN room_visits_final rv ON pd.participant_key = rv.participant_key
+        GROUP BY pd.participant_name, pd.participant_email, pd.first_seen, pd.last_seen
+        ORDER BY pd.participant_name
+        """
+        results = list(client.query(query).result())
+
+        participants = []
+        for row in results:
+            visits = [dict(v) for v in row.get('room_visits', []) if v.get('room_name')]
+            participants.append({
+                'name': row.get('name', ''),
+                'email': row.get('email', ''),
+                'first_seen_ist': row.get('first_seen_ist', ''),
+                'last_seen_ist': row.get('last_seen_ist', ''),
+                'total_duration_mins': row.get('total_duration_mins', 0),
+                'room_visits': visits
+            })
+
+        return jsonify({
+            'success': True,
+            'date': date,
+            'generated_at': datetime.utcnow().isoformat(),
+            'total_participants': len(participants),
+            'participants': participants
+        })
+
+    except Exception as e:
+        print(f"[Attendance] Summary error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/attendance/heatmap', methods=['GET'])
+@app.route('/attendance/heatmap/<date>', methods=['GET'])
+def attendance_heatmap(date=None):
+    """
+    Room utilization heatmap: participant count per room per 15-min slot.
+    Shows which rooms are overcrowded vs empty over time.
+
+    GET /attendance/heatmap/2026-04-03
+    GET /attendance/heatmap?date=2026-04-03&interval=30
+    """
+    if date is None:
+        date = request.args.get('date', get_ist_date())
+    try:
+        date = validate_date_format(date)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    interval = request.args.get('interval', '15')
+    try:
+        interval = int(interval)
+        if interval not in (5, 10, 15, 30, 60):
+            interval = 15
+    except ValueError:
+        interval = 15
+
+    try:
+        client = get_bq_client()
+        query = f"""
+        WITH snapshots AS (
+          SELECT
+            room_name,
+            participant_name,
+            snapshot_time,
+            TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          WHERE event_date = '{date}'
+            AND participant_name NOT LIKE '%Scout%'
+            AND room_name IS NOT NULL AND room_name != ''
+        ),
+        -- Bucket each snapshot into time slots
+        time_bucketed AS (
+          SELECT
+            room_name,
+            participant_name,
+            TIMESTAMP_TRUNC(snapshot_ist, MINUTE) as snapshot_min,
+            FORMAT_TIMESTAMP('%H:%M',
+              TIMESTAMP_SECONDS(
+                DIV(UNIX_SECONDS(TIMESTAMP_TRUNC(snapshot_ist, MINUTE)), {interval} * 60) * {interval} * 60
+              )
+            ) as time_slot
+          FROM snapshots
+        ),
+        -- Count distinct participants per room per slot
+        room_slot_counts AS (
+          SELECT
+            room_name,
+            time_slot,
+            COUNT(DISTINCT participant_name) as participant_count
+          FROM time_bucketed
+          GROUP BY room_name, time_slot
+        ),
+        -- Room summary stats
+        room_stats AS (
+          SELECT
+            room_name,
+            MAX(participant_count) as peak_count,
+            AVG(participant_count) as avg_count,
+            COUNT(DISTINCT time_slot) as active_slots
+          FROM room_slot_counts
+          GROUP BY room_name
+        ),
+        -- All time slots
+        all_slots AS (
+          SELECT DISTINCT time_slot FROM room_slot_counts
+        )
+        SELECT
+          rs.room_name,
+          rs.peak_count,
+          ROUND(rs.avg_count, 1) as avg_count,
+          rs.active_slots,
+          ARRAY_AGG(
+            STRUCT(rsc.time_slot, rsc.participant_count)
+            ORDER BY rsc.time_slot
+          ) as time_slots
+        FROM room_stats rs
+        JOIN room_slot_counts rsc ON rs.room_name = rsc.room_name
+        GROUP BY rs.room_name, rs.peak_count, rs.avg_count, rs.active_slots
+        ORDER BY rs.peak_count DESC, rs.room_name
+        """
+        results = list(client.query(query).result())
+
+        # Build heatmap data
+        rooms = []
+        all_time_slots = set()
+        for row in results:
+            slots = {}
+            for s in row.get('time_slots', []):
+                slot_key = s.get('time_slot', '')
+                slots[slot_key] = s.get('participant_count', 0)
+                all_time_slots.add(slot_key)
+
+            rooms.append({
+                'room_name': row.get('room_name', ''),
+                'peak_count': row.get('peak_count', 0),
+                'avg_count': float(row.get('avg_count', 0)),
+                'active_slots': row.get('active_slots', 0),
+                'time_slots': slots
+            })
+
+        sorted_slots = sorted(all_time_slots)
+
+        return jsonify({
+            'success': True,
+            'date': date,
+            'interval_minutes': interval,
+            'time_slots': sorted_slots,
+            'total_rooms': len(rooms),
+            'rooms': rooms
+        })
+
+    except Exception as e:
+        print(f"[Attendance] Heatmap error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/dashboard')
+@app.route('/dashboard/')
+def attendance_dashboard():
+    """Serve the standalone attendance dashboard HTML page"""
+    dashboard_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dashboard.html')
+    if os.path.exists(dashboard_path):
+        return send_from_directory(os.path.dirname(dashboard_path), 'dashboard.html')
+    return '<h1>Dashboard not found</h1><p>Place dashboard.html in the project root.</p>', 404
+
+
+# ==============================================================================
+# TEAM MANAGEMENT - CRUD for teams and members
+# ==============================================================================
+
+def ensure_team_tables():
+    """Create teams and team_members tables if they don't exist"""
+    client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+    # Teams table
+    teams_sql = f"""
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{BQ_TEAMS_TABLE}` (
+        team_id STRING NOT NULL,
+        team_name STRING NOT NULL,
+        manager_name STRING,
+        manager_email STRING,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    client.query(teams_sql).result()
+
+    # Team members table
+    members_sql = f"""
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` (
+        member_id STRING NOT NULL,
+        team_id STRING NOT NULL,
+        participant_name STRING NOT NULL,
+        participant_email STRING,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    client.query(members_sql).result()
+    print("[Teams] Tables ensured")
+
+
+_team_tables_ensured = False
+
+def ensure_team_tables_once():
+    global _team_tables_ensured
+    if not _team_tables_ensured:
+        ensure_team_tables()
+        _team_tables_ensured = True
+
+
+@app.route('/teams', methods=['GET'])
+def list_teams():
+    """List all teams with member counts"""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        query = f"""
+        SELECT t.team_id, t.team_name, t.manager_name, t.manager_email,
+               t.created_at, t.updated_at,
+               COUNT(m.member_id) as member_count
+        FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` t
+        LEFT JOIN `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` m ON t.team_id = m.team_id
+        GROUP BY t.team_id, t.team_name, t.manager_name, t.manager_email, t.created_at, t.updated_at
+        ORDER BY t.team_name
+        """
+        rows = list(client.query(query).result())
+        teams = []
+        for r in rows:
+            teams.append({
+                'team_id': r.team_id,
+                'team_name': r.team_name,
+                'manager_name': r.manager_name or '',
+                'manager_email': r.manager_email or '',
+                'member_count': r.member_count,
+                'created_at': r.created_at.isoformat() if r.created_at else None,
+                'updated_at': r.updated_at.isoformat() if r.updated_at else None
+            })
+        return jsonify({'success': True, 'teams': teams})
+    except Exception as e:
+        print(f"[Teams] List error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams', methods=['POST'])
+def create_team():
+    """Create a new team"""
+    try:
+        ensure_team_tables_once()
+        data = request.json or {}
+        team_name = (data.get('team_name') or '').strip()
+        if not team_name:
+            return jsonify({'success': False, 'error': 'team_name is required'}), 400
+
+        manager_name = (data.get('manager_name') or '').strip()
+        manager_email = (data.get('manager_email') or '').strip()
+        team_id = str(uuid_lib.uuid4())
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        table_ref = f"{dataset_ref}.{BQ_TEAMS_TABLE}"
+
+        rows = [{'team_id': team_id, 'team_name': team_name,
+                 'manager_name': manager_name, 'manager_email': manager_email,
+                 'created_at': datetime.utcnow().isoformat(),
+                 'updated_at': datetime.utcnow().isoformat()}]
+        errors = client.insert_rows_json(table_ref, rows)
+        if errors:
+            return jsonify({'success': False, 'error': str(errors)}), 500
+
+        print(f"[Teams] Created team '{team_name}' ({team_id})")
+        return jsonify({'success': True, 'team_id': team_id, 'team_name': team_name})
+    except Exception as e:
+        print(f"[Teams] Create error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>', methods=['GET'])
+def get_team(team_id):
+    """Get team details with all members"""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Get team info
+        team_q = f"""
+        SELECT team_id, team_name, manager_name, manager_email, created_at, updated_at
+        FROM `{dataset_ref}.{BQ_TEAMS_TABLE}`
+        WHERE team_id = @team_id
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )
+        team_rows = list(client.query(team_q, job_config=job_config).result())
+        if not team_rows:
+            return jsonify({'success': False, 'error': 'Team not found'}), 404
+
+        t = team_rows[0]
+
+        # Get members
+        members_q = f"""
+        SELECT member_id, participant_name, participant_email, added_at
+        FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+        WHERE team_id = @team_id
+        ORDER BY participant_name
+        """
+        member_rows = list(client.query(members_q, job_config=job_config).result())
+        members = [{'member_id': m.member_id, 'participant_name': m.participant_name,
+                     'participant_email': m.participant_email or '',
+                     'added_at': m.added_at.isoformat() if m.added_at else None}
+                    for m in member_rows]
+
+        return jsonify({
+            'success': True,
+            'team': {
+                'team_id': t.team_id, 'team_name': t.team_name,
+                'manager_name': t.manager_name or '', 'manager_email': t.manager_email or '',
+                'members': members
+            }
+        })
+    except Exception as e:
+        print(f"[Teams] Get error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>', methods=['PUT'])
+def update_team(team_id):
+    """Update team name/manager"""
+    try:
+        ensure_team_tables_once()
+        data = request.json or {}
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        updates = []
+        params = [bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+
+        if 'team_name' in data:
+            updates.append("team_name = @team_name")
+            params.append(bigquery.ScalarQueryParameter("team_name", "STRING", data['team_name'].strip()))
+        if 'manager_name' in data:
+            updates.append("manager_name = @manager_name")
+            params.append(bigquery.ScalarQueryParameter("manager_name", "STRING", data['manager_name'].strip()))
+        if 'manager_email' in data:
+            updates.append("manager_email = @manager_email")
+            params.append(bigquery.ScalarQueryParameter("manager_email", "STRING", data['manager_email'].strip()))
+
+        if not updates:
+            return jsonify({'success': False, 'error': 'No fields to update'}), 400
+
+        updates.append("updated_at = CURRENT_TIMESTAMP()")
+
+        query = f"""
+        UPDATE `{dataset_ref}.{BQ_TEAMS_TABLE}`
+        SET {', '.join(updates)}
+        WHERE team_id = @team_id
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        client.query(query, job_config=job_config).result()
+
+        print(f"[Teams] Updated team {team_id}")
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Teams] Update error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>', methods=['DELETE'])
+def delete_team(team_id):
+    """Delete team and all its members"""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )
+
+        # Delete members first
+        client.query(
+            f"DELETE FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id",
+            job_config=job_config
+        ).result()
+
+        # Delete team
+        client.query(
+            f"DELETE FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id",
+            job_config=job_config
+        ).result()
+
+        print(f"[Teams] Deleted team {team_id}")
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Teams] Delete error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/members', methods=['POST'])
+def add_team_member(team_id):
+    """Add a member to a team"""
+    try:
+        ensure_team_tables_once()
+        data = request.json or {}
+        participant_name = (data.get('participant_name') or '').strip()
+        if not participant_name:
+            return jsonify({'success': False, 'error': 'participant_name is required'}), 400
+
+        participant_email = (data.get('participant_email') or '').strip()
+        member_id = str(uuid_lib.uuid4())
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        table_ref = f"{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}"
+
+        rows = [{'member_id': member_id, 'team_id': team_id,
+                 'participant_name': participant_name,
+                 'participant_email': participant_email,
+                 'added_at': datetime.utcnow().isoformat()}]
+        errors = client.insert_rows_json(table_ref, rows)
+        if errors:
+            return jsonify({'success': False, 'error': str(errors)}), 500
+
+        print(f"[Teams] Added member '{participant_name}' to team {team_id}")
+        return jsonify({'success': True, 'member_id': member_id})
+    except Exception as e:
+        print(f"[Teams] Add member error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/members/<member_id>', methods=['DELETE'])
+def remove_team_member(team_id, member_id):
+    """Remove a member from a team"""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("member_id", "STRING", member_id)
+            ]
+        )
+        client.query(
+            f"DELETE FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id AND member_id = @member_id",
+            job_config=job_config
+        ).result()
+
+        print(f"[Teams] Removed member {member_id} from team {team_id}")
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Teams] Remove member error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/participants', methods=['GET'])
+def list_known_participants():
+    """Get distinct participants from recent snapshots (for adding to teams)"""
+    try:
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        query = f"""
+        SELECT DISTINCT participant_name, participant_email
+        FROM `{dataset_ref}.room_snapshots`
+        WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND LOWER(participant_name) NOT LIKE '%scout%'
+          AND participant_name IS NOT NULL AND participant_name != ''
+        ORDER BY participant_name
+        """
+        rows = list(client.query(query).result())
+        participants = [{'participant_name': r.participant_name,
+                         'participant_email': r.participant_email or ''}
+                        for r in rows]
+        return jsonify({'success': True, 'participants': participants})
+    except Exception as e:
+        print(f"[Teams] Participants list error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# TEAM ATTENDANCE - Break time, Isolation, Team-wise view
+# ==============================================================================
+
+@app.route('/teams/<team_id>/attendance/<date>', methods=['GET'])
+def team_attendance(team_id, date):
+    """Get team attendance for a specific date with break & isolation time"""
+    try:
+        ensure_team_tables_once()
+        report_date = validate_date_format(date)
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Big query: get team info, members, and their attendance from snapshots
+        query = f"""
+        WITH team_info AS (
+            SELECT team_id, team_name, manager_name
+            FROM `{dataset_ref}.{BQ_TEAMS_TABLE}`
+            WHERE team_id = @team_id
+        ),
+        team_members AS (
+            SELECT participant_name, participant_email
+            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+            WHERE team_id = @team_id
+        ),
+        clean_snapshots AS (
+            SELECT
+                s.snapshot_time,
+                s.participant_name,
+                s.participant_email,
+                s.room_name,
+                TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+            WHERE s.event_date = @report_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND s.participant_name IS NOT NULL AND s.participant_name != ''
+        ),
+        -- All snapshot times for the day (to detect breaks)
+        all_times AS (
+            SELECT DISTINCT snapshot_time
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date = @report_date
+              AND room_name IS NOT NULL AND room_name != ''
+            ORDER BY snapshot_time
+        ),
+        -- Room transitions per participant
+        transitions AS (
+            SELECT *,
+                LAG(room_name) OVER (PARTITION BY participant_name ORDER BY snapshot_time) as prev_room,
+                LAG(snapshot_time) OVER (PARTITION BY participant_name ORDER BY snapshot_time) as prev_time
+            FROM clean_snapshots
+        ),
+        -- Visit groups
+        visits_raw AS (
+            SELECT
+                participant_name,
+                participant_email,
+                room_name,
+                MIN(snapshot_ist) as visit_start,
+                MAX(snapshot_ist) as visit_end,
+                TIMESTAMP_DIFF(MAX(snapshot_ist), MIN(snapshot_ist), MINUTE) as duration_mins,
+                SUM(CASE WHEN room_name = prev_room THEN 0 ELSE 1 END) as visit_group
+            FROM transitions
+            GROUP BY participant_name, participant_email, room_name,
+                     CASE WHEN room_name != COALESCE(prev_room, '') THEN
+                         FORMAT_TIMESTAMP('%Y%m%d%H%M', snapshot_ist) ELSE NULL END
+        ),
+        -- Per-participant summary
+        participant_summary AS (
+            SELECT
+                cs.participant_name,
+                cs.participant_email,
+                MIN(cs.snapshot_ist) as first_seen,
+                MAX(cs.snapshot_ist) as last_seen,
+                TIMESTAMP_DIFF(MAX(cs.snapshot_ist), MIN(cs.snapshot_ist), MINUTE) as total_active_mins,
+                COUNT(DISTINCT cs.snapshot_time) as snapshot_count
+            FROM clean_snapshots cs
+            GROUP BY cs.participant_name, cs.participant_email
+        ),
+        -- Break detection: find gaps where participant was NOT seen
+        participant_snapshots AS (
+            SELECT
+                cs.participant_name,
+                cs.snapshot_time,
+                LAG(cs.snapshot_time) OVER (PARTITION BY cs.participant_name ORDER BY cs.snapshot_time) as prev_snapshot
+            FROM clean_snapshots cs
+        ),
+        break_gaps AS (
+            SELECT
+                participant_name,
+                TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) as gap_seconds
+            FROM participant_snapshots
+            WHERE prev_snapshot IS NOT NULL
+              AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60
+        ),
+        break_summary AS (
+            SELECT
+                participant_name,
+                SUM(CASE WHEN gap_seconds > 60 THEN gap_seconds - 30 ELSE 0 END) as total_break_seconds,
+                COUNT(CASE WHEN gap_seconds > 60 THEN 1 END) as break_count
+            FROM break_gaps
+            GROUP BY participant_name
+        ),
+        -- Isolation: times when participant was alone in their room
+        room_occupancy AS (
+            SELECT
+                snapshot_time,
+                room_name,
+                COUNT(DISTINCT participant_name) as occupant_count
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date = @report_date
+              AND room_name IS NOT NULL AND room_name != ''
+              AND participant_name IS NOT NULL AND participant_name != ''
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+            GROUP BY snapshot_time, room_name
+        ),
+        isolation_snapshots AS (
+            SELECT
+                cs.participant_name,
+                cs.snapshot_time,
+                cs.room_name
+            FROM clean_snapshots cs
+            INNER JOIN room_occupancy ro
+                ON cs.snapshot_time = ro.snapshot_time AND cs.room_name = ro.room_name
+            WHERE ro.occupant_count = 1
+        ),
+        isolation_summary AS (
+            SELECT
+                participant_name,
+                COUNT(*) * 30 as isolation_seconds
+            FROM isolation_snapshots
+            GROUP BY participant_name
+        )
+
+        SELECT
+            ps.participant_name,
+            ps.participant_email,
+            FORMAT_TIMESTAMP('%H:%M', ps.first_seen) as first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', ps.last_seen) as last_seen_ist,
+            ps.total_active_mins,
+            ps.snapshot_count,
+            COALESCE(bs.total_break_seconds, 0) as break_seconds,
+            COALESCE(bs.break_count, 0) as break_count,
+            COALESCE(iso.isolation_seconds, 0) as isolation_seconds
+        FROM participant_summary ps
+        LEFT JOIN break_summary bs ON ps.participant_name = bs.participant_name
+        LEFT JOIN isolation_summary iso ON ps.participant_name = iso.participant_name
+        ORDER BY ps.participant_name
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("report_date", "STRING", report_date)
+            ]
+        )
+        rows = list(client.query(query, job_config=job_config).result())
+
+        # Get team info
+        team_q = f"""
+        SELECT team_name, manager_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id
+        """
+        team_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )
+        team_rows = list(client.query(team_q, job_config=team_config).result())
+        team_name = team_rows[0].team_name if team_rows else 'Unknown'
+        manager_name = team_rows[0].manager_name if team_rows else ''
+
+        # Get all team member names for "absent" detection
+        members_q = f"""
+        SELECT participant_name, participant_email
+        FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
+        """
+        all_members = list(client.query(members_q, job_config=team_config).result())
+        present_names = {r.participant_name.lower().strip() for r in rows}
+
+        participants = []
+        for r in rows:
+            break_mins = round(r.break_seconds / 60)
+            iso_mins = round(r.isolation_seconds / 60)
+            participants.append({
+                'name': r.participant_name,
+                'email': r.participant_email or '',
+                'first_seen_ist': r.first_seen_ist,
+                'last_seen_ist': r.last_seen_ist,
+                'total_duration_mins': r.total_active_mins,
+                'break_minutes': break_mins,
+                'break_count': r.break_count,
+                'isolation_minutes': iso_mins,
+                'status': 'present'
+            })
+
+        # Add absent members
+        for m in all_members:
+            if m.participant_name.lower().strip() not in present_names:
+                participants.append({
+                    'name': m.participant_name,
+                    'email': m.participant_email or '',
+                    'first_seen_ist': None,
+                    'last_seen_ist': None,
+                    'total_duration_mins': 0,
+                    'break_minutes': 0,
+                    'break_count': 0,
+                    'isolation_minutes': 0,
+                    'status': 'absent'
+                })
+
+        total_members = len(all_members)
+        present_count = len([p for p in participants if p['status'] == 'present'])
+
+        return jsonify({
+            'success': True,
+            'date': report_date,
+            'team_id': team_id,
+            'team_name': team_name,
+            'manager_name': manager_name,
+            'total_members': total_members,
+            'present_count': present_count,
+            'absent_count': total_members - present_count,
+            'participants': participants
+        })
+    except Exception as e:
+        print(f"[Teams] Attendance error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/report/monthly', methods=['GET'])
+def team_monthly_report(team_id):
+    """Generate monthly CSV report for a team. Query params: year, month"""
+    try:
+        ensure_team_tables_once()
+        year = request.args.get('year', str(get_ist_now().year))
+        month = request.args.get('month', str(get_ist_now().month))
+
+        year = int(year)
+        month = int(month)
+        if month < 1 or month > 12:
+            return jsonify({'success': False, 'error': 'Invalid month'}), 400
+
+        # Date range for the month
+        from calendar import monthrange
+        _, last_day = monthrange(year, month)
+        start_date = f"{year}-{month:02d}-01"
+        end_date = f"{year}-{month:02d}-{last_day:02d}"
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Get team info
+        team_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )
+        team_rows = list(client.query(
+            f"SELECT team_name, manager_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id",
+            job_config=team_config
+        ).result())
+        if not team_rows:
+            return jsonify({'success': False, 'error': 'Team not found'}), 404
+        team_name = team_rows[0].team_name
+
+        # Monthly query: per member, per date stats
+        query = f"""
+        WITH team_members AS (
+            SELECT participant_name, participant_email
+            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+            WHERE team_id = @team_id
+        ),
+        daily_stats AS (
+            SELECT
+                s.event_date,
+                s.participant_name,
+                MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as first_seen,
+                MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as last_seen,
+                TIMESTAMP_DIFF(
+                    MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)),
+                    MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)),
+                    MINUTE
+                ) as active_mins,
+                COUNT(DISTINCT s.snapshot_time) as snapshot_count
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND s.participant_name IS NOT NULL
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+            GROUP BY s.event_date, s.participant_name
+        ),
+        -- Break detection per day
+        ordered_snaps AS (
+            SELECT
+                s.event_date,
+                s.participant_name,
+                s.snapshot_time,
+                LAG(s.snapshot_time) OVER (
+                    PARTITION BY s.event_date, s.participant_name ORDER BY s.snapshot_time
+                ) as prev_snapshot
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND s.participant_name IS NOT NULL
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+        ),
+        daily_breaks AS (
+            SELECT
+                event_date,
+                participant_name,
+                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60
+                    THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_seconds
+            FROM ordered_snaps
+            WHERE prev_snapshot IS NOT NULL
+            GROUP BY event_date, participant_name
+        ),
+        -- Isolation per day
+        room_occupancy AS (
+            SELECT snapshot_time, room_name,
+                   COUNT(DISTINCT participant_name) as occupant_count
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date >= @start_date AND event_date <= @end_date
+              AND room_name IS NOT NULL AND room_name != ''
+              AND participant_name IS NOT NULL
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+            GROUP BY snapshot_time, room_name
+        ),
+        daily_isolation AS (
+            SELECT
+                s.event_date,
+                s.participant_name,
+                COUNT(*) * 30 as isolation_seconds
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+            INNER JOIN room_occupancy ro
+                ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND ro.occupant_count = 1
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+            GROUP BY s.event_date, s.participant_name
+        )
+
+        SELECT
+            ds.event_date,
+            ds.participant_name,
+            tm.participant_email,
+            FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
+            ds.active_mins,
+            COALESCE(ROUND(db.break_seconds / 60), 0) as break_mins,
+            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins
+        FROM daily_stats ds
+        LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
+        LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_name = db.participant_name
+        LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_name = di.participant_name
+        ORDER BY ds.participant_name, ds.event_date
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
+                bigquery.ScalarQueryParameter("end_date", "STRING", end_date)
+            ]
+        )
+        rows = list(client.query(query, job_config=job_config).result())
+
+        # Check if download=csv requested
+        if request.args.get('format') == 'csv':
+            import csv
+            import io
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Date', 'Name', 'Email', 'First_Seen_IST', 'Last_Seen_IST',
+                             'Active_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
+            for r in rows:
+                writer.writerow([r.event_date, r.participant_name, r.participant_email or '',
+                                 r.first_seen_ist, r.last_seen_ist, r.active_mins,
+                                 r.break_mins, r.isolation_mins])
+
+            csv_content = output.getvalue()
+            filename = f"team_{team_name.replace(' ', '_')}_{year}_{month:02d}.csv"
+            return Response(
+                csv_content,
+                mimetype='text/csv',
+                headers={'Content-Disposition': f'attachment; filename={filename}'}
+            )
+
+        # JSON response for dashboard display
+        data = []
+        for r in rows:
+            data.append({
+                'date': str(r.event_date),
+                'name': r.participant_name,
+                'email': r.participant_email or '',
+                'first_seen_ist': r.first_seen_ist,
+                'last_seen_ist': r.last_seen_ist,
+                'active_minutes': r.active_mins,
+                'break_minutes': int(r.break_mins),
+                'isolation_minutes': int(r.isolation_mins)
+            })
+
+        # Summary per member across the month
+        member_summary = {}
+        for r in data:
+            name = r['name']
+            if name not in member_summary:
+                member_summary[name] = {
+                    'name': name, 'email': r['email'],
+                    'days_present': 0, 'total_active_mins': 0,
+                    'total_break_mins': 0, 'total_isolation_mins': 0
+                }
+            member_summary[name]['days_present'] += 1
+            member_summary[name]['total_active_mins'] += r['active_minutes']
+            member_summary[name]['total_break_mins'] += r['break_minutes']
+            member_summary[name]['total_isolation_mins'] += r['isolation_minutes']
+
+        return jsonify({
+            'success': True,
+            'team_id': team_id,
+            'team_name': team_name,
+            'year': year,
+            'month': month,
+            'start_date': start_date,
+            'end_date': end_date,
+            'daily_data': data,
+            'member_summary': list(member_summary.values())
+        })
+    except Exception as e:
+        print(f"[Teams] Monthly report error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # ==============================================================================
