@@ -83,7 +83,7 @@ REACT_BUILD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bre
 STATIC_PATH = os.path.join(REACT_BUILD_PATH, 'static')
 app = Flask(__name__, static_folder=STATIC_PATH, static_url_path='/app/static')
 import re
-CORS(app, resources={r"/*": {"origins": re.compile(r"https://.*\.(zoom\.us|zoom\.com)$"), "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
+CORS(app, resources={r"/*": {"origins": re.compile(r"https://.*\.(zoom\.us|zoom\.com)$"), "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
 
 
 # Headers for Zoom Apps - allow embedding
@@ -6167,13 +6167,13 @@ def update_team(team_id):
 
         if 'team_name' in data:
             updates.append("team_name = @team_name")
-            params.append(bigquery.ScalarQueryParameter("team_name", "STRING", data['team_name'].strip()))
+            params.append(bigquery.ScalarQueryParameter("team_name", "STRING", str(data['team_name'] or '').strip()))
         if 'manager_name' in data:
             updates.append("manager_name = @manager_name")
-            params.append(bigquery.ScalarQueryParameter("manager_name", "STRING", data['manager_name'].strip()))
+            params.append(bigquery.ScalarQueryParameter("manager_name", "STRING", str(data['manager_name'] or '').strip()))
         if 'manager_email' in data:
             updates.append("manager_email = @manager_email")
-            params.append(bigquery.ScalarQueryParameter("manager_email", "STRING", data['manager_email'].strip()))
+            params.append(bigquery.ScalarQueryParameter("manager_email", "STRING", str(data['manager_email'] or '').strip()))
 
         if not updates:
             return jsonify({'success': False, 'error': 'No fields to update'}), 400
@@ -6350,36 +6350,6 @@ def team_attendance(team_id, date):
             WHERE s.event_date = @report_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
-        ),
-        -- All snapshot times for the day (to detect breaks)
-        all_times AS (
-            SELECT DISTINCT snapshot_time
-            FROM `{dataset_ref}.room_snapshots`
-            WHERE event_date = @report_date
-              AND room_name IS NOT NULL AND room_name != ''
-            ORDER BY snapshot_time
-        ),
-        -- Room transitions per participant
-        transitions AS (
-            SELECT *,
-                LAG(room_name) OVER (PARTITION BY participant_name ORDER BY snapshot_time) as prev_room,
-                LAG(snapshot_time) OVER (PARTITION BY participant_name ORDER BY snapshot_time) as prev_time
-            FROM clean_snapshots
-        ),
-        -- Visit groups
-        visits_raw AS (
-            SELECT
-                participant_name,
-                participant_email,
-                room_name,
-                MIN(snapshot_ist) as visit_start,
-                MAX(snapshot_ist) as visit_end,
-                TIMESTAMP_DIFF(MAX(snapshot_ist), MIN(snapshot_ist), MINUTE) as duration_mins,
-                SUM(CASE WHEN room_name = prev_room THEN 0 ELSE 1 END) as visit_group
-            FROM transitions
-            GROUP BY participant_name, participant_email, room_name,
-                     CASE WHEN room_name != COALESCE(prev_room, '') THEN
-                         FORMAT_TIMESTAMP('%Y%m%d%H%M', snapshot_ist) ELSE NULL END
         ),
         -- Per-participant summary
         participant_summary AS (
@@ -6812,7 +6782,8 @@ def team_attendance_range(team_id):
                     'days_present': 0, 'total_active_mins': 0,
                     'total_break_mins': 0, 'total_isolation_mins': 0
                 }
-            member_summary[name]['days_present'] += 1
+            if r['status'] in ('Present', 'Half Day'):
+                member_summary[name]['days_present'] += 1
             member_summary[name]['total_active_mins'] += r['active_minutes']
             member_summary[name]['total_break_mins'] += r['break_minutes']
             member_summary[name]['total_isolation_mins'] += r['isolation_minutes']
@@ -7212,6 +7183,240 @@ def team_monthly_report(team_id):
     except Exception as e:
         print(f"[Teams] Monthly report error: {e}")
         traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# AUTH ENDPOINTS (BigQuery-based)
+# ==============================================================================
+
+@app.route('/auth/login', methods=['POST'])
+def auth_login():
+    """Login endpoint - validates username/password against BigQuery users table"""
+    try:
+        data = request.get_json() or {}
+        username = data.get('username', '').strip()
+        password = data.get('password', '').strip()
+
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Username and password required'}), 400
+
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+        query = f"""
+            SELECT user_id, username, name, role, email
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.app_users`
+            WHERE username = @username AND password = @password
+            LIMIT 1
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("username", "STRING", username),
+                bigquery.ScalarQueryParameter("password", "STRING", password),
+            ]
+        )
+        results = list(client.query(query, job_config=job_config).result())
+
+        if not results:
+            return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
+
+        user = results[0]
+        return jsonify({
+            'success': True,
+            'user': {
+                'id': user.user_id,
+                'username': user.username,
+                'name': user.name,
+                'role': user.role,
+                'email': user.email
+            }
+        })
+    except Exception as e:
+        print(f"[Auth] Login error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/auth/users', methods=['GET'])
+def auth_list_users():
+    """List all users (admin only in production)"""
+    try:
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+        query = f"""
+            SELECT user_id, username, name, role, email
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.app_users`
+            ORDER BY user_id
+        """
+        results = list(client.query(query).result())
+        users = [{'id': r.user_id, 'username': r.username, 'name': r.name, 'role': r.role, 'email': r.email} for r in results]
+        return jsonify({'success': True, 'users': users})
+    except Exception as e:
+        print(f"[Auth] List users error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# ATTENDANCE DATA ENDPOINTS (Replaces Supabase)
+# ==============================================================================
+
+@app.route('/data/attendance', methods=['GET'])
+def data_get_all_attendance():
+    """Get all attendance data (report_date + employees JSON)"""
+    try:
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+        query = f"""
+            SELECT report_date, employees, uploaded_by, uploaded_at
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.attendance_reports`
+            ORDER BY report_date
+        """
+        results = list(client.query(query).result())
+        dates = []
+        for r in results:
+            emp_data = r.employees
+            if isinstance(emp_data, str):
+                try:
+                    emp_data = json.loads(emp_data)
+                except:
+                    pass
+            dates.append({
+                'report_date': str(r.report_date),
+                'employees': emp_data,
+                'uploaded_by': r.uploaded_by,
+                'uploaded_at': str(r.uploaded_at) if r.uploaded_at else None
+            })
+        return jsonify({'success': True, 'dates': dates})
+    except Exception as e:
+        print(f"[Data] Get all attendance error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/data/attendance/dates', methods=['GET'])
+def data_get_attendance_dates():
+    """Get list of dates with attendance data"""
+    try:
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+        query = f"""
+            SELECT report_date
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.attendance_reports`
+            ORDER BY report_date
+        """
+        results = list(client.query(query).result())
+        dates = [str(r.report_date) for r in results]
+        return jsonify({'success': True, 'dates': dates})
+    except Exception as e:
+        print(f"[Data] Get dates error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/data/attendance/<date>', methods=['GET'])
+def data_get_day_attendance(date):
+    """Get attendance data for a specific date"""
+    try:
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+        query = f"""
+            SELECT employees
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.attendance_reports`
+            WHERE report_date = @date
+            LIMIT 1
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "STRING", date)]
+        )
+        results = list(client.query(query, job_config=job_config).result())
+        if not results:
+            return jsonify({'success': False, 'error': 'Date not found'}), 404
+
+        emp_data = results[0].employees
+        if isinstance(emp_data, str):
+            try:
+                emp_data = json.loads(emp_data)
+            except:
+                pass
+        return jsonify({'success': True, 'employees': emp_data})
+    except Exception as e:
+        print(f"[Data] Get day attendance error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/data/attendance', methods=['POST'])
+def data_save_attendance():
+    """Save/update attendance data for a date"""
+    try:
+        data = request.get_json() or {}
+        report_date = data.get('report_date')
+        employees = data.get('employees')
+        uploaded_by = data.get('uploaded_by', 'unknown')
+
+        if not report_date or employees is None:
+            return jsonify({'success': False, 'error': 'report_date and employees required'}), 400
+
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+
+        # Check if date exists
+        check_query = f"""
+            SELECT id FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.attendance_reports`
+            WHERE report_date = @date LIMIT 1
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "STRING", report_date)]
+        )
+        existing = list(client.query(check_query, job_config=job_config).result())
+
+        employees_json = json.dumps(employees) if not isinstance(employees, str) else employees
+
+        if existing:
+            # Update
+            update_query = f"""
+                UPDATE `{GCP_PROJECT_ID}.{BQ_DATASET}.attendance_reports`
+                SET employees = @employees,
+                    uploaded_by = @uploaded_by,
+                    uploaded_at = CURRENT_TIMESTAMP()
+                WHERE report_date = @date
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("employees", "STRING", employees_json),
+                    bigquery.ScalarQueryParameter("uploaded_by", "STRING", uploaded_by),
+                    bigquery.ScalarQueryParameter("date", "STRING", report_date),
+                ]
+            )
+            client.query(update_query, job_config=job_config).result()
+        else:
+            # Insert
+            table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.attendance_reports"
+            rows = [{
+                'report_date': report_date,
+                'employees': employees_json,
+                'uploaded_by': uploaded_by,
+                'uploaded_at': datetime.utcnow().isoformat()
+            }]
+            errors = client.insert_rows_json(table_id, rows)
+            if errors:
+                return jsonify({'success': False, 'error': str(errors)}), 500
+
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Data] Save attendance error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/data/attendance/<date>', methods=['DELETE'])
+def data_delete_attendance(date):
+    """Delete attendance data for a date"""
+    try:
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+        query = f"""
+            DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.attendance_reports`
+            WHERE report_date = @date
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "STRING", date)]
+        )
+        client.query(query, job_config=job_config).result()
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Data] Delete attendance error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
