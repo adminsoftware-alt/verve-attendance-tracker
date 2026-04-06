@@ -2836,6 +2836,8 @@ def _send_scout_alert(date, status, time_str, problem, action, snapshot_count, p
             subject = f"{emoji} Scout Bot Alert: {status} - {date} {time_str}"
 
         mins_ago = int(seconds_since / 60) if seconds_since else 'N/A'
+        action_emoji = '\U0001F527' if alert_type != 'recovery' else '\u2705'
+        quick_fix_html = '<div style="margin-top: 16px;"><h4 style="color: #1e293b; margin: 0 0 8px; font-size: 13px;">Quick Fix Steps:</h4><ol style="color: #475569; font-size: 13px; line-height: 1.8; padding-left: 20px;"><li>SSH into Scout Bot VM: <code style="background: #e2e8f0; padding: 2px 6px; border-radius: 4px;">34.47.178.82</code></li><li>Check if Zoom is running and the bot is in the meeting</li><li>If not, restart the scheduled task or manually join the meeting</li><li>Open the Zoom App to restart snapshot monitoring</li></ol></div>' if alert_type != 'recovery' else ''
 
         html_content = f"""
         <div style="font-family: 'Inter', Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -2869,10 +2871,10 @@ def _send_scout_alert(date, status, time_str, problem, action, snapshot_count, p
           </div>
 
           <div style="background: #f8fafc; border: 1px solid #e5e7eb; border-top: none; padding: 20px 30px; border-radius: 0 0 12px 12px;">
-            <h3 style="color: #1e293b; margin: 0 0 8px; font-size: 14px;">{'\U0001F527' if alert_type != 'recovery' else '\u2705'} Action Required</h3>
+            <h3 style="color: #1e293b; margin: 0 0 8px; font-size: 14px;">{action_emoji} Action Required</h3>
             <p style="color: #475569; margin: 0; font-size: 13px; line-height: 1.6;">{action}</p>
 
-            {'<div style="margin-top: 16px;"><h4 style="color: #1e293b; margin: 0 0 8px; font-size: 13px;">Quick Fix Steps:</h4><ol style="color: #475569; font-size: 13px; line-height: 1.8; padding-left: 20px;"><li>SSH into Scout Bot VM: <code style="background: #e2e8f0; padding: 2px 6px; border-radius: 4px;">34.47.178.82</code></li><li>Check if Zoom is running and the bot is in the meeting</li><li>If not, restart the scheduled task or manually join the meeting</li><li>Open the Zoom App to restart snapshot monitoring</li></ol></div>' if alert_type != 'recovery' else ''}
+            {quick_fix_html}
 
             <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #e2e8f0;">
               <a href="https://breakout-room-calibrator-1041741270489.us-central1.run.app/monitor/health"
