@@ -231,7 +231,7 @@ def add_zoom_headers(response):
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    elif origin and (path.startswith('/attendance/') or path.startswith('/dashboard') or path.startswith('/teams') or path.startswith('/auth/') or path.startswith('/data/')):
+    elif origin and (path.startswith('/attendance/') or path.startswith('/dashboard') or path.startswith('/teams') or path.startswith('/auth/') or path.startswith('/data/') or path.startswith('/employees')):
         # Allow external apps (attendance manager) to call attendance, team, auth & data APIs
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
