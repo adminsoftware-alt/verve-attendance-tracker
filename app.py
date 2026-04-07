@@ -6055,6 +6055,38 @@ def list_teams():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/teams/fix-managers', methods=['POST'])
+def fix_team_managers():
+    """Set manager_name = team_name for all teams where manager is empty.
+    This enables manager-based filtering for team logins.
+    """
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Update all teams: set manager_name = team_name where manager is empty
+        query = f"""
+        UPDATE `{dataset_ref}.{BQ_TEAMS_TABLE}`
+        SET manager_name = team_name, updated_at = CURRENT_TIMESTAMP()
+        WHERE manager_name IS NULL OR TRIM(manager_name) = ''
+        """
+        job = client.query(query)
+        job.result()
+        updated_count = job.num_dml_affected_rows or 0
+
+        print(f"[Teams] Fixed {updated_count} team manager_names")
+        return jsonify({
+            'success': True,
+            'message': f'Updated {updated_count} teams',
+            'updated_count': updated_count
+        })
+    except Exception as e:
+        print(f"[Teams] Fix managers error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/teams', methods=['POST'])
 def create_team():
     """Create a new team"""
