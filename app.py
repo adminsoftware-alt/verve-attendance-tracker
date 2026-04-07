@@ -8138,7 +8138,9 @@ def auth_create_user():
             return jsonify({'success': False, 'error': 'role must be admin, hr, or manager'}), 400
 
         client = bigquery.Client(project=GCP_PROJECT_ID)
-        user_id = f'u{str(uuid_lib.uuid4())[:8]}'
+        # Generate numeric user_id (timestamp-based for uniqueness)
+        import time
+        user_id = int(time.time() * 1000) % 2147483647  # Keep within INT range
 
         errors = client.insert_rows_json(
             f"{GCP_PROJECT_ID}.{BQ_DATASET}.app_users",
