@@ -8101,10 +8101,12 @@ def auth_login():
             return jsonify({'success': False, 'error': 'Username and password required'}), 400
 
         client = bigquery.Client(project=GCP_PROJECT_ID)
+        # Case-insensitive username match, trim whitespace
         query = f"""
             SELECT user_id, username, name, role, email
             FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.app_users`
-            WHERE username = @username AND password = @password
+            WHERE LOWER(TRIM(username)) = LOWER(@username)
+              AND TRIM(password) = @password
             LIMIT 1
         """
         job_config = bigquery.QueryJobConfig(
