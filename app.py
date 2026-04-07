@@ -76,6 +76,140 @@ def validate_date_format(date_str):
     return date_str
 
 # ==============================================================================
+# PARTICIPANT NAME NORMALIZATION
+# ==============================================================================
+# Zoom creates duplicate entries when someone rejoins:
+#   "Aastha Chandwani", "Aastha Chandwani-1", "Aastha Chandwani-2"
+#   "Aman Paul", "Aman Paul-5"
+#   "Yashasvi Dhakate", "Yashasvi Dhakate_accurest"
+# This normalizes names so all entries merge into one person.
+
+import re as _re
+
+def normalize_participant_name(name):
+    """Strip Zoom rejoin suffixes to get the base participant name.
+    'Aastha Chandwani-2' -> 'Aastha Chandwani'
+    'Geo Prithvipal-1' -> 'Geo Prithvipal'
+    'Yashasvi Dhakate_accurest' -> 'Yashasvi Dhakate'
+    'CS Shweta Tulsani-KPRC' -> 'CS Shweta Tulsani'
+    'Gayatri Dabi - KPRC' -> 'Gayatri Dabi'
+    'Ronit 2' -> 'Ronit'
+    """
+    if not name:
+        return name
+    n = name.strip()
+    # Remove trailing " - TEXT" (space dash space suffix)
+    n = _re.sub(r'\s+-\s+\w+$', '', n)
+    # Remove trailing "-N" (number suffix like -1, -2, -5)
+    n = _re.sub(r'-\d+$', '', n)
+    # Remove trailing "_text" (underscore suffix like _accurest, _KPRC)
+    n = _re.sub(r'_\w+$', '', n)
+    # Remove trailing "-text" (dash suffix like -Meeting, -KPRC, -Vridam)
+    n = _re.sub(r'-[A-Za-z]\w*$', '', n)
+    # Remove trailing " N" where N is a single digit (like "Ronit 2")
+    n = _re.sub(r'\s+\d$', '', n)
+    return n.strip()
+
+
+def merge_participants_by_name(participants, mode='summary'):
+    """Merge duplicate participant entries by normalized name.
+
+    For summary mode: merge room_visits, pick best email, earliest/latest times.
+    For live mode: merge participant lists, pick best email.
+    For team mode: merge durations, breaks, isolation.
+    """
+    merged = {}
+    for p in participants:
+        base_name = normalize_participant_name(p.get('name') or p.get('participant_name', ''))
+        if not base_name:
+            continue
+
+        key = base_name.lower().strip()
+
+        if key not in merged:
+            merged[key] = {**p}
+            # Store the cleanest name (the base name)
+            if 'name' in merged[key]:
+                merged[key]['name'] = base_name
+            if 'participant_name' in merged[key]:
+                merged[key]['participant_name'] = base_name
+            continue
+
+        existing = merged[key]
+
+        # Pick best email (non-empty)
+        for email_key in ['email', 'participant_email']:
+            if email_key in p and p[email_key] and not existing.get(email_key):
+                existing[email_key] = p[email_key]
+
+        if mode == 'summary':
+            # Merge room visits
+            existing_visits = existing.get('room_visits', [])
+            new_visits = p.get('room_visits', [])
+            existing['room_visits'] = sorted(
+                existing_visits + new_visits,
+                key=lambda v: v.get('room_joined_ist', '') or ''
+            )
+            # Earliest first_seen, latest last_seen
+            for time_key in ['first_seen_ist']:
+                if p.get(time_key) and (not existing.get(time_key) or p[time_key] < existing[time_key]):
+                    existing[time_key] = p[time_key]
+            for time_key in ['last_seen_ist']:
+                if p.get(time_key) and (not existing.get(time_key) or p[time_key] > existing[time_key]):
+                    existing[time_key] = p[time_key]
+            # Sum duration
+            existing['total_duration_mins'] = existing.get('total_duration_mins', 0) + p.get('total_duration_mins', 0)
+
+        elif mode == 'team':
+            # Earliest first_seen, latest last_seen
+            for time_key in ['first_seen_ist']:
+                if p.get(time_key) and (not existing.get(time_key) or p[time_key] < existing[time_key]):
+                    existing[time_key] = p[time_key]
+            for time_key in ['last_seen_ist']:
+                if p.get(time_key) and (not existing.get(time_key) or p[time_key] > existing[time_key]):
+                    existing[time_key] = p[time_key]
+            # Sum numeric fields
+            for num_key in ['total_duration_mins', 'breakout_mins', 'main_room_mins',
+                            'break_minutes', 'isolation_minutes']:
+                if num_key in p:
+                    existing[num_key] = existing.get(num_key, 0) + (p.get(num_key) or 0)
+            # Best status: present > half_day > absent
+            status_rank = {'present': 3, 'half_day': 2, 'absent': 1}
+            if status_rank.get(p.get('status'), 0) > status_rank.get(existing.get('status'), 0):
+                existing['status'] = p['status']
+
+        elif mode == 'live':
+            # Merge participant lists (for live room view)
+            pass  # Live mode handled separately at room level
+
+    return list(merged.values())
+
+
+def merge_live_rooms(rooms):
+    """Merge duplicate participants within rooms for /attendance/live.
+    If same normalized name appears in multiple entries, merge them."""
+    for room in rooms:
+        if 'participants' not in room:
+            continue
+        seen = {}
+        merged_participants = []
+        for p in room['participants']:
+            base = normalize_participant_name(p.get('participant_name', ''))
+            key = base.lower().strip()
+            if key in seen:
+                # Pick better email
+                if p.get('participant_email') and not seen[key].get('participant_email'):
+                    seen[key]['participant_email'] = p['participant_email']
+                continue
+            p_copy = {**p, 'participant_name': base}
+            seen[key] = p_copy
+            merged_participants.append(p_copy)
+        room['participants'] = merged_participants
+        room['participant_count'] = len(merged_participants)
+    return rooms
+
+
+# ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 
@@ -2694,242 +2828,18 @@ def monitor_health():
 
 
 # ═══════════════════════════════════════════════════════
-# SCOUT BOT HEALTH ALERT (called by Cloud Scheduler)
+# ALERTING: Use GCP Cloud Monitoring (not SendGrid)
 # ═══════════════════════════════════════════════════════
-
-# Cooldown: don't send more than 1 alert per 30 minutes
-_alert_state = {'last_sent': 0, 'last_status': 'HEALTHY'}
-
-@app.route('/monitor/alert', methods=['POST', 'GET'])
-def monitor_alert():
-    """
-    Checks snapshot health and sends email alert to HR if Scout Bot
-    appears to have left the meeting or stopped sending snapshots.
-
-    Called by Cloud Scheduler every 5 minutes during meeting hours.
-    Has 30-minute cooldown to avoid email spam.
-
-    Alerts when:
-      - STALE: No snapshot for >5 minutes (bot may have disconnected)
-      - NO_DATA: No snapshots at all today (bot never joined)
-
-    Also alerts when bot RECOVERS (was down, now healthy again).
-    """
-    import time
-
-    today = get_ist_date()
-    ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    ist_hour = ist_now.hour
-    ist_time_str = ist_now.strftime('%H:%M IST')
-
-    # Only alert during meeting hours (9 AM - 8 PM IST)
-    if not (9 <= ist_hour <= 20):
-        return jsonify({
-            'action': 'skipped',
-            'reason': f'Outside meeting hours ({ist_time_str})',
-            'alert_sent': False
-        })
-
-    try:
-        client = get_bq_client()
-        query = f"""
-        SELECT
-          COUNT(DISTINCT snapshot_time) as snapshot_count,
-          COUNT(DISTINCT COALESCE(NULLIF(participant_email, ''), participant_name)) as participant_count,
-          MAX(snapshot_time) as last_snapshot,
-          TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(snapshot_time), SECOND) as seconds_since_last,
-          MAX(participant_name) as last_participant_seen
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
-        WHERE event_date = '{today}'
-        """
-        result = list(client.query(query).result())
-        row = result[0] if result else {}
-
-        snapshot_count = row.get('snapshot_count', 0) or 0
-        seconds_since = row.get('seconds_since_last', None)
-        participant_count = row.get('participant_count', 0) or 0
-
-        # Determine status
-        if snapshot_count == 0:
-            status = 'NO_DATA'
-            problem = 'No snapshots received today. Scout Bot may not have joined the meeting.'
-            action = 'Check if the Scout Bot VM is running and the scheduled task triggered correctly.'
-        elif seconds_since is not None and seconds_since <= 300:
-            status = 'HEALTHY'
-            problem = None
-            action = None
-        else:
-            status = 'STALE'
-            mins_ago = int(seconds_since / 60) if seconds_since else '?'
-            problem = f'Last snapshot was {mins_ago} minutes ago. Scout Bot may have left the meeting or the Zoom App crashed.'
-            action = 'Check the Scout Bot VM. The bot may need to rejoin the meeting, or the Zoom App needs to be reopened.'
-
-        now = time.time()
-        cooldown = 1800  # 30 minutes
-        prev_status = _alert_state['last_status']
-
-        # Send alert if: problem detected AND cooldown expired
-        # Also send recovery notification if was down and now healthy
-        alert_sent = False
-        alert_type = None
-
-        if status in ('STALE', 'NO_DATA') and (now - _alert_state['last_sent']) > cooldown:
-            # Send problem alert
-            alert_sent = _send_scout_alert(
-                date=today,
-                status=status,
-                time_str=ist_time_str,
-                problem=problem,
-                action=action,
-                snapshot_count=snapshot_count,
-                participant_count=participant_count,
-                seconds_since=seconds_since,
-                alert_type='problem'
-            )
-            if alert_sent:
-                _alert_state['last_sent'] = now
-                alert_type = 'problem'
-
-        elif status == 'HEALTHY' and prev_status in ('STALE', 'NO_DATA'):
-            # Send recovery notification
-            alert_sent = _send_scout_alert(
-                date=today,
-                status='RECOVERED',
-                time_str=ist_time_str,
-                problem='Scout Bot is back online! Snapshots are being received again.',
-                action='No action needed. Monitoring has resumed normally.',
-                snapshot_count=snapshot_count,
-                participant_count=participant_count,
-                seconds_since=seconds_since,
-                alert_type='recovery'
-            )
-            alert_type = 'recovery'
-
-        _alert_state['last_status'] = status
-
-        return jsonify({
-            'status': status,
-            'date': today,
-            'time': ist_time_str,
-            'snapshots_today': snapshot_count,
-            'participants_today': participant_count,
-            'seconds_since_last': seconds_since,
-            'alert_sent': alert_sent,
-            'alert_type': alert_type,
-            'cooldown_remaining': max(0, int(cooldown - (now - _alert_state['last_sent'])))
-        })
-
-    except Exception as e:
-        print(f"[MonitorAlert] Error: {e}")
-        traceback.print_exc()
-        return jsonify({
-            'status': 'ERROR',
-            'message': str(e),
-            'alert_sent': False
-        }), 500
-
-
-def _send_scout_alert(date, status, time_str, problem, action, snapshot_count, participant_count, seconds_since, alert_type='problem'):
-    """Send Scout Bot health alert email via SendGrid"""
-    if not SENDGRID_API_KEY or not REPORT_EMAIL_TO:
-        print(f"[ScoutAlert] SendGrid not configured, skipping {alert_type} alert")
-        return False
-
-    try:
-        import sendgrid
-        from sendgrid.helpers.mail import Mail, Email, To, Content
-
-        sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
-
-        if alert_type == 'recovery':
-            emoji = '\u2705'
-            color = '#059669'
-            bg_color = '#ecfdf5'
-            border_color = '#a7f3d0'
-            subject = f"{emoji} Scout Bot Recovered - {date} {time_str}"
-        else:
-            emoji = '\U0001F6A8' if status == 'NO_DATA' else '\u26A0\uFE0F'
-            color = '#dc2626' if status == 'NO_DATA' else '#d97706'
-            bg_color = '#fef2f2' if status == 'NO_DATA' else '#fffbeb'
-            border_color = '#fecaca' if status == 'NO_DATA' else '#fde68a'
-            subject = f"{emoji} Scout Bot Alert: {status} - {date} {time_str}"
-
-        mins_ago = int(seconds_since / 60) if seconds_since else 'N/A'
-        action_emoji = '\U0001F527' if alert_type != 'recovery' else '\u2705'
-        quick_fix_html = '<div style="margin-top: 16px;"><h4 style="color: #1e293b; margin: 0 0 8px; font-size: 13px;">Quick Fix Steps:</h4><ol style="color: #475569; font-size: 13px; line-height: 1.8; padding-left: 20px;"><li>SSH into Scout Bot VM: <code style="background: #e2e8f0; padding: 2px 6px; border-radius: 4px;">34.47.178.82</code></li><li>Check if Zoom is running and the bot is in the meeting</li><li>If not, restart the scheduled task or manually join the meeting</li><li>Open the Zoom App to restart snapshot monitoring</li></ol></div>' if alert_type != 'recovery' else ''
-
-        html_content = f"""
-        <div style="font-family: 'Inter', Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <div style="background: linear-gradient(135deg, #0f2847, #1a365d); padding: 24px 30px; border-radius: 12px 12px 0 0;">
-            <h1 style="color: #fff; margin: 0; font-size: 20px;">
-              {emoji} Scout Bot Monitor
-            </h1>
-            <p style="color: rgba(255,255,255,0.7); margin: 4px 0 0; font-size: 13px;">
-              Verve Advisory - Attendance Tracker
-            </p>
-          </div>
-
-          <div style="background: {bg_color}; border: 1px solid {border_color}; border-top: none; padding: 20px 30px;">
-            <h2 style="color: {color}; margin: 0 0 8px; font-size: 18px;">
-              Status: {status}
-            </h2>
-            <p style="color: #374151; margin: 0; font-size: 14px; line-height: 1.6;">
-              {problem}
-            </p>
-          </div>
-
-          <div style="background: #fff; border: 1px solid #e5e7eb; border-top: none; padding: 20px 30px;">
-            <h3 style="color: #1e293b; margin: 0 0 12px; font-size: 14px;">Details</h3>
-            <table style="width: 100%; font-size: 13px; border-collapse: collapse;">
-              <tr><td style="padding: 6px 0; color: #64748b;">Date</td><td style="padding: 6px 0; font-weight: 600;">{date}</td></tr>
-              <tr><td style="padding: 6px 0; color: #64748b;">Time of Check</td><td style="padding: 6px 0; font-weight: 600;">{time_str}</td></tr>
-              <tr><td style="padding: 6px 0; color: #64748b;">Snapshots Today</td><td style="padding: 6px 0; font-weight: 600;">{snapshot_count}</td></tr>
-              <tr><td style="padding: 6px 0; color: #64748b;">Participants Seen</td><td style="padding: 6px 0; font-weight: 600;">{participant_count}</td></tr>
-              <tr><td style="padding: 6px 0; color: #64748b;">Last Snapshot</td><td style="padding: 6px 0; font-weight: 600;">{mins_ago} min ago</td></tr>
-            </table>
-          </div>
-
-          <div style="background: #f8fafc; border: 1px solid #e5e7eb; border-top: none; padding: 20px 30px; border-radius: 0 0 12px 12px;">
-            <h3 style="color: #1e293b; margin: 0 0 8px; font-size: 14px;">{action_emoji} Action Required</h3>
-            <p style="color: #475569; margin: 0; font-size: 13px; line-height: 1.6;">{action}</p>
-
-            {quick_fix_html}
-
-            <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #e2e8f0;">
-              <a href="https://breakout-room-calibrator-1041741270489.us-central1.run.app/monitor/health"
-                 style="display: inline-block; padding: 8px 20px; background: #1a365d; color: #fff; text-decoration: none; border-radius: 8px; font-size: 13px; font-weight: 600;">
-                Check Health Dashboard
-              </a>
-              <a href="https://verve-attendance-tracker.vercel.app"
-                 style="display: inline-block; padding: 8px 20px; background: #fff; color: #1a365d; text-decoration: none; border-radius: 8px; font-size: 13px; font-weight: 600; border: 1px solid #d1d5db; margin-left: 8px;">
-                Open Attendance Tracker
-              </a>
-            </div>
-          </div>
-
-          <p style="color: #94a3b8; font-size: 11px; text-align: center; margin-top: 16px;">
-            Automated alert from Verve Attendance Tracker. Checks run every 5 minutes during 9 AM - 8 PM IST.
-          </p>
-        </div>
-        """
-
-        recipients = [r.strip() for r in REPORT_EMAIL_TO.replace(';', ',').split(',') if r.strip()]
-
-        mail = Mail(
-            from_email=Email(REPORT_EMAIL_FROM),
-            to_emails=[To(r) for r in recipients],
-            subject=subject,
-            html_content=Content("text/html", html_content)
-        )
-
-        response = sg.send(mail)
-        print(f"[ScoutAlert] {alert_type} email sent to {recipients}, status: {response.status_code}")
-        return response.status_code == 202
-
-    except Exception as e:
-        print(f"[ScoutAlert] Failed to send email: {e}")
-        traceback.print_exc()
-        return False
+# SendGrid alert code REMOVED - Use GCP Cloud Monitoring instead:
+#
+# 1. Create Uptime Check (checks /monitor/health every 5 min)
+# 2. Create Alert Policy (triggers when status != HEALTHY)
+# 3. Add Email Notification Channels for multiple recipients
+#
+# Setup commands in README.md or run:
+#   gcloud monitoring uptime create ...
+#   gcloud monitoring policies create ...
+# ═══════════════════════════════════════════════════════
 
 
 # Rate limiter for signature error logging
@@ -3757,26 +3667,8 @@ def calibration_health():
             health_status = 'CRITICAL'
             message = 'No calibration data for today'
 
-        # Send email alert if critical and alerts enabled
+        # Alerting moved to GCP Cloud Monitoring (no SendGrid alerts)
         alert_sent = False
-        if health_status == 'CRITICAL' and send_alert and SENDGRID_API_KEY:
-            try:
-                alert_sent = send_calibration_alert(
-                    target_date,
-                    health_status,
-                    message,
-                    {
-                        'total_mappings': total_mappings,
-                        'sequence_mappings': sequence_mappings,
-                        'sdk_mappings': sdk_mappings,
-                        'current_room': current_room,
-                        'total_rooms': total_rooms,
-                        'calibration_started': calibration_started,
-                        'calibration_completed': calibration_completed
-                    }
-                )
-            except Exception as e:
-                print(f"[CalibrationHealth] Alert send error: {e}")
 
         response = {
             'date': target_date,
@@ -3809,67 +3701,6 @@ def calibration_health():
             'message': str(e),
             'alert_sent': False
         }), 500
-
-
-def send_calibration_alert(date, status, message, details):
-    """Send email alert for calibration issues via SendGrid"""
-    if not SENDGRID_API_KEY or not REPORT_EMAIL_TO:
-        print("[CalibrationAlert] SendGrid not configured, skipping alert")
-        return False
-
-    try:
-        import sendgrid
-        from sendgrid.helpers.mail import Mail, Email, To, Content
-
-        sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
-
-        subject = f"[ALERT] Zoom Calibration {status} - {date}"
-
-        html_content = f"""
-        <h2>Zoom Breakout Room Calibration Alert</h2>
-        <p><strong>Status:</strong> <span style="color: {'red' if status == 'CRITICAL' else 'orange'}">{status}</span></p>
-        <p><strong>Date:</strong> {date}</p>
-        <p><strong>Message:</strong> {message}</p>
-
-        <h3>Details</h3>
-        <ul>
-            <li>Calibration Started: {details.get('calibration_started', False)}</li>
-            <li>Calibration Completed: {details.get('calibration_completed', False)}</li>
-            <li>Rooms Progress: {details.get('current_room', 0)} / {details.get('total_rooms', 0)}</li>
-            <li>Webhook UUID Mappings: {details.get('sequence_mappings', 0)}</li>
-            <li>SDK-only Mappings: {details.get('sdk_mappings', 0)}</li>
-        </ul>
-
-        <h3>Action Required</h3>
-        <p>Please run calibration by:</p>
-        <ol>
-            <li>Open Zoom meeting with Scout Bot</li>
-            <li>Open the Zoom App calibration panel</li>
-            <li>Click "Move Scout Bot" to auto-calibrate all rooms</li>
-        </ol>
-
-        <p style="color: gray; font-size: 12px;">
-        This alert was sent by the Zoom Breakout Room Tracker system.
-        </p>
-        """
-
-        recipients = [r.strip() for r in REPORT_EMAIL_TO.replace(';', ',').split(',') if r.strip()]
-
-        mail = Mail(
-            from_email=Email(REPORT_EMAIL_FROM),
-            to_emails=[To(r) for r in recipients],
-            subject=subject,
-            html_content=Content("text/html", html_content)
-        )
-
-        response = sg.send(mail)
-        print(f"[CalibrationAlert] Email sent to {recipients}, status: {response.status_code}")
-        return response.status_code == 202
-
-    except Exception as e:
-        print(f"[CalibrationAlert] Failed to send email: {e}")
-        traceback.print_exc()
-        return False
 
 
 @app.route('/debug/bq-mappings', methods=['GET'])
@@ -5723,6 +5554,11 @@ def attendance_live():
                 snapshot_time = str(st)
                 break
 
+        # Merge duplicate participant names within rooms
+        rooms = merge_live_rooms(rooms)
+        total_people = sum(r['participant_count'] for r in rooms)
+        occupied_count = sum(1 for r in rooms if r['participant_count'] > 0)
+
         return jsonify({
             'success': True,
             'date': target_date,
@@ -5994,6 +5830,9 @@ def attendance_summary(date=None):
                 'total_duration_mins': row.get('total_duration_mins', 0),
                 'room_visits': visits
             })
+
+        # Merge duplicate names (e.g. "Aastha Chandwani-1", "Aastha Chandwani-2" -> "Aastha Chandwani")
+        participants = merge_participants_by_name(participants, mode='summary')
 
         return jsonify({
             'success': True,
@@ -6449,6 +6288,171 @@ def remove_team_member(team_id, member_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/teams/<team_id>/members/bulk', methods=['POST'])
+def bulk_add_team_members(team_id):
+    """Bulk add members from CSV data. Accepts JSON array of {name, email} objects.
+    Deduplicates against existing members. Normalizes names for matching."""
+    try:
+        ensure_team_tables_once()
+        data = request.json or {}
+        members_list = data.get('members', [])
+        if not members_list:
+            return jsonify({'success': False, 'error': 'members array is required'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        table_ref = f"{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}"
+
+        # Get existing members for dedup
+        existing_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )
+        existing = list(client.query(
+            f"SELECT participant_name FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id",
+            job_config=existing_config
+        ).result())
+        existing_names = {normalize_participant_name(m.participant_name).lower().strip() for m in existing}
+
+        # Add new members, skip duplicates
+        added = 0
+        skipped = 0
+        rows_to_insert = []
+        for m in members_list:
+            name = (m.get('name') or m.get('participant_name') or '').strip()
+            email = (m.get('email') or m.get('participant_email') or '').strip()
+            if not name:
+                continue
+            normalized = normalize_participant_name(name)
+            key = normalized.lower().strip()
+            if key in existing_names:
+                skipped += 1
+                continue
+            existing_names.add(key)
+            rows_to_insert.append({
+                'member_id': str(uuid_lib.uuid4()),
+                'team_id': team_id,
+                'participant_name': normalized,
+                'participant_email': email,
+                'added_at': datetime.utcnow().isoformat()
+            })
+            added += 1
+
+        if rows_to_insert:
+            errors = client.insert_rows_json(table_ref, rows_to_insert)
+            if errors:
+                return jsonify({'success': False, 'error': str(errors)}), 500
+
+        print(f"[Teams] Bulk add to {team_id}: {added} added, {skipped} skipped (duplicates)")
+        return jsonify({'success': True, 'added': added, 'skipped': skipped})
+    except Exception as e:
+        print(f"[Teams] Bulk add error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/bulk-import', methods=['POST'])
+def bulk_import_teams_and_members():
+    """Bulk import from CSV: auto-create teams + add members.
+    Accepts JSON: { members: [{name, email, team_name, manager_name?, manager_email?}] }
+    Teams are auto-created if they don't exist. Members are deduplicated."""
+    try:
+        ensure_team_tables_once()
+        data = request.json or {}
+        members_list = data.get('members', [])
+        if not members_list:
+            return jsonify({'success': False, 'error': 'members array is required'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Get existing teams
+        existing_teams = {}
+        for r in client.query(f"SELECT team_id, team_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}`").result():
+            existing_teams[r.team_name.lower().strip()] = r.team_id
+
+        # Group members by team
+        teams_to_create = {}
+        for m in members_list:
+            team_name = (m.get('team_name') or m.get('team') or '').strip()
+            if not team_name:
+                continue
+            key = team_name.lower().strip()
+            if key not in teams_to_create:
+                teams_to_create[key] = {
+                    'team_name': team_name,
+                    'manager_name': (m.get('manager_name') or m.get('manager') or '').strip(),
+                    'manager_email': (m.get('manager_email') or '').strip(),
+                    'members': []
+                }
+            name = (m.get('name') or m.get('participant_name') or '').strip()
+            email = (m.get('email') or m.get('participant_email') or '').strip()
+            if name:
+                teams_to_create[key]['members'].append({'name': normalize_participant_name(name), 'email': email})
+
+        teams_created = 0
+        members_added = 0
+        members_skipped = 0
+
+        for key, team_data in teams_to_create.items():
+            # Create team if not exists
+            if key in existing_teams:
+                team_id = existing_teams[key]
+            else:
+                team_id = str(uuid_lib.uuid4())
+                errors = client.insert_rows_json(f"{dataset_ref}.{BQ_TEAMS_TABLE}", [{
+                    'team_id': team_id, 'team_name': team_data['team_name'],
+                    'manager_name': team_data['manager_name'],
+                    'manager_email': team_data['manager_email'],
+                    'created_at': datetime.utcnow().isoformat(),
+                    'updated_at': datetime.utcnow().isoformat()
+                }])
+                if not errors:
+                    existing_teams[key] = team_id
+                    teams_created += 1
+
+            # Get existing members of this team
+            member_config = bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+            )
+            existing_members = {normalize_participant_name(m.participant_name).lower().strip()
+                                for m in client.query(
+                f"SELECT participant_name FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id",
+                job_config=member_config
+            ).result()}
+
+            # Add new members
+            rows_to_insert = []
+            for m in team_data['members']:
+                mkey = m['name'].lower().strip()
+                if mkey in existing_members:
+                    members_skipped += 1
+                    continue
+                existing_members.add(mkey)
+                rows_to_insert.append({
+                    'member_id': str(uuid_lib.uuid4()),
+                    'team_id': team_id,
+                    'participant_name': m['name'],
+                    'participant_email': m['email'],
+                    'added_at': datetime.utcnow().isoformat()
+                })
+                members_added += 1
+
+            if rows_to_insert:
+                client.insert_rows_json(f"{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}", rows_to_insert)
+
+        print(f"[Teams] Bulk import: {teams_created} teams created, {members_added} members added, {members_skipped} skipped")
+        return jsonify({
+            'success': True,
+            'teams_created': teams_created,
+            'members_added': members_added,
+            'members_skipped': members_skipped
+        })
+    except Exception as e:
+        print(f"[Teams] Bulk import error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/teams/participants', methods=['GET'])
 def list_known_participants():
     """Get distinct participants from recent snapshots (for adding to teams)
@@ -6471,9 +6475,16 @@ def list_known_participants():
         ORDER BY participant_name
         """
         rows = list(client.query(query).result())
-        participants = [{'participant_name': r.participant_name,
-                         'participant_email': r.participant_email or ''}
-                        for r in rows]
+        # Normalize names and deduplicate
+        seen = {}
+        for r in rows:
+            base = normalize_participant_name(r.participant_name)
+            key = base.lower().strip()
+            if key not in seen:
+                seen[key] = {'participant_name': base, 'participant_email': r.participant_email or ''}
+            elif r.participant_email and not seen[key]['participant_email']:
+                seen[key]['participant_email'] = r.participant_email
+        participants = sorted(seen.values(), key=lambda x: x['participant_name'])
         return jsonify({'success': True, 'participants': participants})
     except Exception as e:
         print(f"[Teams] Participants list error: {e}")
@@ -6801,6 +6812,9 @@ def team_attendance(team_id, date):
                     'isolation_minutes': 0,
                     'status': 'absent'
                 })
+
+        # Merge duplicate names
+        participants = merge_participants_by_name(participants, mode='team')
 
         total_members = len(all_members)
         present_count = len([p for p in participants if p['status'] == 'present'])
