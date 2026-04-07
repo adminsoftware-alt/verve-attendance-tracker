@@ -8631,6 +8631,7 @@ def list_unrecognized_participants(date):
                 reg_first_names.setdefault(first, []).append(name_low)
 
         # 4. Extract team keywords from team names
+        # Only use identifiers from non-person team names (skip "Team Aaron" etc.)
         team_keywords = set()
         seen_teams = set()
         for r in reg_rows:
@@ -8638,6 +8639,9 @@ def list_unrecognized_participants(date):
             if not tn or tn in seen_teams:
                 continue
             seen_teams.add(tn)
+            # Skip "Team <PersonName>" — those names collide with first names
+            if tn.lower().startswith('team '):
+                continue
             for word in tn.replace('-', ' ').split():
                 wl = word.lower()
                 if wl not in ('team', 'client', 'sir') and len(wl) >= 3:
@@ -8665,24 +8669,30 @@ def list_unrecognized_participants(date):
             if raw_low in reg_names:
                 return True
 
-            # Pass 2: Normalized match (strips rejoin suffixes like -2, _text)
+            # Pass 2: Strip team keywords from RAW name first (handles KPRC_Aditi, Vridam Nayana)
+            stripped_raw = _strip_team_and_clean(raw_low)
+            if stripped_raw and stripped_raw in reg_names:
+                return True
+
+            # Pass 3: Normalized match (strips rejoin suffixes like -2, _text)
             normed = normalize_participant_name(raw_name).lower().strip()
             if normed in reg_names:
                 return True
 
-            # Pass 3: Strip team keywords + professional prefixes, then exact match
+            # Pass 4: Strip team keywords from normalized name
             cleaned = _strip_team_and_clean(normed)
             if cleaned and cleaned in reg_names:
                 return True
 
-            # Pass 4: Check if any registered full name is contained in the zoom name
+            # Pass 5: Check if any registered full name is contained in the zoom name
             for rn in reg_names:
-                if len(rn) >= 4 and rn in normed:
+                if len(rn) >= 4 and rn in raw_low:
                     return True
 
-            # Pass 5: First-name match (single-word cleaned name matches a registered first name)
-            if cleaned and ' ' not in cleaned and len(cleaned) >= 3:
-                if cleaned in reg_first_names:
+            # Pass 6: First-name match (single-word name matches a registered first name)
+            best_name = stripped_raw or cleaned
+            if best_name and ' ' not in best_name and len(best_name) >= 3:
+                if best_name in reg_first_names:
                     return True
 
             return False
@@ -8693,11 +8703,18 @@ def list_unrecognized_participants(date):
             raw = zp.participant_name
             if is_recognized(raw):
                 continue
+            # Best display name: try team-strip on raw first, then normalize
+            stripped = _strip_team_and_clean(raw.lower().strip())
             normed = normalize_participant_name(raw)
-            cleaned = _strip_team_and_clean(normed)
+            # Pick whichever is more informative (longer, non-empty)
+            display = stripped if stripped and len(stripped) > len(_strip_team_and_clean(normed.lower())) else _strip_team_and_clean(normed.lower())
+            if not display:
+                display = normed
+            # Title case the display name
+            display = display.title() if display == display.lower() else display
             unrecognized.append({
                 'participant_name': raw,
-                'normalized_name': cleaned if cleaned != normed else normed,
+                'normalized_name': display.strip(),
                 'participant_email': zp.participant_email or '',
             })
 
