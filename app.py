@@ -8645,10 +8645,11 @@ def list_unrecognized_participants(date):
             # Skip "Team <PersonName>" — those names collide with first names
             if tn.lower().startswith('team '):
                 continue
-            for word in tn.replace('-', ' ').split():
-                wl = word.lower()
-                if wl not in ('team', 'client', 'sir') and len(wl) >= 3:
-                    team_keywords.add(wl)
+            # Only take the FIRST word (org name like KPRC, Accurest, Vridam)
+            # Skip person names like Kuldeep, Pawan, Yogendra
+            first_word = tn.replace('-', ' ').split()[0].lower() if tn.split() else ''
+            if first_word and first_word not in ('team', 'client', 'sir') and len(first_word) >= 3:
+                team_keywords.add(first_word)
 
         def _strip_team_and_clean(name):
             """Strip team keywords, professional prefixes, and invisible chars from a name."""
