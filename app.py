@@ -231,7 +231,7 @@ def add_zoom_headers(response):
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    elif origin and (path.startswith('/attendance/') or path.startswith('/dashboard') or path.startswith('/teams') or path.startswith('/auth/') or path.startswith('/data/') or path.startswith('/employees')):
+    elif origin and (path.startswith('/attendance/') or path.startswith('/dashboard') or path.startswith('/teams') or path.startswith('/auth/') or path.startswith('/data/') or path.startswith('/employees') or path.startswith('/admin/')):
         # Allow external apps (attendance manager) to call attendance, team, auth & data APIs
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
@@ -8185,8 +8185,8 @@ def auth_create_user():
 
         if not username or not password or not name:
             return jsonify({'success': False, 'error': 'username, password, and name are required'}), 400
-        if role not in ('admin', 'hr', 'manager'):
-            return jsonify({'success': False, 'error': 'role must be admin, hr, or manager'}), 400
+        if role not in ('admin', 'hr', 'manager', 'superadmin'):
+            return jsonify({'success': False, 'error': 'role must be admin, hr, manager, or superadmin'}), 400
 
         client = bigquery.Client(project=GCP_PROJECT_ID)
         # Generate numeric user_id (timestamp-based for uniqueness)
@@ -8881,6 +8881,343 @@ def employee_attendance_detail(employee_id, date):
 # ==============================================================================
 # RUN SERVER
 # ==============================================================================
+
+# ─── SUPERADMIN DATA EDITOR ───────────────────────────────────
+# Only role=superadmin can access. Direct BigQuery DML, no audit trail.
+
+@app.route('/admin/update-role', methods=['POST'])
+def admin_update_role():
+    """Update a user's role (superadmin only)."""
+    try:
+        data = request.get_json() or {}
+        user_id = data.get('user_id')
+        new_role = data.get('role', '').strip()
+        if not user_id or not new_role:
+            return jsonify({'success': False, 'error': 'user_id and role required'}), 400
+        if new_role not in ('admin', 'hr', 'manager', 'superadmin'):
+            return jsonify({'success': False, 'error': 'Invalid role'}), 400
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        q = f"UPDATE `{dataset_ref}.app_users` SET role = @role WHERE user_id = @uid"
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("role", "STRING", new_role),
+            bigquery.ScalarQueryParameter("uid", "INT64", int(user_id)),
+        ])
+        client.query(q, job_config=job_config).result()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/snapshots', methods=['GET'])
+def admin_search_snapshots():
+    """Search room_snapshots by date and optional participant name. Superadmin only."""
+    try:
+        date_str = request.args.get('date')
+        search = request.args.get('search', '').strip()
+        if not date_str:
+            return jsonify({'success': False, 'error': 'date parameter required'}), 400
+        report_date = validate_date_format(date_str)
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        params = [bigquery.ScalarQueryParameter("date", "STRING", report_date)]
+        where_extra = ""
+        if search:
+            where_extra = " AND LOWER(participant_name) LIKE LOWER(@search)"
+            params.append(bigquery.ScalarQueryParameter("search", "STRING", f"%{search}%"))
+
+        query = f"""
+        SELECT snapshot_id, snapshot_time, event_date, meeting_id, room_name,
+               participant_name, participant_email, participant_uuid
+        FROM `{dataset_ref}.room_snapshots`
+        WHERE event_date = @date{where_extra}
+        ORDER BY participant_name, snapshot_time
+        LIMIT 2000
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        rows = list(client.query(query, job_config=job_config).result())
+
+        snapshots = []
+        for r in rows:
+            snapshots.append({
+                'snapshot_id': r.snapshot_id,
+                'snapshot_time': r.snapshot_time.isoformat() if r.snapshot_time else '',
+                'event_date': r.event_date,
+                'meeting_id': r.meeting_id,
+                'room_name': r.room_name,
+                'participant_name': r.participant_name,
+                'participant_email': r.participant_email or '',
+                'participant_uuid': r.participant_uuid or '',
+            })
+
+        # Group by participant + room for a summary view
+        summary = {}
+        for s in snapshots:
+            key = f"{s['participant_name']}||{s['room_name']}"
+            if key not in summary:
+                summary[key] = {
+                    'participant_name': s['participant_name'],
+                    'room_name': s['room_name'],
+                    'first_seen': s['snapshot_time'],
+                    'last_seen': s['snapshot_time'],
+                    'snapshot_count': 0,
+                    'snapshot_ids': [],
+                }
+            summary[key]['last_seen'] = s['snapshot_time']
+            summary[key]['snapshot_count'] += 1
+            summary[key]['snapshot_ids'].append(s['snapshot_id'])
+
+        return jsonify({
+            'success': True,
+            'date': report_date,
+            'snapshots': snapshots,
+            'summary': list(summary.values()),
+            'total': len(snapshots),
+        })
+    except Exception as e:
+        print(f"[Admin] Snapshot search error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/snapshots/edit', methods=['PUT'])
+def admin_edit_snapshots():
+    """Edit room_name or participant_name on snapshot rows. Superadmin only, no audit."""
+    try:
+        data = request.get_json() or {}
+        snapshot_ids = data.get('snapshot_ids', [])
+        new_room = data.get('room_name')
+        new_name = data.get('participant_name')
+        new_time = data.get('snapshot_time')
+
+        if not snapshot_ids:
+            return jsonify({'success': False, 'error': 'snapshot_ids required'}), 400
+        if not new_room and not new_name and not new_time:
+            return jsonify({'success': False, 'error': 'Provide room_name, participant_name, or snapshot_time to update'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Build SET clause
+        sets = []
+        params = []
+        if new_room is not None:
+            sets.append("room_name = @room_name")
+            params.append(bigquery.ScalarQueryParameter("room_name", "STRING", new_room))
+        if new_name is not None:
+            sets.append("participant_name = @part_name")
+            params.append(bigquery.ScalarQueryParameter("part_name", "STRING", new_name))
+        if new_time is not None:
+            sets.append("snapshot_time = @snap_time")
+            params.append(bigquery.ScalarQueryParameter("snap_time", "TIMESTAMP", new_time))
+
+        # Use IN with string array for snapshot_ids
+        id_list = ", ".join([f"'{sid}'" for sid in snapshot_ids])
+        query = f"""
+        UPDATE `{dataset_ref}.room_snapshots`
+        SET {', '.join(sets)}
+        WHERE snapshot_id IN ({id_list})
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        result = client.query(query, job_config=job_config).result()
+        modified = result.num_dml_affected_rows if hasattr(result, 'num_dml_affected_rows') else len(snapshot_ids)
+
+        print(f"[Admin] Edited {modified} snapshots: {sets}")
+        return jsonify({'success': True, 'modified': modified})
+    except Exception as e:
+        print(f"[Admin] Snapshot edit error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/snapshots/delete', methods=['DELETE'])
+def admin_delete_snapshots():
+    """Delete snapshot rows. Superadmin only, no audit."""
+    try:
+        data = request.get_json() or {}
+        snapshot_ids = data.get('snapshot_ids', [])
+        if not snapshot_ids:
+            return jsonify({'success': False, 'error': 'snapshot_ids required'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        id_list = ", ".join([f"'{sid}'" for sid in snapshot_ids])
+        query = f"DELETE FROM `{dataset_ref}.room_snapshots` WHERE snapshot_id IN ({id_list})"
+        result = client.query(query).result()
+        deleted = result.num_dml_affected_rows if hasattr(result, 'num_dml_affected_rows') else len(snapshot_ids)
+
+        print(f"[Admin] Deleted {deleted} snapshots")
+        return jsonify({'success': True, 'deleted': deleted})
+    except Exception as e:
+        print(f"[Admin] Snapshot delete error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/snapshots/add', methods=['POST'])
+def admin_add_snapshot():
+    """Insert new snapshot rows. Superadmin only."""
+    try:
+        data = request.get_json() or {}
+        rows_to_add = data.get('rows', [])
+        if not rows_to_add:
+            return jsonify({'success': False, 'error': 'rows array required'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        import uuid as _uuid
+        bq_rows = []
+        for r in rows_to_add:
+            bq_rows.append({
+                'snapshot_id': str(_uuid.uuid4()),
+                'snapshot_time': r.get('snapshot_time', datetime.now(IST).isoformat()),
+                'event_date': r.get('event_date', datetime.now(IST).strftime('%Y-%m-%d')),
+                'meeting_id': r.get('meeting_id', ''),
+                'room_name': r.get('room_name', 'Main Meeting'),
+                'participant_name': r.get('participant_name', ''),
+                'participant_email': r.get('participant_email', ''),
+                'participant_uuid': r.get('participant_uuid', ''),
+                'inserted_at': datetime.now(IST).isoformat(),
+            })
+
+        errors = client.insert_rows_json(f"{dataset_ref}.room_snapshots", bq_rows)
+        if errors:
+            return jsonify({'success': False, 'error': str(errors)}), 500
+
+        print(f"[Admin] Added {len(bq_rows)} snapshots")
+        return jsonify({'success': True, 'added': len(bq_rows)})
+    except Exception as e:
+        print(f"[Admin] Snapshot add error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/events', methods=['GET'])
+def admin_search_events():
+    """Search participant_events by date and optional participant name. Superadmin only."""
+    try:
+        date_str = request.args.get('date')
+        search = request.args.get('search', '').strip()
+        if not date_str:
+            return jsonify({'success': False, 'error': 'date parameter required'}), 400
+        report_date = validate_date_format(date_str)
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        params = [bigquery.ScalarQueryParameter("date", "STRING", report_date)]
+        where_extra = ""
+        if search:
+            where_extra = " AND LOWER(participant_name) LIKE LOWER(@search)"
+            params.append(bigquery.ScalarQueryParameter("search", "STRING", f"%{search}%"))
+
+        query = f"""
+        SELECT event_id, event_type, event_timestamp, event_date, meeting_id, meeting_uuid,
+               participant_id, participant_name, participant_email, room_uuid, room_name
+        FROM `{dataset_ref}.participant_events`
+        WHERE event_date = @date{where_extra}
+        ORDER BY participant_name, event_timestamp
+        LIMIT 2000
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        rows = list(client.query(query, job_config=job_config).result())
+
+        events = []
+        for r in rows:
+            events.append({
+                'event_id': r.event_id,
+                'event_type': r.event_type,
+                'event_timestamp': r.event_timestamp.isoformat() if r.event_timestamp else '',
+                'event_date': r.event_date,
+                'meeting_id': r.meeting_id or '',
+                'participant_name': r.participant_name or '',
+                'participant_email': r.participant_email or '',
+                'room_name': r.room_name or '',
+            })
+
+        return jsonify({'success': True, 'date': report_date, 'events': events, 'total': len(events)})
+    except Exception as e:
+        print(f"[Admin] Event search error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/events/edit', methods=['PUT'])
+def admin_edit_events():
+    """Edit participant_events rows. Superadmin only, no audit."""
+    try:
+        data = request.get_json() or {}
+        event_ids = data.get('event_ids', [])
+        new_room = data.get('room_name')
+        new_name = data.get('participant_name')
+        new_time = data.get('event_timestamp')
+        new_type = data.get('event_type')
+
+        if not event_ids:
+            return jsonify({'success': False, 'error': 'event_ids required'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        sets = []
+        params = []
+        if new_room is not None:
+            sets.append("room_name = @room_name")
+            params.append(bigquery.ScalarQueryParameter("room_name", "STRING", new_room))
+        if new_name is not None:
+            sets.append("participant_name = @part_name")
+            params.append(bigquery.ScalarQueryParameter("part_name", "STRING", new_name))
+        if new_time is not None:
+            sets.append("event_timestamp = @evt_time")
+            params.append(bigquery.ScalarQueryParameter("evt_time", "TIMESTAMP", new_time))
+        if new_type is not None:
+            sets.append("event_type = @evt_type")
+            params.append(bigquery.ScalarQueryParameter("evt_type", "STRING", new_type))
+
+        if not sets:
+            return jsonify({'success': False, 'error': 'No fields to update'}), 400
+
+        id_list = ", ".join([f"'{eid}'" for eid in event_ids])
+        query = f"""
+        UPDATE `{dataset_ref}.participant_events`
+        SET {', '.join(sets)}
+        WHERE event_id IN ({id_list})
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        result = client.query(query, job_config=job_config).result()
+        modified = result.num_dml_affected_rows if hasattr(result, 'num_dml_affected_rows') else len(event_ids)
+
+        print(f"[Admin] Edited {modified} events: {sets}")
+        return jsonify({'success': True, 'modified': modified})
+    except Exception as e:
+        print(f"[Admin] Event edit error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/events/delete', methods=['DELETE'])
+def admin_delete_events():
+    """Delete participant_events rows. Superadmin only, no audit."""
+    try:
+        data = request.get_json() or {}
+        event_ids = data.get('event_ids', [])
+        if not event_ids:
+            return jsonify({'success': False, 'error': 'event_ids required'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        id_list = ", ".join([f"'{eid}'" for eid in event_ids])
+        query = f"DELETE FROM `{dataset_ref}.participant_events` WHERE event_id IN ({id_list})"
+        result = client.query(query).result()
+        deleted = result.num_dml_affected_rows if hasattr(result, 'num_dml_affected_rows') else len(event_ids)
+
+        print(f"[Admin] Deleted {deleted} events")
+        return jsonify({'success': True, 'deleted': deleted})
+    except Exception as e:
+        print(f"[Admin] Event delete error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))

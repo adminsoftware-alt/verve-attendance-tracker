@@ -261,3 +261,53 @@ export async function fetchEmployeeDetail(employeeId, yearMonth) {
 export function getEmployeeCsvUrl(employeeId, yearMonth) {
   return `${ZOOM_API_BASE}/employees/${employeeId}/attendance/${yearMonth}?format=csv`;
 }
+
+// ─── SUPERADMIN DATA EDITOR ───────────────────────────────
+
+export async function adminUpdateRole(userId, role) {
+  return apiPost('/admin/update-role', { user_id: userId, role });
+}
+
+export async function adminSearchSnapshots(date, search) {
+  const q = new URLSearchParams({ date });
+  if (search) q.set('search', search);
+  return apiFetch(`/admin/snapshots?${q}`);
+}
+
+export async function adminEditSnapshots(snapshotIds, fields) {
+  return apiPut('/admin/snapshots/edit', { snapshot_ids: snapshotIds, ...fields });
+}
+
+export async function adminDeleteSnapshots(snapshotIds) {
+  const res = await fetch(`${ZOOM_API_BASE}/admin/snapshots/delete`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ snapshot_ids: snapshotIds })
+  });
+  if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
+  return res.json();
+}
+
+export async function adminAddSnapshots(rows) {
+  return apiPost('/admin/snapshots/add', { rows });
+}
+
+export async function adminSearchEvents(date, search) {
+  const q = new URLSearchParams({ date });
+  if (search) q.set('search', search);
+  return apiFetch(`/admin/events?${q}`);
+}
+
+export async function adminEditEvents(eventIds, fields) {
+  return apiPut('/admin/events/edit', { event_ids: eventIds, ...fields });
+}
+
+export async function adminDeleteEvents(eventIds) {
+  const res = await fetch(`${ZOOM_API_BASE}/admin/events/delete`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ event_ids: eventIds })
+  });
+  if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
+  return res.json();
+}

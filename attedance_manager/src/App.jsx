@@ -16,6 +16,7 @@ import TeamDashboard from './components/TeamDashboard';
 import CalendarView from './components/CalendarView';
 import ReportBuilder from './components/ReportBuilder';
 import EmployeeManager from './components/EmployeeManager';
+import DataEditor from './components/DataEditor';
 import { FullPageLoader } from './components/LoadingSpinner';
 
 // Pages managers are allowed to see
@@ -94,6 +95,9 @@ export default function App() {
         )}
         {!isManager && page === 'registry' && (
           <EmployeeManager user={user} />
+        )}
+        {user?.role === 'superadmin' && page === 'dataeditor' && (
+          <DataEditor user={user} />
         )}
 
         {/* Shared pages (all roles) */}

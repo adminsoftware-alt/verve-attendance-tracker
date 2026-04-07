@@ -14,6 +14,10 @@ const ADMIN_NAV = [
   { key: 'upload', label: 'Upload', icon: '\u{1F4E4}' },
 ];
 
+const SUPERADMIN_EXTRA = [
+  { key: 'dataeditor', label: 'Data Editor', icon: '\u{1F527}' },
+];
+
 const MANAGER_NAV = [
   { key: 'dashboard', label: 'Dashboard', icon: '\u{1F3E0}' },
   { key: 'teamview', label: 'Team View', icon: '\u{1F4CA}' },
@@ -24,6 +28,7 @@ const MANAGER_NAV = [
 
 function getRoleLabel(role) {
   switch (role) {
+    case 'superadmin': return 'Super Admin';
     case 'admin': return 'Admin';
     case 'hr': return 'HR';
     case 'manager': return 'Manager';
@@ -34,7 +39,8 @@ function getRoleLabel(role) {
 export default function Sidebar({ active, onNav, user, onLogout, uploadedDates }) {
   const role = user?.role || 'admin';
   const isManager = role === 'manager';
-  const navItems = isManager ? MANAGER_NAV : ADMIN_NAV;
+  const isSuperAdmin = role === 'superadmin';
+  const navItems = isManager ? MANAGER_NAV : (isSuperAdmin ? [...ADMIN_NAV, ...SUPERADMIN_EXTRA] : ADMIN_NAV);
 
   return (
     <nav style={s.sidebar} className="sidebar-desktop" role="navigation" aria-label="Main navigation">

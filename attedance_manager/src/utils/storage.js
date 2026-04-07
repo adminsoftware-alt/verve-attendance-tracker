@@ -10,6 +10,8 @@ const STORAGE_KEY = 'verve_attendance_data';
 // ─── AUTH ───────────────────────────────────────────────
 
 const DEFAULT_USERS = [
+  // Superadmin
+  { username: 'dev@verveadvisory.in', password: 'verve2026', name: 'Developer', role: 'superadmin', email: 'dev@verveadvisory.in' },
   // Admin accounts
   { username: 'admin', password: 'verve2026', name: 'Admin', role: 'admin', email: '' },
   { username: 'shashank', password: 'verve2026', name: 'Shashank Channawar', role: 'admin', email: 'shashank.channawar@verveadvisory.com' },
