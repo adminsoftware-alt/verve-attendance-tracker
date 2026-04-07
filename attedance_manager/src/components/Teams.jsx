@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { fetchTeams, fetchTeamDetail, createTeam, updateTeam, deleteTeam, addTeamMember, removeTeamMember, fetchParticipants } from '../utils/zoomApi';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { fetchTeams, fetchTeamDetail, createTeam, updateTeam, deleteTeam, addTeamMember, removeTeamMember, fetchParticipants, bulkImportTeams } from '../utils/zoomApi';
 
 export default function Teams({ user }) {
   const [teams, setTeams] = useState([]);
@@ -17,6 +17,8 @@ export default function Teams({ user }) {
   const [addingMemberTo, setAddingMemberTo] = useState(null);
   const [searchMember, setSearchMember] = useState('');
   const [addingInProgress, setAddingInProgress] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null);
+  const fileInputRef = useRef(null);
 
   // Form state
   const [formName, setFormName] = useState('');
@@ -116,6 +118,59 @@ export default function Teams({ user }) {
     } catch (e) { setError(e.message); }
   };
 
+  // CSV upload: parse CSV, auto-create teams, add members
+  const handleCsvUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadResult(null);
+    setError(null);
+
+    try {
+      const text = await file.text();
+      const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+      if (lines.length < 2) throw new Error('CSV must have header + at least 1 row');
+
+      // Parse header (flexible: Name/name, Email/email, Team/team_name)
+      const header = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/['"]/g, ''));
+      const nameIdx = header.findIndex(h => h === 'name' || h === 'participant_name' || h === 'employee');
+      const emailIdx = header.findIndex(h => h === 'email' || h === 'participant_email');
+      const teamIdx = header.findIndex(h => h === 'team' || h === 'team_name');
+      const managerIdx = header.findIndex(h => h === 'manager' || h === 'manager_name');
+
+      if (nameIdx === -1) throw new Error('CSV must have a "Name" column');
+      if (teamIdx === -1) throw new Error('CSV must have a "Team" column');
+
+      const members = [];
+      for (let i = 1; i < lines.length; i++) {
+        // Handle quoted CSV fields
+        const cols = lines[i].match(/(".*?"|[^",]+)(?=\s*,|\s*$)/g)?.map(c => c.trim().replace(/^"|"$/g, '')) || lines[i].split(',').map(c => c.trim());
+        const name = cols[nameIdx]?.trim();
+        if (!name) continue;
+        members.push({
+          name,
+          email: emailIdx >= 0 ? (cols[emailIdx] || '').trim() : '',
+          team_name: (cols[teamIdx] || '').trim(),
+          manager_name: managerIdx >= 0 ? (cols[managerIdx] || '').trim() : ''
+        });
+      }
+
+      if (members.length === 0) throw new Error('No valid rows found');
+
+      const result = await bulkImportTeams(members);
+      setUploadResult({
+        teams_created: result.teams_created,
+        members_added: result.members_added,
+        members_skipped: result.members_skipped,
+        total: members.length
+      });
+      loadTeams();
+    } catch (err) {
+      setError('CSV upload error: ' + err.message);
+    }
+    // Reset file input
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
   const openEdit = (team) => {
     setEditingTeam(team);
     setFormName(team.team_name);
@@ -186,8 +241,34 @@ export default function Teams({ user }) {
           <h2 style={s.title}>Teams</h2>
           {isManager && <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>Showing your teams only</div>}
         </div>
-        {isAdmin && <button onClick={openCreate} style={s.createBtn}>+ Create Team</button>}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {isAdmin && (
+            <>
+              <input type="file" accept=".csv" ref={fileInputRef} onChange={handleCsvUpload}
+                style={{ display: 'none' }} />
+              <button onClick={() => fileInputRef.current?.click()} style={s.uploadBtn}>Upload CSV</button>
+              <button onClick={openCreate} style={s.createBtn}>+ Create Team</button>
+            </>
+          )}
+        </div>
       </div>
+
+      {/* Upload result */}
+      {uploadResult && (
+        <div style={s.uploadResult}>
+          CSV imported: {uploadResult.teams_created} teams created, {uploadResult.members_added} members added
+          {uploadResult.members_skipped > 0 && `, ${uploadResult.members_skipped} duplicates skipped`}
+          <button onClick={() => setUploadResult(null)} style={{ marginLeft: 10, background: 'none', border: 'none', color: '#15803d', cursor: 'pointer', fontWeight: 600 }}>OK</button>
+        </div>
+      )}
+
+      {/* CSV format hint */}
+      {isAdmin && teams.length === 0 && !loading && (
+        <div style={{ background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 10, padding: 16, marginBottom: 16, fontSize: 12, color: '#64748b' }}>
+          <strong>Upload CSV format:</strong> Name, Email, Team, Manager (optional)
+          <br />Example: <code>Shashank Channawar, shashank@verve.com, TEAM AARON, HARSH</code>
+        </div>
+      )}
 
       {error && (
         <div style={s.error}>
@@ -325,6 +406,8 @@ const s = {
   header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 },
   title: { fontSize: 22, fontWeight: 800, color: '#0f172a', margin: 0 },
   createBtn: { padding: '10px 20px', background: '#0f172a', color: '#fff', border: 'none', borderRadius: 10, fontSize: 13, fontWeight: 600, cursor: 'pointer' },
+  uploadBtn: { padding: '10px 20px', background: '#10b981', color: '#fff', border: 'none', borderRadius: 10, fontSize: 13, fontWeight: 600, cursor: 'pointer' },
+  uploadResult: { padding: '10px 14px', background: '#f0fdf4', color: '#15803d', border: '1px solid #bbf7d0', borderRadius: 10, fontSize: 13, marginBottom: 16, display: 'flex', alignItems: 'center' },
   error: { padding: '10px 14px', background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: 10, fontSize: 13, marginBottom: 16, display: 'flex', alignItems: 'center' },
   loader: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '50vh', color: '#94a3b8' },
   empty: { textAlign: 'center', padding: '60px 20px', color: '#94a3b8', fontSize: 14 },

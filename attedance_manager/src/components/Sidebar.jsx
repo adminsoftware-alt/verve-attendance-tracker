@@ -1,8 +1,6 @@
-import { useState } from 'react';
-
-const NAV_ITEMS = [
-  { key: 'day', label: 'Day View', icon: '\u{1F4C5}' },
+const ADMIN_NAV = [
   { key: 'live', label: 'Live', icon: '\u{1F4E1}' },
+  { key: 'day', label: 'Day View', icon: '\u{1F4C5}' },
   { key: 'employees', label: 'Employees', icon: '\u{1F465}' },
   { key: 'rooms', label: 'Rooms', icon: '\u{1F3E2}' },
   { key: 'isolation', label: 'Isolation', icon: '\u{1F6A8}' },
@@ -15,7 +13,28 @@ const NAV_ITEMS = [
   { key: 'upload', label: 'Upload', icon: '\u{1F4E4}' },
 ];
 
+const MANAGER_NAV = [
+  { key: 'dashboard', label: 'Dashboard', icon: '\u{1F3E0}' },
+  { key: 'teamview', label: 'Team View', icon: '\u{1F4CA}' },
+  { key: 'calendar', label: 'Calendar', icon: '\u{1F4C6}' },
+  { key: 'reports', label: 'Reports', icon: '\u{1F4CB}' },
+  { key: 'teams', label: 'My Teams', icon: '\u{1F46A}' },
+];
+
+function getRoleLabel(role) {
+  switch (role) {
+    case 'admin': return 'Admin';
+    case 'hr': return 'HR';
+    case 'manager': return 'Manager';
+    default: return role || 'User';
+  }
+}
+
 export default function Sidebar({ active, onNav, user, onLogout, uploadedDates }) {
+  const role = user?.role || 'admin';
+  const isManager = role === 'manager';
+  const navItems = isManager ? MANAGER_NAV : ADMIN_NAV;
+
   return (
     <nav style={s.sidebar} className="sidebar-desktop" role="navigation" aria-label="Main navigation">
       {/* Brand */}
@@ -29,7 +48,7 @@ export default function Sidebar({ active, onNav, user, onLogout, uploadedDates }
 
       {/* Navigation */}
       <nav style={s.nav}>
-        {NAV_ITEMS.map(item => {
+        {navItems.map(item => {
           const isActive = active === item.key;
           return (
             <button
@@ -45,7 +64,7 @@ export default function Sidebar({ active, onNav, user, onLogout, uploadedDates }
             >
               <span style={{ fontSize: 15, width: 22, textAlign: 'center' }}>{item.icon}</span>
               <span>{item.label}</span>
-              {item.key === 'upload' && uploadedDates.length > 0 && (
+              {item.key === 'upload' && uploadedDates?.length > 0 && (
                 <span style={s.badge}>{uploadedDates.length}</span>
               )}
             </button>
@@ -59,7 +78,7 @@ export default function Sidebar({ active, onNav, user, onLogout, uploadedDates }
           <div style={s.userAvatar}>{(user?.name || 'U')[0]}</div>
           <div>
             <div style={s.userName}>{user?.name || 'User'}</div>
-            <div style={s.userRole}>{user?.username}</div>
+            <div style={s.userRole}>{getRoleLabel(role)}</div>
           </div>
         </div>
         <button onClick={onLogout} style={s.logoutBtn}>Sign Out</button>

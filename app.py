@@ -8121,6 +8121,59 @@ def auth_list_users():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/auth/users', methods=['POST'])
+def auth_create_user():
+    """Create a new user"""
+    try:
+        data = request.get_json() or {}
+        username = (data.get('username') or '').strip()
+        password = (data.get('password') or '').strip()
+        name = (data.get('name') or '').strip()
+        role = (data.get('role') or 'hr').strip()
+        email = (data.get('email') or '').strip()
+
+        if not username or not password or not name:
+            return jsonify({'success': False, 'error': 'username, password, and name are required'}), 400
+        if role not in ('admin', 'hr', 'manager'):
+            return jsonify({'success': False, 'error': 'role must be admin, hr, or manager'}), 400
+
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+        user_id = f'u{str(uuid_lib.uuid4())[:8]}'
+
+        errors = client.insert_rows_json(
+            f"{GCP_PROJECT_ID}.{BQ_DATASET}.app_users",
+            [{'user_id': user_id, 'username': username, 'password': password,
+              'name': name, 'role': role, 'email': email}]
+        )
+        if errors:
+            return jsonify({'success': False, 'error': str(errors)}), 500
+
+        print(f"[Auth] Created user '{username}' ({role})")
+        return jsonify({'success': True, 'user_id': user_id})
+    except Exception as e:
+        print(f"[Auth] Create user error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/auth/users/<user_id>', methods=['DELETE'])
+def auth_delete_user(user_id):
+    """Delete a user"""
+    try:
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("user_id", "STRING", user_id)]
+        )
+        client.query(
+            f"DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.app_users` WHERE user_id = @user_id",
+            job_config=job_config
+        ).result()
+        print(f"[Auth] Deleted user {user_id}")
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Auth] Delete user error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # ==============================================================================
 # ATTENDANCE DATA ENDPOINTS (Replaces Supabase)
 # ==============================================================================

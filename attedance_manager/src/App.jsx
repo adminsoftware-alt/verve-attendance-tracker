@@ -17,16 +17,32 @@ import CalendarView from './components/CalendarView';
 import ReportBuilder from './components/ReportBuilder';
 import { FullPageLoader } from './components/LoadingSpinner';
 
+// Pages managers are allowed to see
+const MANAGER_PAGES = new Set(['dashboard', 'teamview', 'calendar', 'reports', 'teams']);
+
 export default function App() {
   const [user, setUser] = useState(getSession);
-  const [page, setPage] = useState('live');
   const [refreshKey, setRefreshKey] = useState(0);
+
+  const isManager = user?.role === 'manager';
+  const defaultPage = isManager ? 'dashboard' : 'live';
+  const [page, setPage] = useState(defaultPage);
 
   const { data: allData, dates: uploadedDates, loading } = useAllData(refreshKey);
 
-  const handleLogin = useCallback((u) => setUser(u), []);
+  const handleLogin = useCallback((u) => {
+    setUser(u);
+    // Set default page based on role
+    setPage(u?.role === 'manager' ? 'dashboard' : 'live');
+  }, []);
   const handleLogout = useCallback(() => { clearSession(); setUser(null); }, []);
   const handleDataChange = useCallback(() => setRefreshKey(k => k + 1), []);
+
+  // Guard: manager can't access admin pages
+  const handleNav = useCallback((p) => {
+    if (isManager && !MANAGER_PAGES.has(p)) return;
+    setPage(p);
+  }, [isManager]);
 
   if (!user) {
     return <Login onLogin={handleLogin} />;
@@ -38,7 +54,7 @@ export default function App() {
 
       {/* Mobile header (visible < 768px) */}
       <div className="mobile-header" style={styles.mobileHeader}>
-        <button onClick={() => setPage(p => p)} style={styles.menuBtn} aria-label="Menu">
+        <button onClick={() => {}} style={styles.menuBtn} aria-label="Menu">
           {'\u2630'}
         </button>
         <span style={{ fontSize: 14, fontWeight: 700, color: '#1a365d' }}>Verve Attendance</span>
@@ -46,31 +62,37 @@ export default function App() {
 
       <Sidebar
         active={page}
-        onNav={setPage}
+        onNav={handleNav}
         user={user}
         onLogout={handleLogout}
         uploadedDates={uploadedDates}
       />
       <main id="main-content" role="main" style={styles.main}>
-        {loading && <FullPageLoader message="Loading attendance data..." />}
-        {!loading && page === 'day' && (
+        {/* Admin/HR only pages */}
+        {!isManager && loading && <FullPageLoader message="Loading attendance data..." />}
+        {!isManager && !loading && page === 'day' && (
           <DayView allData={allData} uploadedDates={uploadedDates} onNavigateUpload={() => setPage('upload')} />
         )}
-        {!loading && page === 'employees' && (
+        {!isManager && !loading && page === 'employees' && (
           <Employees allData={allData} uploadedDates={uploadedDates} />
         )}
-        {!loading && page === 'rooms' && (
+        {!isManager && !loading && page === 'rooms' && (
           <Rooms allData={allData} uploadedDates={uploadedDates} />
         )}
-        {!loading && page === 'isolation' && (
+        {!isManager && !loading && page === 'isolation' && (
           <Isolation allData={allData} uploadedDates={uploadedDates} />
         )}
-        {page === 'upload' && (
+        {!isManager && page === 'upload' && (
           <Upload onDataChange={handleDataChange} user={user} />
         )}
-        {page === 'live' && (
+        {!isManager && page === 'live' && (
           <LiveDashboard />
         )}
+        {!isManager && page === 'compare' && (
+          <TeamCompare />
+        )}
+
+        {/* Shared pages (all roles) */}
         {page === 'dashboard' && (
           <TeamDashboard user={user} />
         )}
@@ -86,9 +108,6 @@ export default function App() {
         {page === 'reports' && (
           <ReportBuilder user={user} />
         )}
-        {page === 'compare' && (
-          <TeamCompare />
-        )}
       </main>
     </div>
   );
@@ -100,14 +119,6 @@ const styles = {
     overflow: 'auto',
     padding: '28px 32px',
     background: '#f5f5f0',
-  },
-  loader: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    height: '50vh',
-    color: '#94a3b8',
-    fontSize: 14,
   },
   mobileHeader: {
     display: 'none',

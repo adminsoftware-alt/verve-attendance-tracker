@@ -179,6 +179,14 @@ export async function addTeamMember(teamId, name, email) {
   return apiPost(`/teams/${teamId}/members`, { participant_name: name, participant_email: email });
 }
 
+export async function bulkAddTeamMembers(teamId, members) {
+  return apiPost(`/teams/${teamId}/members/bulk`, { members });
+}
+
+export async function bulkImportTeams(members) {
+  return apiPost('/teams/bulk-import', { members });
+}
+
 export async function removeTeamMember(teamId, memberId) {
   return apiDelete(`/teams/${teamId}/members/${memberId}`);
 }
