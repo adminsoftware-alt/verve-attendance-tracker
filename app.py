@@ -6007,6 +6007,23 @@ def ensure_team_tables():
     )
     """
     client.query(members_sql).result()
+
+    # Employee registry - master list of all known participants
+    registry_sql = f"""
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.employee_registry` (
+        employee_id STRING NOT NULL,
+        participant_name STRING NOT NULL,
+        display_name STRING,
+        participant_email STRING,
+        status STRING DEFAULT 'active',
+        category STRING DEFAULT 'employee',
+        team_id STRING,
+        notes STRING,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    client.query(registry_sql).result()
     print("[Teams] Tables ensured")
 
 
@@ -8373,6 +8390,415 @@ def data_delete_attendance(date):
         return jsonify({'success': True})
     except Exception as e:
         print(f"[Data] Delete attendance error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# EMPLOYEE MANAGEMENT - CRUD, visitor tracking, employee detail
+# ==============================================================================
+
+@app.route('/employees', methods=['GET'])
+def list_employees():
+    """List all employees from registry. Query: ?search=name&category=employee&status=active&team_id=xxx"""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        search = request.args.get('search', '').strip()
+        category = request.args.get('category', '')
+        status = request.args.get('status', '')
+        team_id = request.args.get('team_id', '')
+
+        query = f"SELECT * FROM `{dataset_ref}.employee_registry` WHERE 1=1"
+        params = []
+
+        if search:
+            query += " AND (LOWER(participant_name) LIKE @search OR LOWER(display_name) LIKE @search OR LOWER(participant_email) LIKE @search)"
+            params.append(bigquery.ScalarQueryParameter("search", "STRING", f"%{search.lower()}%"))
+        if category:
+            query += " AND category = @category"
+            params.append(bigquery.ScalarQueryParameter("category", "STRING", category))
+        if status:
+            query += " AND status = @status"
+            params.append(bigquery.ScalarQueryParameter("status", "STRING", status))
+        if team_id:
+            query += " AND team_id = @team_id"
+            params.append(bigquery.ScalarQueryParameter("team_id", "STRING", team_id))
+
+        query += " ORDER BY participant_name"
+        job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
+        rows = list(client.query(query, job_config=job_config).result() if job_config else client.query(query).result())
+
+        employees = [{
+            'employee_id': r.employee_id,
+            'participant_name': r.participant_name,
+            'display_name': r.display_name or r.participant_name,
+            'participant_email': r.participant_email or '',
+            'status': r.status or 'active',
+            'category': r.category or 'employee',
+            'team_id': r.team_id or '',
+            'notes': r.notes or '',
+        } for r in rows]
+
+        return jsonify({'success': True, 'employees': employees, 'total': len(employees)})
+    except Exception as e:
+        print(f"[Employees] List error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees', methods=['POST'])
+def create_employee():
+    """Add employee to registry"""
+    try:
+        ensure_team_tables_once()
+        data = request.json or {}
+        name = (data.get('participant_name') or data.get('name') or '').strip()
+        if not name:
+            return jsonify({'success': False, 'error': 'name is required'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        emp_id = str(uuid_lib.uuid4())
+
+        rows = [{
+            'employee_id': emp_id,
+            'participant_name': normalize_participant_name(name),
+            'display_name': (data.get('display_name') or name).strip(),
+            'participant_email': (data.get('email') or data.get('participant_email') or '').strip(),
+            'status': (data.get('status') or 'active').strip(),
+            'category': (data.get('category') or 'employee').strip(),
+            'team_id': (data.get('team_id') or '').strip(),
+            'notes': (data.get('notes') or '').strip(),
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat(),
+        }]
+        errors = client.insert_rows_json(f"{dataset_ref}.employee_registry", rows)
+        if errors:
+            return jsonify({'success': False, 'error': str(errors)}), 500
+
+        return jsonify({'success': True, 'employee_id': emp_id})
+    except Exception as e:
+        print(f"[Employees] Create error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/<employee_id>', methods=['PUT'])
+def update_employee(employee_id):
+    """Update employee: rename, change status, category, notes"""
+    try:
+        ensure_team_tables_once()
+        data = request.json or {}
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        updates = []
+        params = [bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id)]
+
+        for field in ['participant_name', 'display_name', 'participant_email', 'status', 'category', 'team_id', 'notes']:
+            if field in data:
+                updates.append(f"{field} = @{field}")
+                params.append(bigquery.ScalarQueryParameter(field, "STRING", str(data[field] or '').strip()))
+
+        if not updates:
+            return jsonify({'success': False, 'error': 'No fields to update'}), 400
+
+        updates.append("updated_at = CURRENT_TIMESTAMP()")
+        query = f"UPDATE `{dataset_ref}.employee_registry` SET {', '.join(updates)} WHERE employee_id = @employee_id"
+        client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Employees] Update error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/<employee_id>', methods=['DELETE'])
+def delete_employee(employee_id):
+    """Delete employee from registry"""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id)]
+        )
+        client.query(f"DELETE FROM `{dataset_ref}.employee_registry` WHERE employee_id = @employee_id",
+                      job_config=job_config).result()
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Employees] Delete error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/sync-from-teams', methods=['POST'])
+def sync_employees_from_teams():
+    """Populate employee_registry from existing team_members. Run once to initialize."""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Get all team members not already in registry
+        query = f"""
+        SELECT tm.member_id, tm.team_id, tm.participant_name, tm.participant_email, t.team_name
+        FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
+        LEFT JOIN `{dataset_ref}.{BQ_TEAMS_TABLE}` t ON tm.team_id = t.team_id
+        WHERE LOWER(TRIM(tm.participant_name)) NOT IN (
+            SELECT LOWER(TRIM(participant_name)) FROM `{dataset_ref}.employee_registry`
+        )
+        """
+        rows = list(client.query(query).result())
+
+        if not rows:
+            return jsonify({'success': True, 'added': 0, 'message': 'All team members already in registry'})
+
+        inserts = []
+        for r in rows:
+            inserts.append({
+                'employee_id': str(uuid_lib.uuid4()),
+                'participant_name': normalize_participant_name(r.participant_name),
+                'display_name': normalize_participant_name(r.participant_name),
+                'participant_email': r.participant_email or '',
+                'status': 'active',
+                'category': 'employee',
+                'team_id': r.team_id or '',
+                'notes': f'Team: {r.team_name}' if r.team_name else '',
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat(),
+            })
+
+        errors = client.insert_rows_json(f"{dataset_ref}.employee_registry", inserts)
+        if errors:
+            print(f"[Employees] Sync errors: {errors[:3]}")
+
+        return jsonify({'success': True, 'added': len(inserts)})
+    except Exception as e:
+        print(f"[Employees] Sync error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/unrecognized/<date>', methods=['GET'])
+def list_unrecognized_participants(date):
+    """Find participants in Zoom on a date who are NOT in the employee registry.
+    These are visitors, interviewees, or new joiners."""
+    try:
+        ensure_team_tables_once()
+        report_date = validate_date_format(date)
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        query = f"""
+        WITH zoom_participants AS (
+            SELECT DISTINCT participant_name, participant_email
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date = @date
+              AND participant_name IS NOT NULL AND participant_name != ''
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+        ),
+        registered AS (
+            SELECT LOWER(TRIM(participant_name)) as reg_name
+            FROM `{dataset_ref}.employee_registry`
+        )
+        SELECT zp.participant_name, zp.participant_email
+        FROM zoom_participants zp
+        WHERE LOWER(TRIM(zp.participant_name)) NOT IN (SELECT reg_name FROM registered)
+        ORDER BY zp.participant_name
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "STRING", report_date)]
+        )
+        rows = list(client.query(query, job_config=job_config).result())
+
+        # Also normalize and check
+        participants = []
+        for r in rows:
+            base = normalize_participant_name(r.participant_name)
+            participants.append({
+                'participant_name': r.participant_name,
+                'normalized_name': base,
+                'participant_email': r.participant_email or '',
+            })
+
+        return jsonify({
+            'success': True,
+            'date': report_date,
+            'unrecognized': participants,
+            'count': len(participants)
+        })
+    except Exception as e:
+        print(f"[Employees] Unrecognized error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/<employee_id>/attendance/<date>', methods=['GET'])
+def employee_attendance_detail(employee_id, date):
+    """Get detailed attendance for one employee for a month.
+    date format: YYYY-MM (will fetch full month)"""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Get employee info
+        emp_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id)]
+        )
+        emp_rows = list(client.query(
+            f"SELECT * FROM `{dataset_ref}.employee_registry` WHERE employee_id = @employee_id",
+            job_config=emp_config
+        ).result())
+        if not emp_rows:
+            return jsonify({'success': False, 'error': 'Employee not found'}), 404
+
+        emp = emp_rows[0]
+        emp_name = emp.participant_name
+
+        # Parse year-month
+        parts = date.split('-')
+        year = int(parts[0])
+        month = int(parts[1]) if len(parts) > 1 else get_ist_now().month
+        from calendar import monthrange
+        _, last_day = monthrange(year, month)
+        start_date = f"{year}-{month:02d}-01"
+        end_date = f"{year}-{month:02d}-{last_day:02d}"
+
+        # Get daily data
+        query = f"""
+        WITH snaps AS (
+            SELECT
+                s.event_date,
+                MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as first_seen,
+                MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as last_seen,
+                TIMESTAMP_DIFF(MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)),
+                               MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)), MINUTE) as active_mins,
+                COUNT(DISTINCT s.snapshot_time) as snap_count
+            FROM `{dataset_ref}.room_snapshots` s
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND LOWER(TRIM(s.participant_name)) = LOWER(TRIM(@emp_name))
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+            GROUP BY s.event_date
+        ),
+        breaks AS (
+            SELECT
+                s.event_date,
+                SUM(CASE WHEN TIMESTAMP_DIFF(s.snapshot_time, LAG(s.snapshot_time)
+                    OVER (PARTITION BY s.event_date ORDER BY s.snapshot_time), SECOND) > 60
+                    THEN TIMESTAMP_DIFF(s.snapshot_time, LAG(s.snapshot_time)
+                    OVER (PARTITION BY s.event_date ORDER BY s.snapshot_time), SECOND) - 30
+                    ELSE 0 END) as break_secs
+            FROM `{dataset_ref}.room_snapshots` s
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND LOWER(TRIM(s.participant_name)) = LOWER(TRIM(@emp_name))
+              AND s.room_name IS NOT NULL
+            GROUP BY s.event_date
+        ),
+        isolation AS (
+            SELECT
+                s.event_date,
+                COUNT(*) * 30 as iso_secs
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN (
+                SELECT snapshot_time, room_name, COUNT(DISTINCT participant_name) as cnt
+                FROM `{dataset_ref}.room_snapshots`
+                WHERE event_date >= @start_date AND event_date <= @end_date
+                  AND room_name IS NOT NULL AND room_name != ''
+                  AND LOWER(participant_name) NOT LIKE '%scout%'
+                GROUP BY snapshot_time, room_name
+            ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND LOWER(TRIM(s.participant_name)) = LOWER(TRIM(@emp_name))
+              AND ro.cnt = 1
+            GROUP BY s.event_date
+        )
+        SELECT
+            sn.event_date,
+            FORMAT_TIMESTAMP('%H:%M', sn.first_seen) as first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', sn.last_seen) as last_seen_ist,
+            sn.active_mins,
+            COALESCE(ROUND(b.break_secs / 60), 0) as break_mins,
+            COALESCE(ROUND(i.iso_secs / 60), 0) as isolation_mins
+        FROM snaps sn
+        LEFT JOIN breaks b ON sn.event_date = b.event_date
+        LEFT JOIN isolation i ON sn.event_date = i.event_date
+        ORDER BY sn.event_date
+        """
+
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
+            bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+            bigquery.ScalarQueryParameter("emp_name", "STRING", emp_name),
+        ])
+        rows = list(client.query(query, job_config=job_config).result())
+
+        daily = []
+        total_active = 0
+        total_break = 0
+        total_iso = 0
+        days_present = 0
+        for r in rows:
+            active = r.active_mins or 0
+            brk = int(r.break_mins or 0)
+            iso = int(r.isolation_mins or 0)
+            status = 'Present' if active >= 300 else 'Half Day' if active >= 240 else 'Absent'
+            if status in ('Present', 'Half Day'):
+                days_present += 1
+            total_active += active
+            total_break += brk
+            total_iso += iso
+            daily.append({
+                'date': str(r.event_date),
+                'first_seen_ist': r.first_seen_ist,
+                'last_seen_ist': r.last_seen_ist,
+                'active_minutes': active,
+                'break_minutes': brk,
+                'isolation_minutes': iso,
+                'status': status,
+            })
+
+        # CSV download
+        if request.args.get('format') == 'csv':
+            import csv, io
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow([f'Employee: {emp_name}'])
+            writer.writerow([f'Period: {start_date} to {end_date}'])
+            writer.writerow([f'Days Present: {days_present}', f'Total Active: {total_active}m',
+                             f'Total Break: {total_break}m', f'Total Isolation: {total_iso}m'])
+            writer.writerow([])
+            writer.writerow(['Date', 'Status', 'First Seen', 'Last Seen', 'Active (min)', 'Break (min)', 'Isolation (min)'])
+            for d in daily:
+                writer.writerow([d['date'], d['status'], d['first_seen_ist'], d['last_seen_ist'],
+                                 d['active_minutes'], d['break_minutes'], d['isolation_minutes']])
+            return Response(output.getvalue(), mimetype='text/csv',
+                            headers={'Content-Disposition': f'attachment; filename={emp_name.replace(" ", "_")}_{year}_{month:02d}.csv'})
+
+        return jsonify({
+            'success': True,
+            'employee': {
+                'employee_id': emp.employee_id,
+                'name': emp_name,
+                'display_name': emp.display_name or emp_name,
+                'email': emp.participant_email or '',
+                'status': emp.status,
+                'category': emp.category,
+            },
+            'period': f'{start_date} to {end_date}',
+            'days_present': days_present,
+            'total_active_mins': total_active,
+            'total_break_mins': total_break,
+            'total_isolation_mins': total_iso,
+            'daily': daily,
+        })
+    except Exception as e:
+        print(f"[Employees] Detail error: {e}")
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

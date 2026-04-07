@@ -15,6 +15,7 @@ import TeamCompare from './components/TeamCompare';
 import TeamDashboard from './components/TeamDashboard';
 import CalendarView from './components/CalendarView';
 import ReportBuilder from './components/ReportBuilder';
+import EmployeeManager from './components/EmployeeManager';
 import { FullPageLoader } from './components/LoadingSpinner';
 
 // Pages managers are allowed to see
@@ -90,6 +91,9 @@ export default function App() {
         )}
         {!isManager && page === 'compare' && (
           <TeamCompare />
+        )}
+        {!isManager && page === 'registry' && (
+          <EmployeeManager user={user} />
         )}
 
         {/* Shared pages (all roles) */}

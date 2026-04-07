@@ -10,6 +10,7 @@ const ADMIN_NAV = [
   { key: 'calendar', label: 'Calendar', icon: '\u{1F4C6}' },
   { key: 'reports', label: 'Reports', icon: '\u{1F4CB}' },
   { key: 'compare', label: 'Compare', icon: '\u{1F504}' },
+  { key: 'registry', label: 'Registry', icon: '\u{1F4CB}' },
   { key: 'upload', label: 'Upload', icon: '\u{1F4E4}' },
 ];
 

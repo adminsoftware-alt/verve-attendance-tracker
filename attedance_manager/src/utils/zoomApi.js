@@ -226,3 +226,38 @@ export function getTeamMonthlyEmployeeCsvUrl(teamId, year, month) {
 export function getTeamSummaryCsvUrl(teamId, year, month) {
   return `${ZOOM_API_BASE}/teams/${teamId}/report/monthly?year=${year}&month=${month}&format=team_summary_csv`;
 }
+
+// ─── EMPLOYEE REGISTRY ─────────────────────────────────
+
+export async function fetchEmployees(params = {}) {
+  const q = new URLSearchParams(params).toString();
+  return apiFetch(`/employees${q ? '?' + q : ''}`);
+}
+
+export async function createEmployee(data) {
+  return apiPost('/employees', data);
+}
+
+export async function updateEmployee(id, data) {
+  return apiPut(`/employees/${id}`, data);
+}
+
+export async function deleteEmployee(id) {
+  return apiDelete(`/employees/${id}`);
+}
+
+export async function syncEmployeesFromTeams() {
+  return apiPost('/employees/sync-from-teams', {});
+}
+
+export async function fetchUnrecognized(date) {
+  return apiFetch(`/employees/unrecognized/${date}`);
+}
+
+export async function fetchEmployeeDetail(employeeId, yearMonth) {
+  return apiFetch(`/employees/${employeeId}/attendance/${yearMonth}`);
+}
+
+export function getEmployeeCsvUrl(employeeId, yearMonth) {
+  return `${ZOOM_API_BASE}/employees/${employeeId}/attendance/${yearMonth}?format=csv`;
+}

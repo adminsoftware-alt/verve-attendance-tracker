@@ -10,11 +10,24 @@ const STORAGE_KEY = 'verve_attendance_data';
 // ─── AUTH ───────────────────────────────────────────────
 
 const DEFAULT_USERS = [
+  // Admin accounts
   { username: 'admin', password: 'verve2026', name: 'Admin', role: 'admin', email: '' },
-  { username: 'hr1', password: 'verve2026', name: 'HR User 1', role: 'hr', email: '' },
-  { username: 'hr2', password: 'verve2026', name: 'HR User 2', role: 'hr', email: '' },
-  { username: 'manager1', password: 'verve2026', name: 'Manager 1', role: 'manager', email: '' },
-  { username: 'manager2', password: 'verve2026', name: 'Manager 2', role: 'manager', email: '' },
+  { username: 'shashank', password: 'verve2026', name: 'Shashank Channawar', role: 'admin', email: 'shashank.channawar@verveadvisory.com' },
+  { username: 'harsh', password: 'verve2026', name: 'Harsh Jain', role: 'admin', email: 'harsh.jain@verveadvisory.com' },
+  // Manager accounts (name matches team manager_name for filtering)
+  { username: 'teaminfrbeat@', password: 'verve2026', name: 'Team Infrabeat', role: 'manager', email: '' },
+  { username: 'teamharshal@', password: 'verve2026', name: 'Team Harshal', role: 'manager', email: '' },
+  { username: 'teamaccounts@', password: 'verve2026', name: 'Team Accounts', role: 'manager', email: '' },
+  { username: 'teamatish@', password: 'verve2026', name: 'Team Atish', role: 'manager', email: '' },
+  { username: 'teamunimed@', password: 'verve2026', name: 'Team Unimed', role: 'manager', email: '' },
+  { username: 'teamaaron@', password: 'verve2026', name: 'Team Aaron', role: 'manager', email: '' },
+  { username: 'teampriya@', password: 'verve2026', name: 'Team Priya', role: 'manager', email: '' },
+  { username: 'infrabeatclient@', password: 'verve2026', name: 'Infrabeat Client', role: 'manager', email: '' },
+  { username: 'vridam@', password: 'verve2026', name: 'Vridam', role: 'manager', email: '' },
+  { username: 'accurestclient@', password: 'verve2026', name: 'Accurest Client', role: 'manager', email: '' },
+  { username: 'kprckuldeep@', password: 'verve2026', name: 'KPRC Client-Kuldeep Sir', role: 'manager', email: '' },
+  { username: 'kprcpawan@', password: 'verve2026', name: 'KPRC Client-Pawan Sir', role: 'manager', email: '' },
+  { username: 'kprcyogendra@', password: 'verve2026', name: 'KPRC Client-Yogendra Sir', role: 'manager', email: '' },
 ];
 
 export async function validateLogin(username, password) {
