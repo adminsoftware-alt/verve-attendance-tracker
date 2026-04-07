@@ -8586,50 +8586,126 @@ def sync_employees_from_teams():
 @app.route('/employees/unrecognized/<date>', methods=['GET'])
 def list_unrecognized_participants(date):
     """Find participants in Zoom on a date who are NOT in the employee registry.
-    These are visitors, interviewees, or new joiners."""
+    Uses smart multi-pass matching: exact, normalized, team-keyword-stripped, first-name."""
     try:
         ensure_team_tables_once()
         report_date = validate_date_format(date)
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        query = f"""
-        WITH zoom_participants AS (
-            SELECT DISTINCT participant_name, participant_email
-            FROM `{dataset_ref}.room_snapshots`
-            WHERE event_date = @date
-              AND participant_name IS NOT NULL AND participant_name != ''
-              AND LOWER(participant_name) NOT LIKE '%scout%'
-        ),
-        registered AS (
-            SELECT LOWER(TRIM(participant_name)) as reg_name
-            FROM `{dataset_ref}.employee_registry`
-        )
-        SELECT zp.participant_name, zp.participant_email
-        FROM zoom_participants zp
-        WHERE LOWER(TRIM(zp.participant_name)) NOT IN (SELECT reg_name FROM registered)
-        ORDER BY zp.participant_name
+        # 1. Get all zoom participants for the date
+        zoom_query = f"""
+        SELECT DISTINCT participant_name, participant_email
+        FROM `{dataset_ref}.room_snapshots`
+        WHERE event_date = @date
+          AND participant_name IS NOT NULL AND participant_name != ''
+          AND LOWER(participant_name) NOT LIKE '%scout%'
+        ORDER BY participant_name
         """
         job_config = bigquery.QueryJobConfig(
             query_parameters=[bigquery.ScalarQueryParameter("date", "STRING", report_date)]
         )
-        rows = list(client.query(query, job_config=job_config).result())
+        zoom_rows = list(client.query(zoom_query, job_config=job_config).result())
 
-        # Also normalize and check
-        participants = []
-        for r in rows:
-            base = normalize_participant_name(r.participant_name)
-            participants.append({
-                'participant_name': r.participant_name,
-                'normalized_name': base,
-                'participant_email': r.participant_email or '',
+        # 2. Get registered employees with team info
+        reg_query = f"""
+        SELECT e.participant_name, e.display_name, e.team_id, t.team_name
+        FROM `{dataset_ref}.employee_registry` e
+        LEFT JOIN `{dataset_ref}.teams` t ON e.team_id = t.team_id
+        """
+        reg_rows = list(client.query(reg_query).result())
+
+        # 3. Build matching structures
+        reg_names = set()  # all known lowercase names
+        reg_first_names = {}  # first_name -> [full_names]
+        for r in reg_rows:
+            name_low = r.participant_name.lower().strip()
+            reg_names.add(name_low)
+            normed = normalize_participant_name(r.participant_name).lower().strip()
+            reg_names.add(normed)
+            if r.display_name:
+                reg_names.add(r.display_name.lower().strip())
+            # Index by first name
+            first = name_low.split()[0] if name_low.split() else ''
+            if first and len(first) >= 3:
+                reg_first_names.setdefault(first, []).append(name_low)
+
+        # 4. Extract team keywords from team names
+        team_keywords = set()
+        seen_teams = set()
+        for r in reg_rows:
+            tn = r.team_name
+            if not tn or tn in seen_teams:
+                continue
+            seen_teams.add(tn)
+            for word in tn.replace('-', ' ').split():
+                wl = word.lower()
+                if wl not in ('team', 'client', 'sir') and len(wl) >= 3:
+                    team_keywords.add(wl)
+
+        def _strip_team_and_clean(name):
+            """Strip team keywords, professional prefixes, and invisible chars from a name."""
+            n = name
+            for kw in team_keywords:
+                pat = _re.escape(kw)
+                # Suffix: Name_KPRC, Name-KPRC, Name - KPRC, Name KPRC
+                n = _re.sub(r'[\s_-]+' + pat + r'$', '', n, flags=_re.IGNORECASE)
+                # Prefix: KPRC_Name, KPRC-Name, KPRC Name
+                n = _re.sub(r'^' + pat + r'[\s_-]+', '', n, flags=_re.IGNORECASE)
+            # Professional prefixes (CA, CS, Dr, Er)
+            n = _re.sub(r'^(ca|cs|dr|er)\s+', '', n, flags=_re.IGNORECASE)
+            # Soft hyphens and zero-width chars
+            n = _re.sub(r'[\u00ad\u200b\u200c\u200d]', '', n)
+            return n.strip()
+
+        def is_recognized(raw_name):
+            """Multi-pass matching against employee registry."""
+            # Pass 1: Exact match on raw name
+            raw_low = raw_name.lower().strip()
+            if raw_low in reg_names:
+                return True
+
+            # Pass 2: Normalized match (strips rejoin suffixes like -2, _text)
+            normed = normalize_participant_name(raw_name).lower().strip()
+            if normed in reg_names:
+                return True
+
+            # Pass 3: Strip team keywords + professional prefixes, then exact match
+            cleaned = _strip_team_and_clean(normed)
+            if cleaned and cleaned in reg_names:
+                return True
+
+            # Pass 4: Check if any registered full name is contained in the zoom name
+            for rn in reg_names:
+                if len(rn) >= 4 and rn in normed:
+                    return True
+
+            # Pass 5: First-name match (single-word cleaned name matches a registered first name)
+            if cleaned and ' ' not in cleaned and len(cleaned) >= 3:
+                if cleaned in reg_first_names:
+                    return True
+
+            return False
+
+        # 5. Filter unrecognized
+        unrecognized = []
+        for zp in zoom_rows:
+            raw = zp.participant_name
+            if is_recognized(raw):
+                continue
+            normed = normalize_participant_name(raw)
+            cleaned = _strip_team_and_clean(normed)
+            unrecognized.append({
+                'participant_name': raw,
+                'normalized_name': cleaned if cleaned != normed else normed,
+                'participant_email': zp.participant_email or '',
             })
 
         return jsonify({
             'success': True,
             'date': report_date,
-            'unrecognized': participants,
-            'count': len(participants)
+            'unrecognized': unrecognized,
+            'count': len(unrecognized)
         })
     except Exception as e:
         print(f"[Employees] Unrecognized error: {e}")
