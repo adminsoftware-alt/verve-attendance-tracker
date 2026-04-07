@@ -2804,6 +2804,9 @@ def monitor_health():
         last_ist = (last_snap + timedelta(hours=5, minutes=30)).strftime('%H:%M:%S') if last_snap else None
         current_ist = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime('%H:%M:%S')
 
+        # Return 503 if not healthy (for GCP Uptime Check alerting)
+        http_code = 200 if status == 'HEALTHY' else 503
+
         return jsonify({
             'status': status,
             'message': message,
@@ -2819,7 +2822,7 @@ def monitor_health():
             'seconds_since_last': seconds_since,
             'is_meeting_hours': is_meeting_hours,
             'needs_attention': should_alert
-        })
+        }), http_code
     except Exception as e:
         return jsonify({
             'status': 'ERROR',
