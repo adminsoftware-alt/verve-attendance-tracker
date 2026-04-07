@@ -222,6 +222,9 @@ export default function DataEditor({ user }) {
               <button onClick={() => openEdit('snapshots', 'participant_name')} disabled={!selectedSnaps.size} style={{ ...S.actionBtn, ...S.editBtn }}>
                 Edit Name
               </button>
+              <button onClick={() => openEdit('snapshots', 'snapshot_time')} disabled={!selectedSnaps.size} style={{ ...S.actionBtn, ...S.editBtn }}>
+                Edit Time
+              </button>
               <button onClick={() => handleDelete('snapshots')} disabled={!selectedSnaps.size} style={{ ...S.actionBtn, ...S.deleteBtn }}>
                 Delete Selected
               </button>
@@ -280,6 +283,9 @@ export default function DataEditor({ user }) {
               <button onClick={() => openEdit('events', 'event_type')} disabled={!selectedEvents.size} style={{ ...S.actionBtn, ...S.editBtn }}>
                 Edit Type
               </button>
+              <button onClick={() => openEdit('events', 'event_timestamp')} disabled={!selectedEvents.size} style={{ ...S.actionBtn, ...S.editBtn }}>
+                Edit Time
+              </button>
               <button onClick={() => handleDelete('events')} disabled={!selectedEvents.size} style={{ ...S.actionBtn, ...S.deleteBtn }}>
                 Delete Selected
               </button>
@@ -332,9 +338,11 @@ export default function DataEditor({ user }) {
               Edit {editField.replace('_', ' ')} ({editModal === 'snapshots' ? selectedSnaps.size : selectedEvents.size} rows)
             </h3>
             <input
+              type={editField === 'snapshot_time' || editField === 'event_timestamp' ? 'datetime-local' : 'text'}
+              step={editField === 'snapshot_time' || editField === 'event_timestamp' ? '1' : undefined}
               value={editValue}
               onChange={e => setEditValue(e.target.value)}
-              placeholder={`New ${editField.replace('_', ' ')}...`}
+              placeholder={`New ${editField.replace(/_/g, ' ')}...`}
               style={S.modalInput}
               autoFocus
               onKeyDown={e => e.key === 'Enter' && handleEdit()}
