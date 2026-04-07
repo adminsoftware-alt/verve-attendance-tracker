@@ -8127,6 +8127,7 @@ def auth_login():
             FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.app_users`
             WHERE LOWER(TRIM(username)) = LOWER(@username)
               AND TRIM(password) = @password
+            ORDER BY CASE role WHEN 'superadmin' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
             LIMIT 1
         """
         job_config = bigquery.QueryJobConfig(
