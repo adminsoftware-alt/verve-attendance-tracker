@@ -122,6 +122,7 @@ const s = {
     display: 'flex',
     flexDirection: 'column',
     gap: 2,
+    overflowY: 'auto',
   },
   navBtn: {
     display: 'flex',
