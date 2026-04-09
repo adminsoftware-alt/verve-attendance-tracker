@@ -5,32 +5,28 @@ import Login from './components/Login';
 import Sidebar from './components/Sidebar';
 import DayView from './components/DayView';
 import Employees from './components/Employees';
-import Rooms from './components/Rooms';
-import Isolation from './components/Isolation';
-import Upload from './components/Upload';
+import RoomAnalytics from './components/RoomAnalytics';
 import LiveDashboard from './components/LiveDashboard';
 import Teams from './components/Teams';
 import TeamView from './components/TeamView';
 import TeamCompare from './components/TeamCompare';
 import TeamDashboard from './components/TeamDashboard';
-import CalendarView from './components/CalendarView';
 import ReportBuilder from './components/ReportBuilder';
 import EmployeeManager from './components/EmployeeManager';
 import DataEditor from './components/DataEditor';
 import { FullPageLoader } from './components/LoadingSpinner';
 
 // Pages managers are allowed to see
-const MANAGER_PAGES = new Set(['dashboard', 'teamview', 'calendar', 'reports', 'teams']);
+const MANAGER_PAGES = new Set(['dashboard', 'teamview', 'reports', 'teams']);
 
 export default function App() {
   const [user, setUser] = useState(getSession);
-  const [refreshKey, setRefreshKey] = useState(0);
 
   const isManager = user?.role === 'manager';
   const defaultPage = isManager ? 'dashboard' : 'live';
   const [page, setPage] = useState(defaultPage);
 
-  const { data: allData, dates: uploadedDates, loading } = useAllData(refreshKey);
+  const { data: allData, dates: uploadedDates, loading } = useAllData(0);
 
   const handleLogin = useCallback((u) => {
     setUser(u);
@@ -38,7 +34,6 @@ export default function App() {
     setPage(u?.role === 'manager' ? 'dashboard' : 'live');
   }, []);
   const handleLogout = useCallback(() => { clearSession(); setUser(null); }, []);
-  const handleDataChange = useCallback(() => setRefreshKey(k => k + 1), []);
 
   // Guard: manager can't access admin pages
   const handleNav = useCallback((p) => {
@@ -75,22 +70,16 @@ export default function App() {
         {!isManager && !loading && page === 'day' && (
           <DayView allData={allData} uploadedDates={uploadedDates} onNavigateUpload={() => setPage('upload')} />
         )}
-        {!isManager && !loading && page === 'employees' && (
-          <Employees allData={allData} uploadedDates={uploadedDates} />
+        {!isManager && page === 'employees' && (
+          <Employees user={user} />
         )}
-        {!isManager && !loading && page === 'rooms' && (
-          <Rooms allData={allData} uploadedDates={uploadedDates} />
-        )}
-        {!isManager && !loading && page === 'isolation' && (
-          <Isolation allData={allData} uploadedDates={uploadedDates} />
-        )}
-        {!isManager && page === 'upload' && (
-          <Upload onDataChange={handleDataChange} user={user} />
+        {!isManager && !loading && page === 'roomanalytics' && (
+          <RoomAnalytics allData={allData} uploadedDates={uploadedDates} />
         )}
         {!isManager && page === 'live' && (
           <LiveDashboard />
         )}
-        {!isManager && page === 'compare' && (
+        {user?.role === 'superadmin' && page === 'compare' && (
           <TeamCompare />
         )}
         {!isManager && page === 'registry' && (
@@ -109,9 +98,6 @@ export default function App() {
         )}
         {page === 'teamview' && (
           <TeamView user={user} />
-        )}
-        {page === 'calendar' && (
-          <CalendarView user={user} />
         )}
         {page === 'reports' && (
           <ReportBuilder user={user} />

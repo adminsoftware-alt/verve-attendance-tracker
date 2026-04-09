@@ -2,26 +2,22 @@ const ADMIN_NAV = [
   { key: 'live', label: 'Live', icon: '\u{1F4E1}' },
   { key: 'day', label: 'Day View', icon: '\u{1F4C5}' },
   { key: 'employees', label: 'Employees', icon: '\u{1F465}' },
-  { key: 'rooms', label: 'Rooms', icon: '\u{1F3E2}' },
-  { key: 'isolation', label: 'Isolation', icon: '\u{1F6A8}' },
+  { key: 'roomanalytics', label: 'Room Analytics', icon: '\u{1F3E2}' },
   { key: 'dashboard', label: 'Dashboard', icon: '\u{1F3E0}' },
   { key: 'teams', label: 'Teams', icon: '\u{1F46A}' },
   { key: 'teamview', label: 'Team View', icon: '\u{1F4CA}' },
-  { key: 'calendar', label: 'Calendar', icon: '\u{1F4C6}' },
   { key: 'reports', label: 'Reports', icon: '\u{1F4CB}' },
-  { key: 'compare', label: 'Compare', icon: '\u{1F504}' },
   { key: 'registry', label: 'Registry', icon: '\u{1F4CB}' },
-  { key: 'upload', label: 'Upload', icon: '\u{1F4E4}' },
 ];
 
 const SUPERADMIN_EXTRA = [
+  { key: 'compare', label: 'Compare', icon: '\u{1F504}' },
   { key: 'dataeditor', label: 'Data Editor', icon: '\u{1F527}' },
 ];
 
 const MANAGER_NAV = [
   { key: 'dashboard', label: 'Dashboard', icon: '\u{1F3E0}' },
   { key: 'teamview', label: 'Team View', icon: '\u{1F4CA}' },
-  { key: 'calendar', label: 'Calendar', icon: '\u{1F4C6}' },
   { key: 'reports', label: 'Reports', icon: '\u{1F4CB}' },
   { key: 'teams', label: 'My Teams', icon: '\u{1F46A}' },
 ];
@@ -71,9 +67,6 @@ export default function Sidebar({ active, onNav, user, onLogout, uploadedDates }
             >
               <span style={{ fontSize: 15, width: 22, textAlign: 'center' }}>{item.icon}</span>
               <span>{item.label}</span>
-              {item.key === 'upload' && uploadedDates?.length > 0 && (
-                <span style={s.badge}>{uploadedDates.length}</span>
-              )}
             </button>
           );
         })}

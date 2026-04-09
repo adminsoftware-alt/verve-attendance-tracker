@@ -211,6 +211,23 @@ export async function fetchTeamComparison(teamIds, date) {
   return apiFetch(`/teams/compare?ids=${teamIds.join(',')}&date=${date}`);
 }
 
+// ─── TEAM HOLIDAYS ─────────────────────────────────────
+export async function fetchTeamHolidays(teamId, year, month) {
+  const q = new URLSearchParams();
+  if (year) q.set('year', year);
+  if (month) q.set('month', month);
+  const qs = q.toString();
+  return apiFetch(`/teams/${teamId}/holidays${qs ? '?' + qs : ''}`);
+}
+
+export async function addTeamHoliday(teamId, date, description) {
+  return apiPost(`/teams/${teamId}/holidays`, { date, description: description || '' });
+}
+
+export async function deleteTeamHoliday(teamId, holidayId) {
+  return apiDelete(`/teams/${teamId}/holidays/${holidayId}`);
+}
+
 export function getTeamRangeCsvUrl(teamId, startDate, endDate) {
   return `${ZOOM_API_BASE}/teams/${teamId}/attendance/range?start=${startDate}&end=${endDate}&format=csv`;
 }

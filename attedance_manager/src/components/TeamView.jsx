@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   fetchTeams, fetchTeamAttendance, fetchTeamAttendanceRange,
-  fetchTeamMonthlyReport, getTeamRangeCsvUrl, getTeamMonthlyCsvUrl,
-  getTeamMonthlyEmployeeCsvUrl, getTeamSummaryCsvUrl
+  fetchTeamMonthlyReport, getTeamRangeCsvUrl
 } from '../utils/zoomApi';
+import { downloadTeamPivotExcel } from '../utils/teamPivotExcel';
+import MonthlyPivotTables from './MonthlyPivotTables';
+import HolidayManager from './HolidayManager';
 
 function istDate() {
   const now = new Date();
@@ -47,6 +49,7 @@ export default function TeamView({ user }) {
   const [dataLoading, setDataLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [showHolidayModal, setShowHolidayModal] = useState(false);
 
   // Manager filtering
   const isManager = user?.role === 'manager';
@@ -114,24 +117,28 @@ export default function TeamView({ user }) {
     if (!selectedTeam) return;
     window.open(getTeamRangeCsvUrl(selectedTeam, startDate, endDate), '_blank');
   };
-  const downloadMonthlyCsv = () => {
+  const downloadPivotExcel = async () => {
     if (!selectedTeam) return;
-    window.open(getTeamMonthlyCsvUrl(selectedTeam, year, month), '_blank');
-  };
-  const downloadEmployeeCsv = () => {
-    if (!selectedTeam) return;
-    window.open(getTeamMonthlyEmployeeCsvUrl(selectedTeam, year, month), '_blank');
-  };
-  const downloadSummaryCsv = () => {
-    if (!selectedTeam) return;
-    window.open(getTeamSummaryCsvUrl(selectedTeam, year, month), '_blank');
+    try {
+      // Ensure we have fresh data for the selected month
+      let data = monthlyData;
+      if (!data || data.team_id !== selectedTeam || data.year !== year || data.month !== month) {
+        setDataLoading(true);
+        data = await fetchTeamMonthlyReport(selectedTeam, year, month);
+        setMonthlyData(data);
+        setDataLoading(false);
+      }
+      const team = teams.find(t => t.team_id === selectedTeam) || {};
+      downloadTeamPivotExcel(data, team, year, month);
+    } catch (e) {
+      setError(e.message);
+      setDataLoading(false);
+    }
   };
 
   if (loading && teams.length === 0) return <div style={s.loader}>Loading...</div>;
 
   const dailyMembers = attendance?.participants || [];
-  const monthlySummary = monthlyData?.member_summary || [];
-  const monthlyDaily = monthlyData?.daily_data || [];
   const rangeSummary = rangeData?.member_summary || [];
   const rangeDaily = rangeData?.daily_data || [];
 
@@ -185,9 +192,8 @@ export default function TeamView({ user }) {
                 <option key={i} value={i + 1}>{m}</option>
               ))}
             </select>
-            <button onClick={downloadMonthlyCsv} style={s.csvBtn}>CSV</button>
-            <button onClick={downloadEmployeeCsv} style={s.empCsvBtn}>Report Cards</button>
-            <button onClick={downloadSummaryCsv} style={s.summCsvBtn}>Team Summary</button>
+            <button onClick={downloadPivotExcel} style={s.pivotXlsxBtn} title="Monthly pivot Excel with hours, isolation, and leaves">Download Excel Report</button>
+            <button onClick={() => setShowHolidayModal(true)} style={s.holidayBtn} title="Manage team holidays" disabled={!selectedTeam}>Manage Holidays</button>
           </div>
         )}
         <button onClick={loadAttendance} disabled={dataLoading} style={s.refreshBtn}>
@@ -356,72 +362,24 @@ export default function TeamView({ user }) {
             </div>
           )}
 
-          {monthlySummary.length > 0 && (
-            <>
-              <h3 style={s.sectionTitle}>Member Summary</h3>
-              <div style={{ ...s.tableWrap, marginBottom: 24 }}>
-                <table style={s.table}>
-                  <thead>
-                    <tr>
-                      <th style={s.th}>Name</th>
-                      <th style={s.th}>Days Present</th>
-                      <th style={s.th}>Total Active</th>
-                      <th style={s.th}>Total Break</th>
-                      <th style={s.th}>Total Isolation</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {monthlySummary.map((m, i) => (
-                      <tr key={i} style={i % 2 === 0 ? s.trEven : {}}>
-                        <td style={{ ...s.td, fontWeight: 600 }}>{m.name}</td>
-                        <td style={s.td}><span style={{ ...s.badge, background: '#eff6ff', color: '#2563eb' }}>{m.days_present}</span></td>
-                        <td style={{ ...s.td, color: '#10b981', fontWeight: 600 }}>{fmtMins(m.total_active_mins)}</td>
-                        <td style={{ ...s.td, color: '#f97316' }}>{fmtMins(m.total_break_mins)}</td>
-                        <td style={{ ...s.td, color: '#64748b' }}>{fmtMins(m.total_isolation_mins)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          )}
-
-          {monthlyDaily.length > 0 ? (
-            <>
-              <h3 style={s.sectionTitle}>Daily Breakdown</h3>
-              <div style={s.tableWrap}>
-                <table style={s.table}>
-                  <thead>
-                    <tr>
-                      <th style={s.th}>Date</th>
-                      <th style={s.th}>Name</th>
-                      <th style={s.th}>First Seen</th>
-                      <th style={s.th}>Last Seen</th>
-                      <th style={s.th}>Active</th>
-                      <th style={s.th}>Break</th>
-                      <th style={s.th}>Isolation</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {monthlyDaily.map((d, i) => (
-                      <tr key={i} style={i % 2 === 0 ? s.trEven : {}}>
-                        <td style={{ ...s.td, fontWeight: 500 }}>{d.date}</td>
-                        <td style={s.td}>{d.name}</td>
-                        <td style={s.td}>{d.first_seen_ist || '-'}</td>
-                        <td style={s.td}>{d.last_seen_ist || '-'}</td>
-                        <td style={{ ...s.td, color: '#10b981', fontWeight: 600 }}>{fmtMins(d.active_minutes)}</td>
-                        <td style={{ ...s.td, color: '#f97316' }}>{fmtMins(d.break_minutes)}</td>
-                        <td style={{ ...s.td, color: '#64748b' }}>{fmtMins(d.isolation_minutes)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          ) : (
-            <div style={s.empty}>No attendance data for this month.</div>
-          )}
+          <MonthlyPivotTables
+            monthlyData={monthlyData}
+            year={year}
+            month={month}
+            holidays={monthlyData?.holidays || []}
+          />
         </div>
+      )}
+
+      {showHolidayModal && selectedTeam && (
+        <HolidayManager
+          teamId={selectedTeam}
+          teamName={teams.find(t => t.team_id === selectedTeam)?.team_name || ''}
+          year={year}
+          month={month}
+          onClose={() => setShowHolidayModal(false)}
+          onChange={loadAttendance}
+        />
       )}
 
       {dataLoading && <div style={s.loadingOverlay}><div style={s.spinner} />Loading...</div>}
@@ -452,8 +410,8 @@ const s = {
   dateInput: { padding: '8px 12px', border: '1px solid #d1d5db', borderRadius: 8, fontSize: 13 },
   refreshBtn: { padding: '8px 16px', background: '#f1f5f9', color: '#475569', border: '1px solid #e5e7eb', borderRadius: 8, fontSize: 12, cursor: 'pointer' },
   csvBtn: { padding: '7px 14px', background: '#10b981', color: '#fff', border: 'none', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' },
-  empCsvBtn: { padding: '7px 14px', background: '#8b5cf6', color: '#fff', border: 'none', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' },
-  summCsvBtn: { padding: '7px 14px', background: '#0f172a', color: '#fff', border: 'none', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' },
+  pivotXlsxBtn: { padding: '8px 18px', background: '#f97316', color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: 'pointer', boxShadow: '0 2px 4px rgba(249,115,22,0.35)' },
+  holidayBtn: { padding: '8px 14px', background: '#fff', color: '#0f172a', border: '1px solid #cbd5e1', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' },
 
   error: { padding: '10px 14px', background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: 10, fontSize: 13, marginBottom: 16 },
   loader: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '50vh', color: '#94a3b8' },

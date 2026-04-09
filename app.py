@@ -354,6 +354,7 @@ BQ_QOS_TABLE = 'qos_data'
 BQ_CALIBRATION_STATE_TABLE = 'calibration_state'
 BQ_TEAMS_TABLE = 'teams'
 BQ_TEAM_MEMBERS_TABLE = 'team_members'
+BQ_TEAM_HOLIDAYS_TABLE = 'team_holidays'
 
 # Email Configuration
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
@@ -6027,6 +6028,19 @@ def ensure_team_tables():
     )
     """
     client.query(registry_sql).result()
+
+    # Team holidays - per-team holiday dates (so different teams can have
+    # different holiday calendars)
+    holidays_sql = f"""
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{BQ_TEAM_HOLIDAYS_TABLE}` (
+        holiday_id STRING NOT NULL,
+        team_id STRING NOT NULL,
+        holiday_date DATE NOT NULL,
+        description STRING,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    client.query(holidays_sql).result()
     print("[Teams] Tables ensured")
 
 
@@ -7603,6 +7617,35 @@ def team_monthly_report(team_id):
             return Response(csv_content, mimetype='text/csv',
                             headers={'Content-Disposition': f'attachment; filename={filename}'})
 
+        # Load holidays for this team + month so frontend can mark them
+        holidays_list = []
+        try:
+            hol_rows = list(client.query(
+                f"""
+                SELECT holiday_id,
+                       FORMAT_DATE('%Y-%m-%d', holiday_date) AS holiday_date,
+                       description
+                FROM `{dataset_ref}.{BQ_TEAM_HOLIDAYS_TABLE}`
+                WHERE team_id = @team_id
+                  AND EXTRACT(YEAR FROM holiday_date) = @year
+                  AND EXTRACT(MONTH FROM holiday_date) = @month
+                ORDER BY holiday_date
+                """,
+                job_config=bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                    bigquery.ScalarQueryParameter("year", "INT64", year),
+                    bigquery.ScalarQueryParameter("month", "INT64", month),
+                ])
+            ).result())
+            holidays_list = [{
+                'holiday_id': h.holiday_id,
+                'date': h.holiday_date,
+                'description': h.description or '',
+            } for h in hol_rows]
+        except Exception as he:
+            # If the table doesn't exist yet for this project, just return empty
+            print(f"[Teams] Holiday lookup warning: {he}")
+
         return jsonify({
             'success': True,
             'team_id': team_id,
@@ -7612,10 +7655,118 @@ def team_monthly_report(team_id):
             'start_date': start_date,
             'end_date': end_date,
             'daily_data': data,
-            'member_summary': list(member_summary.values())
+            'member_summary': list(member_summary.values()),
+            'holidays': holidays_list,
         })
     except Exception as e:
         print(f"[Teams] Monthly report error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# TEAM HOLIDAYS - per-team holiday calendar
+# ==============================================================================
+
+@app.route('/teams/<team_id>/holidays', methods=['GET'])
+def list_team_holidays(team_id):
+    """List holidays for a team. Optional ?year=&month= to filter."""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        year = request.args.get('year')
+        month = request.args.get('month')
+
+        where = ["team_id = @team_id"]
+        params = [bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        if year:
+            where.append("EXTRACT(YEAR FROM holiday_date) = @year")
+            params.append(bigquery.ScalarQueryParameter("year", "INT64", int(year)))
+        if month:
+            where.append("EXTRACT(MONTH FROM holiday_date) = @month")
+            params.append(bigquery.ScalarQueryParameter("month", "INT64", int(month)))
+
+        query = f"""
+        SELECT holiday_id, team_id,
+               FORMAT_DATE('%Y-%m-%d', holiday_date) AS holiday_date,
+               description
+        FROM `{dataset_ref}.{BQ_TEAM_HOLIDAYS_TABLE}`
+        WHERE {' AND '.join(where)}
+        ORDER BY holiday_date
+        """
+        rows = list(client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result())
+        holidays = [{
+            'holiday_id': r.holiday_id,
+            'team_id': r.team_id,
+            'date': r.holiday_date,
+            'description': r.description or '',
+        } for r in rows]
+        return jsonify({'success': True, 'holidays': holidays})
+    except Exception as e:
+        print(f"[Holidays] List error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/holidays', methods=['POST'])
+def add_team_holiday(team_id):
+    """Add a holiday for a team. Body: {date: 'YYYY-MM-DD', description?}."""
+    try:
+        ensure_team_tables_once()
+        data = request.get_json(force=True) or {}
+        date = data.get('date')
+        description = data.get('description', '')
+        if not date:
+            return jsonify({'success': False, 'error': 'date required'}), 400
+        # Validate date format
+        try:
+            datetime.strptime(date, '%Y-%m-%d')
+        except Exception:
+            return jsonify({'success': False, 'error': 'Invalid date format (expected YYYY-MM-DD)'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        table_ref = f"{dataset_ref}.{BQ_TEAM_HOLIDAYS_TABLE}"
+
+        holiday_id = str(uuid_lib.uuid4())
+        row = {
+            'holiday_id': holiday_id,
+            'team_id': team_id,
+            'holiday_date': date,
+            'description': description,
+            'created_at': datetime.utcnow().isoformat(),
+        }
+        errors = client.insert_rows_json(table_ref, [row])
+        if errors:
+            return jsonify({'success': False, 'error': f'Insert failed: {errors}'}), 500
+
+        return jsonify({'success': True, 'holiday_id': holiday_id, 'date': date})
+    except Exception as e:
+        print(f"[Holidays] Add error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/holidays/<holiday_id>', methods=['DELETE'])
+def delete_team_holiday(team_id, holiday_id):
+    """Remove a holiday."""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        query = f"""
+        DELETE FROM `{dataset_ref}.{BQ_TEAM_HOLIDAYS_TABLE}`
+        WHERE team_id = @team_id AND holiday_id = @holiday_id
+        """
+        client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+            bigquery.ScalarQueryParameter("holiday_id", "STRING", holiday_id),
+        ])).result()
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Holidays] Delete error: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
