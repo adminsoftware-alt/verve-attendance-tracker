@@ -6919,6 +6919,47 @@ def team_attendance(team_id, date):
         # Merge duplicate names
         participants = merge_participants_by_name(participants, mode='team')
 
+        # Apply attendance overrides (manual edits take precedence)
+        try:
+            override_query = f"""
+            SELECT employee_name, first_seen_ist, last_seen_ist, status,
+                   active_mins, break_mins, isolation_mins
+            FROM `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
+            WHERE event_date = @report_date
+            ORDER BY created_at DESC
+            """
+            override_rows = list(client.query(override_query, job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("report_date", "DATE", report_date)]
+            )).result())
+
+            # Build override map (latest override wins for each employee)
+            override_map = {}
+            for ov in override_rows:
+                name_key = ov.employee_name.lower().strip()
+                if name_key not in override_map:
+                    override_map[name_key] = ov
+
+            # Apply overrides to participants
+            for p in participants:
+                name_key = p['name'].lower().strip()
+                if name_key in override_map:
+                    ov = override_map[name_key]
+                    if ov.first_seen_ist:
+                        p['first_seen_ist'] = ov.first_seen_ist
+                    if ov.last_seen_ist:
+                        p['last_seen_ist'] = ov.last_seen_ist
+                    if ov.status:
+                        p['status'] = ov.status
+                    if ov.active_mins is not None:
+                        p['total_duration_mins'] = ov.active_mins
+                    if ov.break_mins is not None:
+                        p['break_minutes'] = ov.break_mins
+                    if ov.isolation_mins is not None:
+                        p['isolation_minutes'] = ov.isolation_mins
+                    p['has_override'] = True
+        except Exception as ov_err:
+            print(f"[Teams] Override merge skipped: {ov_err}")
+
         total_members = len(all_members)
         present_count = len([p for p in participants if p['status'] == 'present'])
         half_day_count = len([p for p in participants if p['status'] == 'half_day'])
