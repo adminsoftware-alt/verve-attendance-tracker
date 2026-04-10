@@ -62,15 +62,15 @@ export default function HolidayManager({ teamId, teamName, year, month, onClose,
     setLoading(false);
   }, [year, month]);
 
-  // Load employees for selection
+  // Load ALL employees for selection (not filtered by team)
   const loadEmployees = useCallback(async () => {
     try {
-      const res = await fetchEmployees({ status: 'active', team_id: teamId });
+      const res = await fetchEmployees({ status: 'active' });
       setEmployees(res.employees || []);
     } catch (e) {
       console.error('Failed to load employees:', e);
     }
-  }, [teamId]);
+  }, []);
 
   useEffect(() => {
     if (tab === 'team') loadHolidays();
