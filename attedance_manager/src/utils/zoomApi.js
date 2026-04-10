@@ -228,6 +228,52 @@ export async function deleteTeamHoliday(teamId, holidayId) {
   return apiDelete(`/teams/${teamId}/holidays/${holidayId}`);
 }
 
+// ─── EMPLOYEE LEAVE ───────────────────────────────────
+export async function fetchAllEmployeeLeave(year, month) {
+  const q = new URLSearchParams();
+  if (year) q.set('year', year);
+  if (month) q.set('month', month);
+  const qs = q.toString();
+  return apiFetch(`/employees/leave${qs ? '?' + qs : ''}`);
+}
+
+export async function fetchEmployeeLeave(employeeId, year, month) {
+  const q = new URLSearchParams();
+  if (year) q.set('year', year);
+  if (month) q.set('month', month);
+  const qs = q.toString();
+  return apiFetch(`/employees/${employeeId}/leave${qs ? '?' + qs : ''}`);
+}
+
+export async function addEmployeeLeave(employeeId, date, leaveType, description) {
+  return apiPost(`/employees/${employeeId}/leave`, { date, leave_type: leaveType, description: description || '' });
+}
+
+export async function deleteEmployeeLeave(employeeId, leaveId) {
+  return apiDelete(`/employees/${employeeId}/leave/${leaveId}`);
+}
+
+export async function addBulkEmployeeLeave(date, employeeIds, leaveType, description) {
+  return apiPost('/employees/leave/bulk', { date, employee_ids: employeeIds, leave_type: leaveType, description: description || '' });
+}
+
+// ─── ATTENDANCE OVERRIDES ─────────────────────────────
+export async function fetchAttendanceOverrides(date, employeeName) {
+  const q = new URLSearchParams();
+  if (date) q.set('date', date);
+  if (employeeName) q.set('employee_name', employeeName);
+  const qs = q.toString();
+  return apiFetch(`/attendance/overrides${qs ? '?' + qs : ''}`);
+}
+
+export async function addAttendanceOverride(data) {
+  return apiPost('/attendance/override', data);
+}
+
+export async function deleteAttendanceOverride(overrideId) {
+  return apiDelete(`/attendance/override/${overrideId}`);
+}
+
 export function getTeamRangeCsvUrl(teamId, startDate, endDate) {
   return `${ZOOM_API_BASE}/teams/${teamId}/attendance/range?start=${startDate}&end=${endDate}&format=csv`;
 }
@@ -277,6 +323,10 @@ export async function fetchEmployeeDetail(employeeId, yearMonth) {
 
 export function getEmployeeCsvUrl(employeeId, yearMonth) {
   return `${ZOOM_API_BASE}/employees/${employeeId}/attendance/${yearMonth}?format=csv`;
+}
+
+export async function fetchEmployeeYearlySummary(employeeId, year) {
+  return apiFetch(`/employees/${employeeId}/report/yearly?year=${year}`);
 }
 
 // ─── SUPERADMIN DATA EDITOR ───────────────────────────────

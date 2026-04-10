@@ -355,6 +355,8 @@ BQ_CALIBRATION_STATE_TABLE = 'calibration_state'
 BQ_TEAMS_TABLE = 'teams'
 BQ_TEAM_MEMBERS_TABLE = 'team_members'
 BQ_TEAM_HOLIDAYS_TABLE = 'team_holidays'
+BQ_EMPLOYEE_LEAVE_TABLE = 'employee_leave'
+BQ_ATTENDANCE_OVERRIDES_TABLE = 'attendance_overrides'
 
 # Email Configuration
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
@@ -6041,6 +6043,41 @@ def ensure_team_tables():
     )
     """
     client.query(holidays_sql).result()
+
+    # Employee leave - individual employee leave/holiday dates
+    leave_sql = f"""
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}` (
+        leave_id STRING NOT NULL,
+        employee_id STRING NOT NULL,
+        employee_name STRING NOT NULL,
+        leave_date DATE NOT NULL,
+        leave_type STRING DEFAULT 'leave',
+        description STRING,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    client.query(leave_sql).result()
+
+    # Attendance overrides - manual corrections to attendance data
+    overrides_sql = f"""
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}` (
+        override_id STRING NOT NULL,
+        employee_id STRING,
+        employee_name STRING NOT NULL,
+        event_date DATE NOT NULL,
+        first_seen_ist STRING,
+        last_seen_ist STRING,
+        status STRING,
+        active_mins INT64,
+        break_mins INT64,
+        isolation_mins INT64,
+        notes STRING,
+        created_by STRING,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    client.query(overrides_sql).result()
     print("[Teams] Tables ensured")
 
 
@@ -7772,6 +7809,441 @@ def delete_team_holiday(team_id, holiday_id):
 
 
 # ==============================================================================
+# EMPLOYEE LEAVE - Individual employee leave/holidays
+# ==============================================================================
+
+@app.route('/employees/leave', methods=['GET'])
+def list_all_employee_leave():
+    """List all employee leave records. Optional filters: ?year=&month=&employee_id="""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        year = request.args.get('year')
+        month = request.args.get('month')
+        employee_id = request.args.get('employee_id')
+
+        conditions = []
+        params = []
+        if year:
+            conditions.append("EXTRACT(YEAR FROM leave_date) = @year")
+            params.append(bigquery.ScalarQueryParameter("year", "INT64", int(year)))
+        if month:
+            conditions.append("EXTRACT(MONTH FROM leave_date) = @month")
+            params.append(bigquery.ScalarQueryParameter("month", "INT64", int(month)))
+        if employee_id:
+            conditions.append("employee_id = @employee_id")
+            params.append(bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id))
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+        SELECT leave_id, employee_id, employee_name, leave_date, leave_type, description, created_at
+        FROM `{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}`
+        {where_clause}
+        ORDER BY leave_date DESC
+        """
+        rows = list(client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result())
+
+        leave_list = [{
+            'leave_id': r.leave_id,
+            'employee_id': r.employee_id,
+            'employee_name': r.employee_name,
+            'date': str(r.leave_date),
+            'leave_type': r.leave_type or 'leave',
+            'description': r.description or '',
+        } for r in rows]
+
+        return jsonify({'success': True, 'leave': leave_list})
+    except Exception as e:
+        print(f"[Leave] List error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/<employee_id>/leave', methods=['GET'])
+def list_employee_leave(employee_id):
+    """List leave for a specific employee. Optional: ?year=&month="""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        year = request.args.get('year')
+        month = request.args.get('month')
+
+        conditions = ["employee_id = @employee_id"]
+        params = [bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id)]
+
+        if year:
+            conditions.append("EXTRACT(YEAR FROM leave_date) = @year")
+            params.append(bigquery.ScalarQueryParameter("year", "INT64", int(year)))
+        if month:
+            conditions.append("EXTRACT(MONTH FROM leave_date) = @month")
+            params.append(bigquery.ScalarQueryParameter("month", "INT64", int(month)))
+
+        query = f"""
+        SELECT leave_id, employee_id, employee_name, leave_date, leave_type, description, created_at
+        FROM `{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}`
+        WHERE {' AND '.join(conditions)}
+        ORDER BY leave_date DESC
+        """
+        rows = list(client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result())
+
+        leave_list = [{
+            'leave_id': r.leave_id,
+            'employee_id': r.employee_id,
+            'employee_name': r.employee_name,
+            'date': str(r.leave_date),
+            'leave_type': r.leave_type or 'leave',
+            'description': r.description or '',
+        } for r in rows]
+
+        return jsonify({'success': True, 'leave': leave_list})
+    except Exception as e:
+        print(f"[Leave] Employee list error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/<employee_id>/leave', methods=['POST'])
+def add_employee_leave(employee_id):
+    """Add leave for an employee. Body: {date: 'YYYY-MM-DD', leave_type?, description?}"""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        data = request.json or {}
+        date = data.get('date')
+        if not date or not validate_date_format(date):
+            return jsonify({'success': False, 'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
+
+        leave_type = data.get('leave_type', 'leave')
+        description = data.get('description', '')
+
+        # Get employee name
+        emp_query = f"SELECT participant_name FROM `{dataset_ref}.employee_registry` WHERE employee_id = @employee_id"
+        emp_rows = list(client.query(emp_query, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id)
+        ])).result())
+
+        if not emp_rows:
+            return jsonify({'success': False, 'error': 'Employee not found'}), 404
+        employee_name = emp_rows[0].participant_name
+
+        # Check for duplicate
+        check_query = f"""
+        SELECT COUNT(*) as cnt FROM `{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}`
+        WHERE employee_id = @employee_id AND leave_date = @date
+        """
+        check_rows = list(client.query(check_query, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id),
+            bigquery.ScalarQueryParameter("date", "DATE", date),
+        ])).result())
+        if check_rows and check_rows[0].cnt > 0:
+            return jsonify({'success': False, 'error': 'Leave already exists for this date'}), 400
+
+        table_ref = f"{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}"
+        leave_id = str(uuid_lib.uuid4())
+        row = {
+            'leave_id': leave_id,
+            'employee_id': employee_id,
+            'employee_name': employee_name,
+            'leave_date': date,
+            'leave_type': leave_type,
+            'description': description,
+            'created_at': datetime.utcnow().isoformat(),
+        }
+        errors = client.insert_rows_json(table_ref, [row])
+        if errors:
+            return jsonify({'success': False, 'error': f'Insert failed: {errors}'}), 500
+
+        return jsonify({'success': True, 'leave_id': leave_id, 'date': date})
+    except Exception as e:
+        print(f"[Leave] Add error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/<employee_id>/leave/<leave_id>', methods=['DELETE'])
+def delete_employee_leave(employee_id, leave_id):
+    """Remove leave record."""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        query = f"""
+        DELETE FROM `{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}`
+        WHERE employee_id = @employee_id AND leave_id = @leave_id
+        """
+        client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id),
+            bigquery.ScalarQueryParameter("leave_id", "STRING", leave_id),
+        ])).result()
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Leave] Delete error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/leave/bulk', methods=['POST'])
+def add_bulk_leave():
+    """Add leave for multiple employees. Body: {date: 'YYYY-MM-DD', employee_ids: [...], leave_type?, description?}"""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        data = request.json or {}
+        date = data.get('date')
+        employee_ids = data.get('employee_ids', [])
+
+        if not date or not validate_date_format(date):
+            return jsonify({'success': False, 'error': 'Invalid date format'}), 400
+        if not employee_ids:
+            return jsonify({'success': False, 'error': 'No employees specified'}), 400
+
+        leave_type = data.get('leave_type', 'leave')
+        description = data.get('description', '')
+
+        # Get employee names
+        emp_query = f"""
+        SELECT employee_id, participant_name FROM `{dataset_ref}.employee_registry`
+        WHERE employee_id IN UNNEST(@ids)
+        """
+        emp_rows = list(client.query(emp_query, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("ids", "STRING", employee_ids)
+        ])).result())
+        emp_map = {r.employee_id: r.participant_name for r in emp_rows}
+
+        # Get existing leave for these employees on this date
+        existing_query = f"""
+        SELECT employee_id FROM `{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}`
+        WHERE employee_id IN UNNEST(@ids) AND leave_date = @date
+        """
+        existing_rows = list(client.query(existing_query, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("ids", "STRING", employee_ids),
+            bigquery.ScalarQueryParameter("date", "DATE", date),
+        ])).result())
+        existing_ids = {r.employee_id for r in existing_rows}
+
+        # Insert new records
+        table_ref = f"{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}"
+        rows = []
+        added = []
+        skipped = []
+        for emp_id in employee_ids:
+            if emp_id in existing_ids:
+                skipped.append(emp_id)
+                continue
+            if emp_id not in emp_map:
+                skipped.append(emp_id)
+                continue
+            rows.append({
+                'leave_id': str(uuid_lib.uuid4()),
+                'employee_id': emp_id,
+                'employee_name': emp_map[emp_id],
+                'leave_date': date,
+                'leave_type': leave_type,
+                'description': description,
+                'created_at': datetime.utcnow().isoformat(),
+            })
+            added.append(emp_id)
+
+        if rows:
+            errors = client.insert_rows_json(table_ref, rows)
+            if errors:
+                return jsonify({'success': False, 'error': f'Insert failed: {errors}'}), 500
+
+        return jsonify({'success': True, 'added': len(added), 'skipped': len(skipped)})
+    except Exception as e:
+        print(f"[Leave] Bulk add error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# ATTENDANCE OVERRIDES - Manual corrections to attendance data
+# ==============================================================================
+
+@app.route('/attendance/override', methods=['POST'])
+def add_attendance_override():
+    """Add or update attendance override for an employee on a date.
+    Body: {
+        employee_name: string (required),
+        employee_id?: string,
+        event_date: 'YYYY-MM-DD' (required),
+        first_seen_ist?: 'HH:MM',
+        last_seen_ist?: 'HH:MM',
+        status?: 'present'|'half_day'|'absent'|'leave',
+        active_mins?: int,
+        break_mins?: int,
+        isolation_mins?: int,
+        notes?: string,
+        created_by?: string
+    }
+    """
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        data = request.json or {}
+        employee_name = data.get('employee_name')
+        event_date = data.get('event_date')
+
+        if not employee_name:
+            return jsonify({'success': False, 'error': 'employee_name required'}), 400
+        if not event_date or not validate_date_format(event_date):
+            return jsonify({'success': False, 'error': 'Invalid event_date format'}), 400
+
+        # Check for existing override
+        check_query = f"""
+        SELECT override_id FROM `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
+        WHERE LOWER(TRIM(employee_name)) = LOWER(TRIM(@emp_name)) AND event_date = @date
+        """
+        check_rows = list(client.query(check_query, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("emp_name", "STRING", employee_name),
+            bigquery.ScalarQueryParameter("date", "DATE", event_date),
+        ])).result())
+
+        override_id = check_rows[0].override_id if check_rows else str(uuid_lib.uuid4())
+
+        if check_rows:
+            # Update existing
+            update_parts = ["updated_at = CURRENT_TIMESTAMP()"]
+            params = [
+                bigquery.ScalarQueryParameter("override_id", "STRING", override_id),
+            ]
+
+            field_map = {
+                'employee_id': ('STRING', 'employee_id'),
+                'first_seen_ist': ('STRING', 'first_seen_ist'),
+                'last_seen_ist': ('STRING', 'last_seen_ist'),
+                'status': ('STRING', 'status'),
+                'active_mins': ('INT64', 'active_mins'),
+                'break_mins': ('INT64', 'break_mins'),
+                'isolation_mins': ('INT64', 'isolation_mins'),
+                'notes': ('STRING', 'notes'),
+                'created_by': ('STRING', 'created_by'),
+            }
+            for field, (dtype, col) in field_map.items():
+                if field in data and data[field] is not None:
+                    update_parts.append(f"{col} = @{field}")
+                    params.append(bigquery.ScalarQueryParameter(field, dtype, data[field]))
+
+            update_query = f"""
+            UPDATE `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
+            SET {', '.join(update_parts)}
+            WHERE override_id = @override_id
+            """
+            client.query(update_query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+        else:
+            # Insert new
+            table_ref = f"{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}"
+            row = {
+                'override_id': override_id,
+                'employee_id': data.get('employee_id', ''),
+                'employee_name': employee_name,
+                'event_date': event_date,
+                'first_seen_ist': data.get('first_seen_ist'),
+                'last_seen_ist': data.get('last_seen_ist'),
+                'status': data.get('status'),
+                'active_mins': data.get('active_mins'),
+                'break_mins': data.get('break_mins'),
+                'isolation_mins': data.get('isolation_mins'),
+                'notes': data.get('notes', ''),
+                'created_by': data.get('created_by', ''),
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat(),
+            }
+            errors = client.insert_rows_json(table_ref, [row])
+            if errors:
+                return jsonify({'success': False, 'error': f'Insert failed: {errors}'}), 500
+
+        return jsonify({'success': True, 'override_id': override_id, 'is_update': bool(check_rows)})
+    except Exception as e:
+        print(f"[Override] Add/Update error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/attendance/override/<override_id>', methods=['DELETE'])
+def delete_attendance_override(override_id):
+    """Remove an attendance override."""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        query = f"""
+        DELETE FROM `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
+        WHERE override_id = @override_id
+        """
+        client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("override_id", "STRING", override_id),
+        ])).result()
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Override] Delete error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/attendance/overrides', methods=['GET'])
+def list_attendance_overrides():
+    """List overrides. Optional: ?date=YYYY-MM-DD or ?employee_name="""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        date = request.args.get('date')
+        emp_name = request.args.get('employee_name')
+
+        conditions = []
+        params = []
+        if date:
+            conditions.append("event_date = @date")
+            params.append(bigquery.ScalarQueryParameter("date", "DATE", date))
+        if emp_name:
+            conditions.append("LOWER(TRIM(employee_name)) = LOWER(TRIM(@emp_name))")
+            params.append(bigquery.ScalarQueryParameter("emp_name", "STRING", emp_name))
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+        SELECT * FROM `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
+        {where_clause}
+        ORDER BY event_date DESC, employee_name
+        """
+        rows = list(client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result())
+
+        overrides = [{
+            'override_id': r.override_id,
+            'employee_id': r.employee_id or '',
+            'employee_name': r.employee_name,
+            'event_date': str(r.event_date),
+            'first_seen_ist': r.first_seen_ist,
+            'last_seen_ist': r.last_seen_ist,
+            'status': r.status,
+            'active_mins': r.active_mins,
+            'break_mins': r.break_mins,
+            'isolation_mins': r.isolation_mins,
+            'notes': r.notes or '',
+            'created_by': r.created_by or '',
+        } for r in rows]
+
+        return jsonify({'success': True, 'overrides': overrides})
+    except Exception as e:
+        print(f"[Override] List error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
 # HISTORICAL TRENDS - Month-over-month analysis
 # ==============================================================================
 
@@ -9047,6 +9519,261 @@ def employee_attendance_detail(employee_id, date):
         })
     except Exception as e:
         print(f"[Employees] Detail error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/<employee_id>/report/yearly', methods=['GET'])
+def employee_yearly_report(employee_id):
+    """Generate yearly summary for a single employee.
+    Query params: year (defaults to current year)
+    Returns: 12-month summary with working days, present/half/absent, attendance %,
+             total hours, avg login/logout, break hours, isolation hours
+    """
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Get employee info
+        emp_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id)]
+        )
+        emp_rows = list(client.query(
+            f"SELECT * FROM `{dataset_ref}.employee_registry` WHERE employee_id = @employee_id",
+            job_config=emp_config
+        ).result())
+        if not emp_rows:
+            return jsonify({'success': False, 'error': 'Employee not found'}), 404
+
+        emp = emp_rows[0]
+        emp_name = emp.participant_name
+
+        # Get year parameter (default to current year)
+        year = int(request.args.get('year', get_ist_now().year))
+
+        # Get team holidays if employee belongs to a team
+        holidays_set = set()
+        if emp.team_id:
+            try:
+                hol_query = f"""
+                SELECT holiday_date FROM `{dataset_ref}.team_holidays`
+                WHERE team_id = @team_id AND EXTRACT(YEAR FROM holiday_date) = @year
+                """
+                hol_config = bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("team_id", "STRING", emp.team_id),
+                    bigquery.ScalarQueryParameter("year", "INT64", year),
+                ])
+                hol_rows = list(client.query(hol_query, job_config=hol_config).result())
+                for h in hol_rows:
+                    holidays_set.add(str(h.holiday_date))
+            except Exception:
+                pass  # team_holidays table might not exist
+
+        # Query yearly data with monthly aggregation
+        start_date = f"{year}-01-01"
+        end_date = f"{year}-12-31"
+
+        query = f"""
+        WITH daily_stats AS (
+            SELECT
+                s.event_date,
+                EXTRACT(MONTH FROM s.event_date) as month_num,
+                MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as first_seen,
+                MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as last_seen,
+                TIMESTAMP_DIFF(MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)),
+                               MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)), MINUTE) as active_mins,
+                COUNT(DISTINCT s.snapshot_time) as snap_count
+            FROM `{dataset_ref}.room_snapshots` s
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND LOWER(TRIM(s.participant_name)) = LOWER(TRIM(@emp_name))
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+            GROUP BY s.event_date
+        ),
+        breaks AS (
+            SELECT
+                s.event_date,
+                SUM(CASE WHEN TIMESTAMP_DIFF(s.snapshot_time, LAG(s.snapshot_time)
+                    OVER (PARTITION BY s.event_date ORDER BY s.snapshot_time), SECOND) > 60
+                    THEN TIMESTAMP_DIFF(s.snapshot_time, LAG(s.snapshot_time)
+                    OVER (PARTITION BY s.event_date ORDER BY s.snapshot_time), SECOND) - 30
+                    ELSE 0 END) as break_secs
+            FROM `{dataset_ref}.room_snapshots` s
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND LOWER(TRIM(s.participant_name)) = LOWER(TRIM(@emp_name))
+              AND s.room_name IS NOT NULL
+            GROUP BY s.event_date
+        ),
+        isolation AS (
+            SELECT
+                s.event_date,
+                COUNT(*) * 30 as iso_secs
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN (
+                SELECT snapshot_time, room_name, COUNT(DISTINCT participant_name) as cnt
+                FROM `{dataset_ref}.room_snapshots`
+                WHERE event_date >= @start_date AND event_date <= @end_date
+                  AND room_name IS NOT NULL AND room_name != ''
+                  AND LOWER(participant_name) NOT LIKE '%scout%'
+                GROUP BY snapshot_time, room_name
+            ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND LOWER(TRIM(s.participant_name)) = LOWER(TRIM(@emp_name))
+              AND ro.cnt = 1
+            GROUP BY s.event_date
+        )
+        SELECT
+            ds.event_date,
+            ds.month_num,
+            ds.active_mins,
+            EXTRACT(HOUR FROM ds.first_seen) * 60 + EXTRACT(MINUTE FROM ds.first_seen) as login_mins,
+            EXTRACT(HOUR FROM ds.last_seen) * 60 + EXTRACT(MINUTE FROM ds.last_seen) as logout_mins,
+            COALESCE(ROUND(b.break_secs / 60), 0) as break_mins,
+            COALESCE(ROUND(i.iso_secs / 60), 0) as isolation_mins
+        FROM daily_stats ds
+        LEFT JOIN breaks b ON ds.event_date = b.event_date
+        LEFT JOIN isolation i ON ds.event_date = i.event_date
+        ORDER BY ds.event_date
+        """
+
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
+            bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+            bigquery.ScalarQueryParameter("emp_name", "STRING", emp_name),
+        ])
+        rows = list(client.query(query, job_config=job_config).result())
+
+        # Calculate working days per month (weekdays only, excluding holidays)
+        from calendar import monthrange
+        import datetime as dt
+
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+                       'July', 'August', 'September', 'October', 'November', 'December']
+
+        # Initialize monthly stats
+        monthly_stats = {}
+        for m in range(1, 13):
+            _, days_in_month = monthrange(year, m)
+            working_days = 0
+            for d in range(1, days_in_month + 1):
+                date_obj = dt.date(year, m, d)
+                date_str = date_obj.strftime('%Y-%m-%d')
+                # Skip weekends (Mon=0, Sat=5, Sun=6)
+                if date_obj.weekday() < 5 and date_str not in holidays_set:
+                    working_days += 1
+            monthly_stats[m] = {
+                'month': m,
+                'month_name': month_names[m],
+                'working_days': working_days,
+                'present_days': 0,
+                'half_days': 0,
+                'absent_days': 0,
+                'total_active_mins': 0,
+                'login_mins_sum': 0,
+                'logout_mins_sum': 0,
+                'days_with_login': 0,
+                'total_break_mins': 0,
+                'total_isolation_mins': 0,
+            }
+
+        # Process daily rows
+        for r in rows:
+            m = r.month_num
+            active = r.active_mins or 0
+            brk = int(r.break_mins or 0)
+            iso = int(r.isolation_mins or 0)
+            login_m = r.login_mins or 0
+            logout_m = r.logout_mins or 0
+
+            if active >= 300:
+                monthly_stats[m]['present_days'] += 1
+            elif active >= 240:
+                monthly_stats[m]['half_days'] += 1
+
+            monthly_stats[m]['total_active_mins'] += active
+            monthly_stats[m]['total_break_mins'] += brk
+            monthly_stats[m]['total_isolation_mins'] += iso
+
+            if login_m > 0:
+                monthly_stats[m]['login_mins_sum'] += login_m
+                monthly_stats[m]['logout_mins_sum'] += logout_m
+                monthly_stats[m]['days_with_login'] += 1
+
+        # Build monthly summary
+        monthly_summary = []
+        yearly_totals = {
+            'working_days': 0,
+            'present_days': 0,
+            'half_days': 0,
+            'absent_days': 0,
+            'total_hours': 0,
+            'total_break_hours': 0,
+            'total_isolation_hours': 0,
+        }
+
+        for m in range(1, 13):
+            ms = monthly_stats[m]
+            days_attended = ms['present_days'] + ms['half_days']
+            absent = max(0, ms['working_days'] - days_attended)
+            attendance_pct = round((days_attended / ms['working_days'] * 100), 1) if ms['working_days'] > 0 else 0
+            total_hours = round(ms['total_active_mins'] / 60, 1)
+            break_hours = round(ms['total_break_mins'] / 60, 1)
+            isolation_hours = round(ms['total_isolation_mins'] / 60, 1)
+
+            # Calculate average login/logout times
+            avg_login = ''
+            avg_logout = ''
+            if ms['days_with_login'] > 0:
+                avg_login_mins = ms['login_mins_sum'] / ms['days_with_login']
+                avg_logout_mins = ms['logout_mins_sum'] / ms['days_with_login']
+                avg_login = f"{int(avg_login_mins // 60):02d}:{int(avg_login_mins % 60):02d}"
+                avg_logout = f"{int(avg_logout_mins // 60):02d}:{int(avg_logout_mins % 60):02d}"
+
+            monthly_summary.append({
+                'month': m,
+                'month_name': ms['month_name'],
+                'working_days': ms['working_days'],
+                'present_days': ms['present_days'],
+                'half_days': ms['half_days'],
+                'absent_days': absent,
+                'attendance_pct': attendance_pct,
+                'total_hours': total_hours,
+                'avg_login': avg_login,
+                'avg_logout': avg_logout,
+                'break_hours': break_hours,
+                'isolation_hours': isolation_hours,
+            })
+
+            # Accumulate yearly totals
+            yearly_totals['working_days'] += ms['working_days']
+            yearly_totals['present_days'] += ms['present_days']
+            yearly_totals['half_days'] += ms['half_days']
+            yearly_totals['absent_days'] += absent
+            yearly_totals['total_hours'] += total_hours
+            yearly_totals['total_break_hours'] += break_hours
+            yearly_totals['total_isolation_hours'] += isolation_hours
+
+        # Calculate yearly attendance percentage
+        yearly_attended = yearly_totals['present_days'] + yearly_totals['half_days']
+        yearly_totals['attendance_pct'] = round(
+            (yearly_attended / yearly_totals['working_days'] * 100), 1
+        ) if yearly_totals['working_days'] > 0 else 0
+        yearly_totals['total_hours'] = round(yearly_totals['total_hours'], 1)
+        yearly_totals['total_break_hours'] = round(yearly_totals['total_break_hours'], 1)
+        yearly_totals['total_isolation_hours'] = round(yearly_totals['total_isolation_hours'], 1)
+
+        return jsonify({
+            'success': True,
+            'employee_id': employee_id,
+            'employee_name': emp_name,
+            'display_name': emp.display_name or emp_name,
+            'year': year,
+            'monthly_summary': monthly_summary,
+            'yearly_totals': yearly_totals,
+        })
+
+    except Exception as e:
+        print(f"[Employees] Yearly report error: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 

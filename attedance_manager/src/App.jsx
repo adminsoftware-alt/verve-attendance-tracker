@@ -13,6 +13,7 @@ import TeamCompare from './components/TeamCompare';
 import TeamDashboard from './components/TeamDashboard';
 import ReportBuilder from './components/ReportBuilder';
 import EmployeeManager from './components/EmployeeManager';
+import EmployeeSummary from './components/EmployeeSummary';
 import DataEditor from './components/DataEditor';
 import { FullPageLoader } from './components/LoadingSpinner';
 
@@ -84,6 +85,9 @@ export default function App() {
         )}
         {!isManager && page === 'registry' && (
           <EmployeeManager user={user} />
+        )}
+        {!isManager && page === 'empsummary' && (
+          <EmployeeSummary user={user} />
         )}
         {user?.role === 'superadmin' && page === 'dataeditor' && (
           <DataEditor user={user} />

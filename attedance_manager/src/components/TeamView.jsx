@@ -6,6 +6,7 @@ import {
 import { downloadTeamPivotExcel } from '../utils/teamPivotExcel';
 import MonthlyPivotTables from './MonthlyPivotTables';
 import HolidayManager from './HolidayManager';
+import AttendanceEditModal from './AttendanceEditModal';
 
 function istDate() {
   const now = new Date();
@@ -50,6 +51,7 @@ export default function TeamView({ user }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [showHolidayModal, setShowHolidayModal] = useState(false);
+  const [editModalMember, setEditModalMember] = useState(null);
 
   // Manager filtering
   const isManager = user?.role === 'manager';
@@ -238,6 +240,7 @@ export default function TeamView({ user }) {
                     <th style={s.th}>Main Room</th>
                     <th style={s.th}>Break</th>
                     <th style={s.th}>Isolation</th>
+                    <th style={s.th}></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -262,6 +265,9 @@ export default function TeamView({ user }) {
                       </td>
                       <td style={{ ...s.td, color: m.isolation_minutes > 30 ? '#ef4444' : '#64748b' }}>
                         {m.status !== 'absent' ? fmtMins(m.isolation_minutes) : '-'}
+                      </td>
+                      <td style={s.td}>
+                        <button onClick={() => setEditModalMember(m)} style={s.editBtn}>Edit</button>
                       </td>
                     </tr>
                   ))}
@@ -382,6 +388,15 @@ export default function TeamView({ user }) {
         />
       )}
 
+      {editModalMember && (
+        <AttendanceEditModal
+          member={editModalMember}
+          date={date}
+          onClose={() => setEditModalMember(null)}
+          onSave={loadAttendance}
+        />
+      )}
+
       {dataLoading && <div style={s.loadingOverlay}><div style={s.spinner} />Loading...</div>}
     </div>
   );
@@ -430,4 +445,5 @@ const s = {
   td: { padding: '10px 14px', fontSize: 13, color: '#1e293b', borderBottom: '1px solid #f1f5f9' },
   trEven: { background: '#fafbfc' },
   badge: { padding: '3px 10px', borderRadius: 12, fontSize: 11, fontWeight: 600, textTransform: 'capitalize', display: 'inline-block' },
+  editBtn: { padding: '4px 10px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' },
 };
