@@ -7,6 +7,7 @@ const ADMIN_NAV = [
   { key: 'dashboard', label: 'Dashboard', icon: '\u{1F3E0}' },
   { key: 'teams', label: 'Teams', icon: '\u{1F46A}' },
   { key: 'teamview', label: 'Team View', icon: '\u{1F4CA}' },
+  { key: 'holidays', label: 'Holidays & Leave', icon: '\u{1F4C6}' },
   { key: 'reports', label: 'Reports', icon: '\u{1F4CB}' },
   { key: 'registry', label: 'Registry', icon: '\u{1F4CB}' },
 ];

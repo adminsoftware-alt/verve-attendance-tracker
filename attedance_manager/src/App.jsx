@@ -15,6 +15,7 @@ import ReportBuilder from './components/ReportBuilder';
 import EmployeeManager from './components/EmployeeManager';
 import EmployeeSummary from './components/EmployeeSummary';
 import DataEditor from './components/DataEditor';
+import HolidayManager from './components/HolidayManager';
 import { FullPageLoader } from './components/LoadingSpinner';
 
 // Pages managers are allowed to see
@@ -91,6 +92,9 @@ export default function App() {
         )}
         {user?.role === 'superadmin' && page === 'dataeditor' && (
           <DataEditor user={user} />
+        )}
+        {!isManager && page === 'holidays' && (
+          <HolidayManager user={user} />
         )}
 
         {/* Shared pages (all roles) */}
