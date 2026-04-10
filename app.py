@@ -9590,19 +9590,24 @@ def employee_yearly_report(employee_id):
               AND s.room_name IS NOT NULL AND s.room_name != ''
             GROUP BY s.event_date
         ),
-        breaks AS (
+        breaks_with_lag AS (
             SELECT
                 s.event_date,
-                SUM(CASE WHEN TIMESTAMP_DIFF(s.snapshot_time, LAG(s.snapshot_time)
-                    OVER (PARTITION BY s.event_date ORDER BY s.snapshot_time), SECOND) > 60
-                    THEN TIMESTAMP_DIFF(s.snapshot_time, LAG(s.snapshot_time)
-                    OVER (PARTITION BY s.event_date ORDER BY s.snapshot_time), SECOND) - 30
-                    ELSE 0 END) as break_secs
+                s.snapshot_time,
+                LAG(s.snapshot_time) OVER (PARTITION BY s.event_date ORDER BY s.snapshot_time) as prev_time
             FROM `{dataset_ref}.room_snapshots` s
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND LOWER(TRIM(s.participant_name)) = LOWER(TRIM(@emp_name))
               AND s.room_name IS NOT NULL
-            GROUP BY s.event_date
+        ),
+        breaks AS (
+            SELECT
+                event_date,
+                SUM(CASE WHEN prev_time IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 60
+                    THEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) - 30
+                    ELSE 0 END) as break_secs
+            FROM breaks_with_lag
+            GROUP BY event_date
         ),
         isolation AS (
             SELECT
