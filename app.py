@@ -8072,6 +8072,7 @@ def add_bulk_leave():
 @app.route('/attendance/override', methods=['POST'])
 def add_attendance_override():
     """Add or update attendance override for an employee on a date.
+    Uses DELETE + INSERT pattern to avoid BigQuery streaming buffer issues.
     Body: {
         employee_name: string (required),
         employee_id?: string,
@@ -8100,71 +8101,44 @@ def add_attendance_override():
         if not event_date or not validate_date_format(event_date):
             return jsonify({'success': False, 'error': 'Invalid event_date format'}), 400
 
-        # Check for existing override
-        check_query = f"""
-        SELECT override_id FROM `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
-        WHERE LOWER(TRIM(employee_name)) = LOWER(TRIM(@emp_name)) AND event_date = @date
-        """
-        check_rows = list(client.query(check_query, job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("emp_name", "STRING", employee_name),
-            bigquery.ScalarQueryParameter("date", "DATE", event_date),
-        ])).result())
-
-        override_id = check_rows[0].override_id if check_rows else str(uuid_lib.uuid4())
-
-        if check_rows:
-            # Update existing
-            update_parts = ["updated_at = CURRENT_TIMESTAMP()"]
-            params = [
-                bigquery.ScalarQueryParameter("override_id", "STRING", override_id),
-            ]
-
-            field_map = {
-                'employee_id': ('STRING', 'employee_id'),
-                'first_seen_ist': ('STRING', 'first_seen_ist'),
-                'last_seen_ist': ('STRING', 'last_seen_ist'),
-                'status': ('STRING', 'status'),
-                'active_mins': ('INT64', 'active_mins'),
-                'break_mins': ('INT64', 'break_mins'),
-                'isolation_mins': ('INT64', 'isolation_mins'),
-                'notes': ('STRING', 'notes'),
-                'created_by': ('STRING', 'created_by'),
-            }
-            for field, (dtype, col) in field_map.items():
-                if field in data and data[field] is not None:
-                    update_parts.append(f"{col} = @{field}")
-                    params.append(bigquery.ScalarQueryParameter(field, dtype, data[field]))
-
-            update_query = f"""
-            UPDATE `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
-            SET {', '.join(update_parts)}
-            WHERE override_id = @override_id
+        # Try to delete any existing override (ignore errors from streaming buffer)
+        try:
+            delete_query = f"""
+            DELETE FROM `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
+            WHERE LOWER(TRIM(employee_name)) = LOWER(TRIM(@emp_name)) AND event_date = @date
             """
-            client.query(update_query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
-        else:
-            # Insert new
-            table_ref = f"{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}"
-            row = {
-                'override_id': override_id,
-                'employee_id': data.get('employee_id', ''),
-                'employee_name': employee_name,
-                'event_date': event_date,
-                'first_seen_ist': data.get('first_seen_ist'),
-                'last_seen_ist': data.get('last_seen_ist'),
-                'status': data.get('status'),
-                'active_mins': data.get('active_mins'),
-                'break_mins': data.get('break_mins'),
-                'isolation_mins': data.get('isolation_mins'),
-                'notes': data.get('notes', ''),
-                'created_by': data.get('created_by', ''),
-                'created_at': datetime.utcnow().isoformat(),
-                'updated_at': datetime.utcnow().isoformat(),
-            }
-            errors = client.insert_rows_json(table_ref, [row])
-            if errors:
-                return jsonify({'success': False, 'error': f'Insert failed: {errors}'}), 500
+            client.query(delete_query, job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("emp_name", "STRING", employee_name),
+                bigquery.ScalarQueryParameter("date", "DATE", event_date),
+            ])).result()
+        except Exception as del_err:
+            # Ignore streaming buffer errors - we'll just insert a new record
+            print(f"[Override] Delete skipped (streaming buffer): {del_err}")
 
-        return jsonify({'success': True, 'override_id': override_id, 'is_update': bool(check_rows)})
+        # Always insert a new record
+        override_id = str(uuid_lib.uuid4())
+        table_ref = f"{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}"
+        row = {
+            'override_id': override_id,
+            'employee_id': data.get('employee_id', ''),
+            'employee_name': employee_name,
+            'event_date': event_date,
+            'first_seen_ist': data.get('first_seen_ist'),
+            'last_seen_ist': data.get('last_seen_ist'),
+            'status': data.get('status'),
+            'active_mins': data.get('active_mins'),
+            'break_mins': data.get('break_mins'),
+            'isolation_mins': data.get('isolation_mins'),
+            'notes': data.get('notes', ''),
+            'created_by': data.get('created_by', ''),
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat(),
+        }
+        errors = client.insert_rows_json(table_ref, [row])
+        if errors:
+            return jsonify({'success': False, 'error': f'Insert failed: {errors}'}), 500
+
+        return jsonify({'success': True, 'override_id': override_id})
     except Exception as e:
         print(f"[Override] Add/Update error: {e}")
         traceback.print_exc()
