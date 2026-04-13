@@ -7,6 +7,7 @@ import {
   fetchTeamMonthlyReport,
   fetchEmployeeDetail,
   fetchUnrecognized,
+  fetchUnrecognizedMonthly,
   addTeamMember,
 } from '../utils/zoomApi';
 
@@ -470,28 +471,34 @@ function DailyBreakdown({ detail }) {
 }
 
 // ─── Unrecognized participants panel ─────────────────────
+// Monthly view: aggregate attendance per person (days, hours, break,
+// isolation) plus an expandable per-day breakdown mirroring the Team Members
+// view. Each row can be classified as visitor/vendor/interview/other/employee.
 function UnrecognizedPanel({ teams, onClassified }) {
-  const [date, setDate] = useState(istDate());
+  const [year, setYear] = useState(new Date().getFullYear());
+  const [month, setMonth] = useState(new Date().getMonth() + 1);
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
-  // per-row form state, keyed by raw participant_name
+  const [expandedKey, setExpandedKey] = useState(null);
+  // per-row classification form state, keyed by name_key
   const [rowState, setRowState] = useState({});
   const [savingRow, setSavingRow] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setErr(null);
+    setExpandedKey(null);
     try {
-      const res = await fetchUnrecognized(date);
-      setItems(res.unrecognized || []);
-      // Reset per-row state with sensible defaults
+      const res = await fetchUnrecognizedMonthly(year, month);
+      const list = res.unrecognized || [];
+      setItems(list);
       const initial = {};
-      (res.unrecognized || []).forEach(u => {
-        initial[u.participant_name] = {
+      list.forEach(u => {
+        initial[u.name_key] = {
           category: 'visitor',
           team_id: '',
-          name: u.normalized_name || u.participant_name,
+          name: u.display_name || u.participant_name,
           email: u.participant_email || '',
         };
       });
@@ -500,7 +507,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
       setErr(e.message);
     }
     setLoading(false);
-  }, [date]);
+  }, [year, month]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -512,7 +519,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
   };
 
   const saveRow = async (item) => {
-    const key = item.participant_name;
+    const key = item.name_key;
     const state = rowState[key];
     if (!state) return;
     if (state.category === 'employee' && !state.team_id) {
@@ -522,15 +529,12 @@ function UnrecognizedPanel({ teams, onClassified }) {
     setSavingRow(key);
     setErr(null);
     try {
-      // 1. Always register in employee_registry with the chosen category
       await createEmployee({
         participant_name: state.name.trim() || item.participant_name,
         participant_email: state.email.trim(),
         category: state.category,
         team_id: state.team_id || null,
       });
-      // 2. For "employee" category, also add to team_members so they show
-      //    up in team monthly reports
       if (state.category === 'employee' && state.team_id) {
         try {
           await addTeamMember(
@@ -539,12 +543,10 @@ function UnrecognizedPanel({ teams, onClassified }) {
             state.email.trim(),
           );
         } catch (e) {
-          // Not fatal — registry save already succeeded
           console.warn('addTeamMember failed:', e);
         }
       }
-      // Remove from list
-      setItems(prev => prev.filter(x => x.participant_name !== key));
+      setItems(prev => prev.filter(x => x.name_key !== key));
       onClassified && onClassified();
     } catch (e) {
       setErr(e.message);
@@ -552,17 +554,32 @@ function UnrecognizedPanel({ teams, onClassified }) {
     setSavingRow(null);
   };
 
+  // Monthly aggregates shown in the header stat cards
+  const totals = useMemo(() => {
+    const count = items.length;
+    const totalHours = items.reduce((sum, p) => sum + (p.total_active_mins || 0), 0) / 60;
+    const totalBreak = items.reduce((sum, p) => sum + (p.total_break_mins || 0), 0);
+    const totalIso = items.reduce((sum, p) => sum + (p.total_isolation_mins || 0), 0);
+    return { count, totalHours, totalBreak, totalIso };
+  }, [items]);
+
   return (
     <div>
+      {/* Controls: year/month, refresh */}
       <div style={s.controlBar}>
         <div style={s.controlGroup}>
-          <label style={s.label}>Date</label>
-          <input
-            type="date"
-            value={date}
-            onChange={e => setDate(e.target.value)}
-            style={s.input}
-          />
+          <label style={s.label}>Year</label>
+          <select value={year} onChange={e => setYear(+e.target.value)} style={s.select}>
+            {[2024, 2025, 2026].map(y => <option key={y} value={y}>{y}</option>)}
+          </select>
+        </div>
+        <div style={s.controlGroup}>
+          <label style={s.label}>Month</label>
+          <select value={month} onChange={e => setMonth(+e.target.value)} style={s.select}>
+            {['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].map((m, i) => (
+              <option key={i} value={i + 1}>{m}</option>
+            ))}
+          </select>
         </div>
         <div style={s.controlGroup}>
           <label style={s.label}>&nbsp;</label>
@@ -571,13 +588,24 @@ function UnrecognizedPanel({ teams, onClassified }) {
           </button>
         </div>
         <div style={{ flex: 1, minWidth: 220, alignSelf: 'flex-end', fontSize: 12, color: '#64748b' }}>
-          {items.length > 0
-            ? <>Found <strong>{items.length}</strong> unrecognized participant{items.length === 1 ? '' : 's'} on this date.</>
-            : loading ? '' : 'No unrecognized participants — everyone is already classified.'}
+          {loading
+            ? ''
+            : items.length > 0
+              ? <>Found <strong>{items.length}</strong> unrecognized participant{items.length === 1 ? '' : 's'} this month.</>
+              : 'No unrecognized participants — everyone is already classified.'}
         </div>
       </div>
 
       {err && <div style={s.error}>{err}</div>}
+
+      {!loading && items.length > 0 && (
+        <div style={s.statsRow}>
+          <Stat label="Unrecognized" value={totals.count} color="#3b82f6" />
+          <Stat label="Total Hours" value={`${totals.totalHours.toFixed(0)}h`} color="#10b981" />
+          <Stat label="Total Break" value={fmtMins(totals.totalBreak)} color="#f97316" />
+          <Stat label="Total Isolation" value={fmtMins(totals.totalIso)} color="#ef4444" />
+        </div>
+      )}
 
       {loading && <div style={s.loader}>Loading unrecognized participants...</div>}
 
@@ -586,80 +614,106 @@ function UnrecognizedPanel({ teams, onClassified }) {
           <table style={s.table}>
             <thead>
               <tr>
-                <th style={s.th}>Zoom Name</th>
-                <th style={s.th}>Save As</th>
-                <th style={s.th}>Email</th>
+                <th style={s.th}></th>
+                <th style={s.th}>Name</th>
                 <th style={s.th}>Category</th>
+                <th style={s.th}>Days Present</th>
+                <th style={s.th}>Total Hours</th>
+                <th style={s.th}>Avg / Day</th>
+                <th style={s.th}>Break</th>
+                <th style={s.th}>Isolation</th>
+                <th style={s.th}>Classify As</th>
                 <th style={s.th}>Team</th>
                 <th style={s.th}></th>
               </tr>
             </thead>
             <tbody>
-              {items.map((item, i) => {
-                const key = item.participant_name;
+              {items.map((p, i) => {
+                const key = p.name_key;
                 const state = rowState[key] || {};
+                const isOpen = expandedKey === key;
+                const avgMins = p.days_present > 0 ? Math.round(p.total_active_mins / p.days_present) : 0;
                 return (
-                  <tr key={key} style={i % 2 === 0 ? s.trEven : {}}>
-                    <td style={s.td}>
-                      <div style={{ fontWeight: 600, fontSize: 12 }}>{item.participant_name}</div>
-                      {item.normalized_name && item.normalized_name !== item.participant_name && (
-                        <div style={{ fontSize: 10, color: '#94a3b8' }}>
-                          cleaned: {item.normalized_name}
-                        </div>
-                      )}
-                    </td>
-                    <td style={s.td}>
-                      <input
-                        type="text"
-                        value={state.name || ''}
-                        onChange={e => updateRow(key, 'name', e.target.value)}
-                        style={{ ...s.formInput, padding: '5px 8px', fontSize: 12, width: 170 }}
-                      />
-                    </td>
-                    <td style={s.td}>
-                      <input
-                        type="email"
-                        value={state.email || ''}
-                        onChange={e => updateRow(key, 'email', e.target.value)}
-                        placeholder="(optional)"
-                        style={{ ...s.formInput, padding: '5px 8px', fontSize: 12, width: 180 }}
-                      />
-                    </td>
-                    <td style={s.td}>
-                      <select
-                        value={state.category || 'visitor'}
-                        onChange={e => updateRow(key, 'category', e.target.value)}
-                        style={{ ...s.teamSelect, fontSize: 12 }}
-                      >
-                        <option value="employee">Employee (add to team)</option>
-                        <option value="visitor">Visitor</option>
-                        <option value="vendor">Vendor</option>
-                        <option value="interview">Interview</option>
-                        <option value="other">Other</option>
-                      </select>
-                    </td>
-                    <td style={s.td}>
-                      <select
-                        value={state.team_id || ''}
-                        onChange={e => updateRow(key, 'team_id', e.target.value)}
-                        style={{ ...s.teamSelect, fontSize: 12 }}
-                      >
-                        <option value="">— None —</option>
-                        {teams.map(t => (
-                          <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
-                        ))}
-                      </select>
-                    </td>
-                    <td style={s.td}>
-                      <button
-                        onClick={() => saveRow(item)}
-                        disabled={savingRow === key}
-                        style={s.saveRowBtn}
-                      >
-                        {savingRow === key ? 'Saving...' : 'Save'}
-                      </button>
-                    </td>
-                  </tr>
+                  <Fragment key={key}>
+                    <tr
+                      onClick={() => setExpandedKey(isOpen ? null : key)}
+                      style={{
+                        cursor: 'pointer',
+                        ...(i % 2 === 0 ? s.trEven : {}),
+                        ...(isOpen ? { background: '#eff6ff' } : {}),
+                      }}
+                    >
+                      <td style={s.td}>
+                        <span style={{ color: '#64748b', fontSize: 11 }}>{isOpen ? '▼' : '▶'}</span>
+                      </td>
+                      <td style={s.td}>
+                        <div style={{ fontWeight: 600 }}>{p.display_name || p.participant_name}</div>
+                        {p.participant_name !== p.display_name && (
+                          <div style={{ fontSize: 10, color: '#94a3b8' }}>
+                            zoom name: {p.participant_name}
+                          </div>
+                        )}
+                        {p.participant_email && (
+                          <div style={{ fontSize: 11, color: '#64748b' }}>{p.participant_email}</div>
+                        )}
+                      </td>
+                      <td style={s.td}>
+                        <span style={{ ...s.badge, background: '#f1f5f9', color: '#64748b' }}>
+                          Unclassified
+                        </span>
+                      </td>
+                      <td style={{ ...s.td, fontWeight: 600 }}>{p.days_present || 0}</td>
+                      <td style={{ ...s.td, color: '#10b981', fontWeight: 700 }}>
+                        {fmtHours(p.total_active_mins)}
+                      </td>
+                      <td style={s.td}>{fmtMins(avgMins)}</td>
+                      <td style={{ ...s.td, color: '#f97316' }}>{fmtMins(p.total_break_mins)}</td>
+                      <td style={{ ...s.td, color: (p.total_isolation_mins || 0) > 120 ? '#ef4444' : '#64748b' }}>
+                        {fmtMins(p.total_isolation_mins)}
+                      </td>
+                      <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                        <select
+                          value={state.category || 'visitor'}
+                          onChange={e => updateRow(key, 'category', e.target.value)}
+                          style={{ ...s.teamSelect, fontSize: 12, minWidth: 120 }}
+                        >
+                          <option value="employee">Employee</option>
+                          <option value="visitor">Visitor</option>
+                          <option value="vendor">Vendor</option>
+                          <option value="interview">Interview</option>
+                          <option value="other">Other</option>
+                        </select>
+                      </td>
+                      <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                        <select
+                          value={state.team_id || ''}
+                          onChange={e => updateRow(key, 'team_id', e.target.value)}
+                          style={{ ...s.teamSelect, fontSize: 12 }}
+                        >
+                          <option value="">— None —</option>
+                          {teams.map(t => (
+                            <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
+                          ))}
+                        </select>
+                      </td>
+                      <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                        <button
+                          onClick={() => saveRow(p)}
+                          disabled={savingRow === key}
+                          style={s.saveRowBtn}
+                        >
+                          {savingRow === key ? 'Saving...' : 'Save'}
+                        </button>
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr>
+                        <td colSpan={11} style={s.detailCell}>
+                          <DailyBreakdown detail={{ daily: p.daily || [] }} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
             </tbody>

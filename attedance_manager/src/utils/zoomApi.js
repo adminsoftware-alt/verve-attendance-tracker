@@ -317,6 +317,10 @@ export async function fetchUnrecognized(date) {
   return apiFetch(`/employees/unrecognized/${date}`);
 }
 
+export async function fetchUnrecognizedMonthly(year, month) {
+  return apiFetch(`/employees/unrecognized-monthly?year=${year}&month=${month}`);
+}
+
 export async function fetchEmployeeDetail(employeeId, yearMonth) {
   return apiFetch(`/employees/${employeeId}/attendance/${yearMonth}`);
 }
