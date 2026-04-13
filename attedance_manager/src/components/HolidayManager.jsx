@@ -401,12 +401,12 @@ export default function HolidayManager({ user }) {
                             </tr>
                           </thead>
                           <tbody>
-                            {holidays.map(h => {
+                            {holidays.map((h, i) => {
                               const [y, m, d] = h.date.split('-').map(Number);
                               const dow = new Date(y, m - 1, d).getDay();
                               const dayName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dow];
                               return (
-                                <tr key={h.holiday_id}>
+                                <tr key={h.holiday_id} style={i % 2 === 0 ? s.trEven : {}}>
                                   <td style={s.td}><strong>{h.date}</strong></td>
                                   <td style={s.td}>{dayName}</td>
                                   <td style={s.td}>{h.description || <span style={{ color: '#94a3b8' }}>—</span>}</td>
@@ -524,8 +524,8 @@ export default function HolidayManager({ user }) {
                         </tr>
                       </thead>
                       <tbody>
-                        {leaveList.map(l => (
-                          <tr key={l.leave_id}>
+                        {leaveList.map((l, i) => (
+                          <tr key={l.leave_id} style={i % 2 === 0 ? s.trEven : {}}>
                             <td style={s.td}><strong>{l.date}</strong></td>
                             <td style={s.td}>{l.employee_name}</td>
                             <td style={s.td}>
@@ -569,351 +569,81 @@ function getLeaveTypeStyle(type) {
 }
 
 const s = {
-  container: {
-    maxWidth: 1400,
-    margin: '0 auto',
-  },
-  title: {
-    fontSize: 22,
-    fontWeight: 700,
-    color: '#1e293b',
-    margin: '0 0 20px 0',
-  },
-  controls: {
-    display: 'flex',
-    gap: 16,
-    marginBottom: 20,
-    flexWrap: 'wrap',
-  },
-  controlGroup: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 4,
-  },
-  controlLabel: {
-    fontSize: 10,
-    fontWeight: 600,
-    color: '#64748b',
-    textTransform: 'uppercase',
-    letterSpacing: '0.04em',
-  },
-  select: {
-    padding: '8px 12px',
-    border: '1px solid #d1d5db',
-    borderRadius: 8,
-    fontSize: 13,
-    background: '#fff',
-    minWidth: 160,
-  },
-  error: {
-    padding: '10px 14px',
-    background: '#fef2f2',
-    color: '#dc2626',
-    border: '1px solid #fecaca',
-    borderRadius: 8,
-    fontSize: 13,
-    marginBottom: 16,
-  },
-  mainContent: {
-    display: 'grid',
-    gridTemplateColumns: '340px 1fr',
-    gap: 24,
-    alignItems: 'start',
-  },
-  // Calendar styles
-  calendarSection: {
-    background: '#fff',
-    borderRadius: 12,
-    border: '1px solid #e5e7eb',
-    padding: 16,
-  },
-  calendarHeader: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  calendarTitle: {
-    margin: 0,
-    fontSize: 15,
-    fontWeight: 700,
-    color: '#1e293b',
-  },
-  legend: {
-    display: 'flex',
-    gap: 12,
-    fontSize: 10,
-    color: '#64748b',
-  },
-  legendItem: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 4,
-  },
-  legendDot: {
-    width: 8,
-    height: 8,
-    borderRadius: '50%',
-  },
-  calendar: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(7, 1fr)',
-    gap: 2,
-  },
-  calDayHeader: {
-    textAlign: 'center',
-    fontSize: 10,
-    fontWeight: 600,
-    color: '#94a3b8',
-    padding: '6px 0',
-    textTransform: 'uppercase',
-  },
-  calEmpty: {
-    aspectRatio: '1',
-  },
-  calDay: {
-    aspectRatio: '1',
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 6,
-    background: '#f8fafc',
-    cursor: 'pointer',
-    position: 'relative',
-    transition: 'all 0.15s',
-  },
-  calDayNum: {
-    fontSize: 12,
-    fontWeight: 500,
-    color: '#475569',
-  },
-  calDayToday: {
-    border: '2px solid #2563eb',
-  },
-  calDayWeekend: {
-    background: '#f1f5f9',
-  },
-  calDayHoliday: {
-    background: '#fff7ed',
-  },
-  calDayLeave: {
-    background: '#eff6ff',
-  },
-  calDot: {
-    width: 5,
-    height: 5,
-    borderRadius: '50%',
-    background: '#f97316',
-    marginTop: 2,
-  },
-  tooltip: {
-    position: 'absolute',
-    bottom: '100%',
-    left: '50%',
-    transform: 'translateX(-50%)',
-    background: '#1e293b',
-    color: '#fff',
-    padding: '8px 10px',
-    borderRadius: 8,
-    fontSize: 11,
-    minWidth: 160,
-    zIndex: 100,
-    marginBottom: 6,
-    boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
-  },
-  tooltipItem: {
-    marginBottom: 6,
-    lineHeight: 1.4,
-  },
-  tooltipBadge: {
-    display: 'inline-block',
-    padding: '1px 6px',
-    borderRadius: 4,
-    fontSize: 9,
-    fontWeight: 600,
-    textTransform: 'uppercase',
-    marginRight: 6,
-  },
-  tooltipSub: {
-    fontSize: 10,
-    color: '#94a3b8',
-    marginTop: 2,
-  },
-  // Tabs section
-  tabsSection: {
-    background: '#fff',
-    borderRadius: 12,
-    border: '1px solid #e5e7eb',
-    overflow: 'hidden',
-  },
-  tabs: {
-    display: 'flex',
-    borderBottom: '1px solid #e5e7eb',
-  },
-  tab: {
-    flex: 1,
-    padding: '14px 20px',
-    background: 'none',
-    border: 'none',
-    fontSize: 13,
-    fontWeight: 600,
-    color: '#64748b',
-    cursor: 'pointer',
-    borderBottom: '2px solid transparent',
-    marginBottom: -1,
-    transition: 'all 0.15s',
-  },
-  tabActive: {
-    color: '#2563eb',
-    borderBottomColor: '#2563eb',
-    background: '#f8fafc',
-  },
-  tabContent: {
-    padding: 16,
-    maxHeight: 'calc(100vh - 300px)',
-    overflowY: 'auto',
-  },
-  addForm: {
-    display: 'flex',
-    gap: 10,
-    alignItems: 'flex-end',
-    marginBottom: 16,
-    padding: 12,
-    background: '#f8fafc',
-    border: '1px solid #e5e7eb',
-    borderRadius: 10,
-    flexWrap: 'wrap',
-  },
+  container: { maxWidth: 1400, margin: '0 auto' },
+
+  // Header — matches TeamView.jsx title treatment
+  title: { fontSize: 22, fontWeight: 800, color: '#0f172a', margin: '0 0 16px 0' },
+
+  // Controls row — same selects as TeamView
+  controls: { display: 'flex', gap: 10, alignItems: 'flex-end', marginBottom: 20, flexWrap: 'wrap' },
+  controlGroup: { display: 'flex', flexDirection: 'column', gap: 4 },
+  controlLabel: { fontSize: 10, fontWeight: 600, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' },
+  select: { padding: '8px 12px', border: '1px solid #d1d5db', borderRadius: 8, fontSize: 13, background: '#fff', cursor: 'pointer', minWidth: 160 },
+
+  error: { padding: '10px 14px', background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: 10, fontSize: 13, marginBottom: 16 },
+
+  mainContent: { display: 'grid', gridTemplateColumns: '340px 1fr', gap: 20, alignItems: 'start' },
+
+  // Calendar panel — card shell identical to TeamView tableWrap
+  calendarSection: { background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb', padding: 16 },
+  calendarHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  calendarTitle: { margin: 0, fontSize: 14, fontWeight: 700, color: '#1e293b' },
+  legend: { display: 'flex', gap: 12, fontSize: 10, color: '#64748b' },
+  legendItem: { display: 'flex', alignItems: 'center', gap: 4 },
+  legendDot: { width: 8, height: 8, borderRadius: '50%' },
+  calendar: { display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 2 },
+  calDayHeader: { textAlign: 'center', fontSize: 10, fontWeight: 600, color: '#94a3b8', padding: '6px 0', textTransform: 'uppercase', letterSpacing: '0.05em' },
+  calEmpty: { aspectRatio: '1' },
+  calDay: { aspectRatio: '1', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRadius: 8, background: '#fafbfc', cursor: 'pointer', position: 'relative', transition: 'all 0.15s' },
+  calDayNum: { fontSize: 12, fontWeight: 500, color: '#475569' },
+  calDayToday: { border: '2px solid #0f172a' },
+  calDayWeekend: { background: '#f1f5f9' },
+  calDayHoliday: { background: '#fff7ed' },
+  calDayLeave: { background: '#eff6ff' },
+  calDot: { width: 5, height: 5, borderRadius: '50%', background: '#f97316', marginTop: 2 },
+  tooltip: { position: 'absolute', bottom: '100%', left: '50%', transform: 'translateX(-50%)', background: '#0f172a', color: '#fff', padding: '8px 10px', borderRadius: 8, fontSize: 11, minWidth: 160, zIndex: 100, marginBottom: 6, boxShadow: '0 4px 12px rgba(0,0,0,0.2)' },
+  tooltipItem: { marginBottom: 6, lineHeight: 1.4 },
+  tooltipBadge: { display: 'inline-block', padding: '2px 8px', borderRadius: 10, fontSize: 9, fontWeight: 600, textTransform: 'uppercase', marginRight: 6 },
+  tooltipSub: { fontSize: 10, color: '#94a3b8', marginTop: 2 },
+
+  // Tabs panel — card shell with pill-style tab toggle (like TeamView modeToggle)
+  tabsSection: { background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb', overflow: 'hidden' },
+  tabs: { display: 'flex', background: '#f1f5f9', borderRadius: 8, padding: 3, margin: 16, marginBottom: 0, gap: 2 },
+  tab: { flex: 1, padding: '7px 14px', background: 'transparent', border: 'none', borderRadius: 6, fontSize: 12, fontWeight: 500, color: '#64748b', cursor: 'pointer', transition: 'all 0.15s' },
+  tabActive: { background: '#0f172a', color: '#fff', fontWeight: 600 },
+  tabContent: { padding: 16, maxHeight: 'calc(100vh - 320px)', overflowY: 'auto' },
+
+  // Add-holiday / add-leave form
+  addForm: { display: 'flex', gap: 10, alignItems: 'flex-end', marginBottom: 16, padding: 14, background: '#fafbfc', border: '1px solid #e5e7eb', borderRadius: 12, flexWrap: 'wrap' },
   formGroup: { display: 'flex', flexDirection: 'column', gap: 4 },
-  label: { fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.03em', fontWeight: 600 },
-  input: { padding: '8px 10px', border: '1px solid #d1d5db', borderRadius: 6, fontSize: 12, background: '#fff' },
-  addBtn: {
-    padding: '8px 16px',
-    background: '#f97316',
-    color: '#fff',
-    border: 'none',
-    borderRadius: 6,
-    fontSize: 12,
-    fontWeight: 700,
-    cursor: 'pointer',
-    whiteSpace: 'nowrap',
-  },
-  deleteBtn: {
-    padding: '4px 10px',
-    background: '#fef2f2',
-    color: '#b91c1c',
-    border: '1px solid #fecaca',
-    borderRadius: 6,
-    fontSize: 11,
-    fontWeight: 600,
-    cursor: 'pointer',
-  },
-  selectAllBtn: {
-    padding: '6px 12px',
-    background: '#eff6ff',
-    color: '#2563eb',
-    border: '1px solid #bfdbfe',
-    borderRadius: 6,
-    fontSize: 11,
-    fontWeight: 600,
-    cursor: 'pointer',
-  },
-  sectionTitle: {
-    fontSize: 11,
-    fontWeight: 700,
-    color: '#64748b',
-    textTransform: 'uppercase',
-    letterSpacing: '0.04em',
-    marginBottom: 8,
-    marginTop: 8,
-  },
-  tableWrap: {
-    border: '1px solid #e5e7eb',
-    borderRadius: 8,
-    overflow: 'hidden',
-    marginBottom: 14,
-  },
+  label: { fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 },
+  input: { padding: '8px 12px', border: '1px solid #d1d5db', borderRadius: 8, fontSize: 13, background: '#fff' },
+
+  // Buttons — match TeamView CTAs
+  addBtn: { padding: '8px 18px', background: '#f97316', color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap', boxShadow: '0 2px 4px rgba(249,115,22,0.35)' },
+  deleteBtn: { padding: '4px 10px', background: '#fef2f2', color: '#b91c1c', border: '1px solid #fecaca', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' },
+  selectAllBtn: { padding: '6px 12px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' },
+
+  // Section headings — match TeamView sectionTitle
+  sectionTitle: { fontSize: 14, fontWeight: 700, color: '#1e293b', margin: '4px 0 10px' },
+
+  // Tables — match TeamView table treatment (padding, radius, fonts)
+  tableWrap: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, overflow: 'auto', marginBottom: 14 },
   table: { width: '100%', borderCollapse: 'collapse' },
-  th: {
-    padding: '8px 12px',
-    textAlign: 'left',
-    fontSize: 10,
-    fontWeight: 600,
-    color: '#64748b',
-    textTransform: 'uppercase',
-    letterSpacing: '0.04em',
-    borderBottom: '1px solid #e5e7eb',
-    background: '#f8fafc',
-  },
-  td: {
-    padding: '8px 12px',
-    fontSize: 12,
-    color: '#1e293b',
-    borderBottom: '1px solid #f1f5f9',
-  },
-  badge: {
-    display: 'inline-block',
-    padding: '2px 8px',
-    borderRadius: 4,
-    fontSize: 10,
-    fontWeight: 600,
-    textTransform: 'uppercase',
-  },
-  empSelectWrap: {
-    border: '1px solid #e5e7eb',
-    borderRadius: 8,
-    marginBottom: 14,
-    overflow: 'hidden',
-  },
-  empToolbar: {
-    display: 'flex',
-    gap: 8,
-    padding: 10,
-    background: '#f8fafc',
-    borderBottom: '1px solid #e5e7eb',
-  },
-  empGrid: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
-    gap: 4,
-    padding: 10,
-    maxHeight: 160,
-    overflowY: 'auto',
-  },
-  empItem: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    padding: '6px 10px',
-    borderRadius: 6,
-    cursor: 'pointer',
-    fontSize: 12,
-    background: '#fff',
-    border: '1px solid #e5e7eb',
-    transition: 'all 0.1s',
-  },
-  empItemSelected: {
-    background: '#eff6ff',
-    borderColor: '#bfdbfe',
-  },
+  th: { padding: '10px 14px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', borderBottom: '1px solid #e5e7eb', background: '#f8fafc', whiteSpace: 'nowrap' },
+  td: { padding: '10px 14px', fontSize: 13, color: '#1e293b', borderBottom: '1px solid #f1f5f9' },
+  trEven: { background: '#fafbfc' },
+  badge: { display: 'inline-block', padding: '3px 10px', borderRadius: 12, fontSize: 11, fontWeight: 600, textTransform: 'capitalize' },
+
+  // Employee picker
+  empSelectWrap: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, marginBottom: 14, overflow: 'hidden' },
+  empToolbar: { display: 'flex', gap: 8, padding: 10, background: '#f8fafc', borderBottom: '1px solid #e5e7eb' },
+  empGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 6, padding: 12, maxHeight: 180, overflowY: 'auto' },
+  empItem: { display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 8, cursor: 'pointer', fontSize: 13, background: '#fff', border: '1px solid #e5e7eb', transition: 'all 0.1s' },
+  empItemSelected: { background: '#eff6ff', borderColor: '#bfdbfe' },
   empName: { color: '#1e293b' },
-  empty: {
-    textAlign: 'center',
-    padding: '24px 12px',
-    color: '#94a3b8',
-    fontSize: 12,
-    background: '#f8fafc',
-    border: '1px dashed #e5e7eb',
-    borderRadius: 8,
-    marginBottom: 14,
-  },
-  hint: {
-    fontSize: 11,
-    color: '#64748b',
-    padding: '10px 12px',
-    background: '#fff7ed',
-    border: '1px solid #fed7aa',
-    borderRadius: 6,
-  },
+
+  // Empty / hint states
+  empty: { textAlign: 'center', padding: '40px 20px', color: '#94a3b8', fontSize: 14, marginBottom: 14 },
+  hint: { fontSize: 12, color: '#92400e', padding: '10px 14px', background: '#fff7ed', border: '1px solid #fed7aa', borderRadius: 10 },
 };

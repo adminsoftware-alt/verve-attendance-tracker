@@ -20,6 +20,7 @@ function istDate() {
 const ADD_CATEGORIES = [
   { value: 'visitor', label: 'Visitor' },
   { value: 'vendor',  label: 'Vendor'  },
+  { value: 'interview',   label: 'Interview'   },
   { value: 'other',   label: 'Other'   },
 ];
 
@@ -28,6 +29,7 @@ const ALL_CATEGORIES = [
   { value: 'employee', label: 'Employee' },
   { value: 'visitor',  label: 'Visitor' },
   { value: 'vendor',   label: 'Vendor' },
+  { value: 'interview',    label: 'Interview' },
   { value: 'other',    label: 'Other' },
 ];
 
@@ -36,6 +38,7 @@ function catBadgeStyle(cat) {
     case 'employee': return { background: '#dcfce7', color: '#15803d' };
     case 'visitor':  return { background: '#dbeafe', color: '#1d4ed8' };
     case 'vendor':   return { background: '#fef3c7', color: '#92400e' };
+    case 'interview':   return { background: '#e0e7ff', color: '#3730a3' };
     case 'other':    return { background: '#f3e8ff', color: '#7c3aed' };
     default:         return { background: '#f1f5f9', color: '#475569' };
   }
@@ -152,7 +155,7 @@ export default function Employees({ user }) {
 
   // Counts for category filter chips
   const counts = useMemo(() => {
-    const c = { all: registryEmployees.length, employee: 0, visitor: 0, vendor: 0, other: 0 };
+    const c = { all: registryEmployees.length, employee: 0, visitor: 0, vendor: 0, other: 0, interview: 0 };
     registryEmployees.forEach(e => {
       if (c[e.category] !== undefined) c[e.category]++;
     });
@@ -218,7 +221,7 @@ export default function Employees({ user }) {
           <div style={s.subtitle}>Team members and visitors with monthly attendance</div>
         </div>
         <button onClick={() => setShowAddModal(true)} style={s.addBtn}>
-          + Add Visitor / Vendor
+          + Add Visitor / Vendor  / Interview
         </button>
       </div>
 
@@ -631,6 +634,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
                         <option value="employee">Employee (add to team)</option>
                         <option value="visitor">Visitor</option>
                         <option value="vendor">Vendor</option>
+                        <option value="interview">Interview</option>
                         <option value="other">Other</option>
                       </select>
                     </td>
@@ -692,7 +696,7 @@ function AddModal({ teams, defaultTeamId, onClose, onSave }) {
     <div style={s.modalOverlay} onClick={onClose}>
       <div style={s.modal} onClick={e => e.stopPropagation()}>
         <div style={s.modalHeader}>
-          <h3 style={{ margin: 0, fontSize: 16 }}>Add Visitor / Vendor</h3>
+          <h3 style={{ margin: 0, fontSize: 16 }}>Add Visitor / Vendor / Interview</h3>
           <button onClick={onClose} style={s.modalClose}>×</button>
         </div>
         <form onSubmit={submit} style={s.modalBody}>
