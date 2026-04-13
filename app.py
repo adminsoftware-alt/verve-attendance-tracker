@@ -5625,30 +5625,17 @@ def attendance_summary(date=None):
         client = get_bq_client()
         query = f"""
         WITH
-        -- ==========================================================
-        -- IDENTITY BRIDGE: Map every name used today in SDK snapshots
-        -- to its stable UUID. Lets webhook events (no UUID) collapse
-        -- under the same key when a participant renames mid-meeting.
-        -- ==========================================================
-        participant_name_map AS (
-          SELECT DISTINCT
-            COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
-            LOWER(TRIM(participant_name)) as name_key
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
-          WHERE event_date = '{date}'
-            AND participant_name IS NOT NULL AND participant_name != ''
-        ),
-        -- Webhook events: main meeting join/leave (keyed by UUID via bridge)
+        -- Webhook events: main meeting join/leave. Keyed by normalized name
+        -- so that a single person with multiple UUIDs today (e.g. after a
+        -- leave-and-rejoin that issued a new UUID) collapses into one record.
         webhook_events AS (
           SELECT
-            COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+            LOWER(TRIM(pe.participant_name)) as participant_key,
             pe.participant_name,
             COALESCE(NULLIF(pe.participant_email, ''), '') as participant_email,
             pe.event_type,
             pe.event_timestamp
           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
-          LEFT JOIN participant_name_map pnm
-            ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
           WHERE pe.event_date = '{date}'
             AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
             AND LOWER(pe.participant_name) NOT LIKE '%scout%'
@@ -5665,13 +5652,20 @@ def attendance_summary(date=None):
           FROM webhook_events
           GROUP BY participant_key
         ),
-        -- Clean snapshots (breakout rooms only) — keyed by UUID.
-        -- QUALIFY dedupes cases where a participant appeared in two rooms at
-        -- the same snapshot_time (SDK transition artifact). Prefer breakout
-        -- rooms over Main Room so the visit timeline stays coherent.
+        -- Clean snapshots (breakout rooms only). Three important filters:
+        --   1. Exclude "Main Room" / "0.Main Room" rows — main-room time is
+        --      produced by the main_room_visits synthesis below. If we let
+        --      snapshots also contribute main-room visits we get duplicates
+        --      that overlap the breakout-gap synthesis.
+        --   2. QUALIFY dedupes the SDK-transition case where a participant
+        --      briefly appeared in two rooms at the same snapshot_time.
+        --   3. participant_key is the normalized name, so a single person
+        --      with multiple UUIDs today collapses into one visit stream
+        --      (otherwise the synthesis fills gaps for one UUID that the
+        --      other UUID's real visits already occupy → overlaps).
         snapshot_clean AS (
           SELECT
-            COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
+            LOWER(TRIM(participant_name)) as participant_key,
             participant_name,
             COALESCE(NULLIF(participant_email, ''), '') as participant_email,
             room_name,
@@ -5681,12 +5675,11 @@ def attendance_summary(date=None):
             AND participant_name IS NOT NULL AND participant_name != ''
             AND room_name IS NOT NULL AND room_name != ''
             AND LOWER(participant_name) NOT LIKE '%scout%'
+            AND LOWER(room_name) != 'main room'
+            AND LOWER(room_name) NOT LIKE '0.main%'
           QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))),
-                         snapshot_time
-            ORDER BY
-              CASE WHEN LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-              room_name
+            PARTITION BY LOWER(TRIM(participant_name)), snapshot_time
+            ORDER BY room_name
           ) = 1
         ),
         -- Per-participant first/last seen in breakout rooms
