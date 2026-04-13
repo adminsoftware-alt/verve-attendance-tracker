@@ -2639,16 +2639,21 @@ def monitor_snapshot():
     today = get_ist_date()
     snapshot_time = now.isoformat()
 
-    rows = []
-    total_participants = 0
+    # Dedupe: one row per participant per snapshot. During room transitions
+    # the SDK may briefly list a participant in two rooms; storing both rows
+    # causes overlapping visits in downstream reports. Prefer breakout rooms
+    # over "Main Room" when a conflict exists.
+    def _is_main_room(name):
+        n = (name or '').lower()
+        return n == 'main room' or n.startswith('0.main')
 
+    by_participant = {}  # dedup_key -> {row dict}
     for room in rooms:
         room_name = room.get('room_name', '')
         if not room_name:
             continue
 
-        participants = room.get('participants', [])
-        for p in participants:
+        for p in room.get('participants', []):
             p_name = p.get('name', '') or p.get('participant_name', '') or ''
             p_email = p.get('email', '') or p.get('participant_email', '') or ''
             p_uuid = p.get('uuid', '') or p.get('participant_uuid', '') or ''
@@ -2657,7 +2662,20 @@ def monitor_snapshot():
             if 'scout' in p_name.lower() and 'bot' in p_name.lower():
                 continue
 
-            rows.append({
+            key = (p_uuid or '').strip().lower() or (p_name or '').strip().lower()
+            if not key:
+                continue
+
+            existing = by_participant.get(key)
+            if existing is not None:
+                # Keep whichever entry is a breakout room. Skip the new one
+                # unless it would promote a stale main-room pick.
+                if _is_main_room(room_name) or not _is_main_room(existing['room_name']):
+                    continue
+                existing['room_name'] = room_name
+                continue
+
+            by_participant[key] = {
                 'snapshot_id': str(uuid_lib.uuid4()),
                 'snapshot_time': snapshot_time,
                 'event_date': today,
@@ -2665,9 +2683,11 @@ def monitor_snapshot():
                 'room_name': room_name,
                 'participant_name': p_name,
                 'participant_email': p_email,
-                'participant_uuid': p_uuid
-            })
-            total_participants += 1
+                'participant_uuid': p_uuid,
+            }
+
+    rows = list(by_participant.values())
+    total_participants = len(rows)
 
     if rows:
         try:
@@ -5645,7 +5665,10 @@ def attendance_summary(date=None):
           FROM webhook_events
           GROUP BY participant_key
         ),
-        -- Clean snapshots (breakout rooms only) — keyed by UUID
+        -- Clean snapshots (breakout rooms only) — keyed by UUID.
+        -- QUALIFY dedupes cases where a participant appeared in two rooms at
+        -- the same snapshot_time (SDK transition artifact). Prefer breakout
+        -- rooms over Main Room so the visit timeline stays coherent.
         snapshot_clean AS (
           SELECT
             COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
@@ -5658,6 +5681,13 @@ def attendance_summary(date=None):
             AND participant_name IS NOT NULL AND participant_name != ''
             AND room_name IS NOT NULL AND room_name != ''
             AND LOWER(participant_name) NOT LIKE '%scout%'
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))),
+                         snapshot_time
+            ORDER BY
+              CASE WHEN LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+              room_name
+          ) = 1
         ),
         -- Per-participant first/last seen in breakout rooms
         participant_breakout_times AS (
@@ -6692,6 +6722,15 @@ def team_attendance(team_id, date):
             WHERE s.event_date = @report_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
+            -- Dedupe: one row per (participant, snapshot_time). Prevents the
+            -- SDK-transition case where a user appears in two rooms at once.
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
+                             s.snapshot_time
+                ORDER BY
+                    CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+                    s.room_name
+            ) = 1
         ),
         -- Track gaps between consecutive snapshots
         snapshots_with_gap AS (
@@ -7116,19 +7155,16 @@ def team_attendance_range(team_id):
                 ON LOWER(TRIM(tm.participant_name)) = pnm.name_key
             WHERE pnm.event_date IS NOT NULL
         ),
-        -- First get snapshots with previous snapshot time for gap detection
-        ordered_snaps AS (
+        -- Dedupe: one row per (participant, snapshot_time) before windowing,
+        -- so SDK transition artifacts (two rooms at once) don't inflate
+        -- intervals.
+        deduped_snaps AS (
             SELECT
                 s.event_date,
                 s.participant_name,
-                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
-                s.snapshot_time,
-                TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                LAG(s.snapshot_time) OVER (
-                    PARTITION BY s.event_date,
-                        COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name)))
-                    ORDER BY s.snapshot_time
-                ) as prev_snapshot
+                s.participant_uuid,
+                s.room_name,
+                s.snapshot_time
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
@@ -7137,6 +7173,29 @@ def team_attendance_range(team_id):
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND s.participant_name IS NOT NULL
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY s.event_date,
+                             COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
+                             s.snapshot_time
+                ORDER BY
+                    CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+                    s.room_name
+            ) = 1
+        ),
+        -- First get snapshots with previous snapshot time for gap detection
+        ordered_snaps AS (
+            SELECT
+                event_date,
+                participant_name,
+                COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
+                snapshot_time,
+                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
+                LAG(snapshot_time) OVER (
+                    PARTITION BY event_date,
+                        COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))
+                    ORDER BY snapshot_time
+                ) as prev_snapshot
+            FROM deduped_snaps
         ),
         daily_stats AS (
             SELECT
@@ -7394,22 +7453,37 @@ def compare_teams():
             WITH team_members AS (
                 SELECT participant_name FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
             ),
-            snaps AS (
+            deduped AS (
                 SELECT
-                    COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                    s.participant_uuid,
                     s.participant_name,
-                    s.snapshot_time,
-                    TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                    LAG(s.snapshot_time) OVER (
-                        PARTITION BY COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name)))
-                        ORDER BY s.snapshot_time
-                    ) as prev_snapshot
+                    s.room_name,
+                    s.snapshot_time
                 FROM `{dataset_ref}.room_snapshots` s
                 INNER JOIN team_members tm ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
                 WHERE s.event_date = @report_date
                   AND s.room_name IS NOT NULL AND s.room_name != ''
                   AND s.participant_name IS NOT NULL
                   AND LOWER(s.participant_name) NOT LIKE '%scout%'
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
+                                 s.snapshot_time
+                    ORDER BY
+                        CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+                        s.room_name
+                ) = 1
+            ),
+            snaps AS (
+                SELECT
+                    COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
+                    participant_name,
+                    snapshot_time,
+                    TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
+                    LAG(snapshot_time) OVER (
+                        PARTITION BY COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))
+                        ORDER BY snapshot_time
+                    ) as prev_snapshot
+                FROM deduped
             ),
             per_person AS (
                 SELECT
@@ -7551,17 +7625,15 @@ def team_monthly_report(team_id):
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
             GROUP BY s.event_date, participant_key
         ),
-        -- Break detection per day
-        ordered_snaps AS (
+        -- Break detection per day. Dedupe first so two-room SDK artifacts
+        -- don't register as false breaks.
+        deduped_snaps AS (
             SELECT
                 s.event_date,
-                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
-                s.snapshot_time,
-                LAG(s.snapshot_time) OVER (
-                    PARTITION BY s.event_date,
-                        COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name)))
-                    ORDER BY s.snapshot_time
-                ) as prev_snapshot
+                s.participant_uuid,
+                s.participant_name,
+                s.room_name,
+                s.snapshot_time
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
@@ -7570,6 +7642,26 @@ def team_monthly_report(team_id):
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND s.participant_name IS NOT NULL
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY s.event_date,
+                             COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
+                             s.snapshot_time
+                ORDER BY
+                    CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+                    s.room_name
+            ) = 1
+        ),
+        ordered_snaps AS (
+            SELECT
+                event_date,
+                COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
+                snapshot_time,
+                LAG(snapshot_time) OVER (
+                    PARTITION BY event_date,
+                        COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))
+                    ORDER BY snapshot_time
+                ) as prev_snapshot
+            FROM deduped_snaps
         ),
         daily_breaks AS (
             SELECT
@@ -9609,17 +9701,34 @@ def employee_attendance_detail(employee_id, date):
               AND LOWER(TRIM(participant_name)) = LOWER(TRIM(@emp_name))
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
-        snaps_with_lag AS (
+        -- Dedupe before windowing so SDK transition artifacts (two rooms
+        -- at the same snapshot) don't inflate breaks or active intervals.
+        deduped AS (
             SELECT
                 s.event_date,
-                s.snapshot_time,
-                TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                LAG(s.snapshot_time) OVER (PARTITION BY s.event_date ORDER BY s.snapshot_time) as prev_time
+                s.participant_uuid,
+                s.participant_name,
+                s.room_name,
+                s.snapshot_time
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN emp_keys ek
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY s.event_date, s.snapshot_time
+                ORDER BY
+                    CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+                    s.room_name
+            ) = 1
+        ),
+        snaps_with_lag AS (
+            SELECT
+                event_date,
+                snapshot_time,
+                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
+                LAG(snapshot_time) OVER (PARTITION BY event_date ORDER BY snapshot_time) as prev_time
+            FROM deduped
         ),
         snaps AS (
             SELECT
@@ -9650,11 +9759,9 @@ def employee_attendance_detail(employee_id, date):
         ),
         isolation AS (
             SELECT
-                s.event_date,
+                event_date,
                 COUNT(*) * 30 as iso_secs
-            FROM `{dataset_ref}.room_snapshots` s
-            INNER JOIN emp_keys ek
-                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
+            FROM deduped s
             INNER JOIN (
                 SELECT snapshot_time, room_name,
                        COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as cnt
@@ -9664,9 +9771,8 @@ def employee_attendance_detail(employee_id, date):
                   AND LOWER(participant_name) NOT LIKE '%scout%'
                 GROUP BY snapshot_time, room_name
             ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND ro.cnt = 1
-            GROUP BY s.event_date
+            WHERE ro.cnt = 1
+            GROUP BY event_date
         )
         SELECT
             sn.event_date,
@@ -9813,18 +9919,35 @@ def employee_yearly_report(employee_id):
               AND LOWER(TRIM(participant_name)) = LOWER(TRIM(@emp_name))
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
-        snaps_with_lag AS (
+        -- Dedupe first: if the SDK briefly listed this person in two rooms
+        -- at the same snapshot_time, collapse to one row.
+        deduped AS (
             SELECT
                 s.event_date,
-                EXTRACT(MONTH FROM s.event_date) as month_num,
-                s.snapshot_time,
-                TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                LAG(s.snapshot_time) OVER (PARTITION BY s.event_date ORDER BY s.snapshot_time) as prev_time
+                s.participant_uuid,
+                s.participant_name,
+                s.room_name,
+                s.snapshot_time
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN emp_keys ek
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY s.event_date, s.snapshot_time
+                ORDER BY
+                    CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+                    s.room_name
+            ) = 1
+        ),
+        snaps_with_lag AS (
+            SELECT
+                event_date,
+                EXTRACT(MONTH FROM event_date) as month_num,
+                snapshot_time,
+                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
+                LAG(snapshot_time) OVER (PARTITION BY event_date ORDER BY snapshot_time) as prev_time
+            FROM deduped
         ),
         daily_stats AS (
             SELECT
@@ -9856,11 +9979,9 @@ def employee_yearly_report(employee_id):
         ),
         isolation AS (
             SELECT
-                s.event_date,
+                event_date,
                 COUNT(*) * 30 as iso_secs
-            FROM `{dataset_ref}.room_snapshots` s
-            INNER JOIN emp_keys ek
-                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
+            FROM deduped s
             INNER JOIN (
                 SELECT snapshot_time, room_name,
                        COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as cnt
@@ -9870,9 +9991,8 @@ def employee_yearly_report(employee_id):
                   AND LOWER(participant_name) NOT LIKE '%scout%'
                 GROUP BY snapshot_time, room_name
             ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND ro.cnt = 1
-            GROUP BY s.event_date
+            WHERE ro.cnt = 1
+            GROUP BY event_date
         )
         SELECT
             ds.event_date,

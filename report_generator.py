@@ -223,7 +223,10 @@ def generate_daily_report(report_date=None):
       GROUP BY COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
     ),
     -- ==========================================================
-    -- STEP 1: Clean snapshots - remove empty room names
+    -- STEP 1: Clean snapshots - remove empty room names, and dedupe
+    -- cases where a participant briefly appeared in two rooms at the
+    -- same snapshot_time (SDK transition artifact). Prefer breakout
+    -- rooms over Main Room so the visit timeline stays coherent.
     -- ==========================================================
     snapshot_clean AS (
       SELECT
@@ -236,6 +239,13 @@ def generate_daily_report(report_date=None):
       WHERE event_date = '{report_date}'
         AND participant_name IS NOT NULL AND participant_name != ''
         AND room_name IS NOT NULL AND room_name != ''
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))),
+                     snapshot_time
+        ORDER BY
+          CASE WHEN LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+          room_name
+      ) = 1
     ),
     -- ==========================================================
     -- STEP 2: Detect room transitions AND time gaps
