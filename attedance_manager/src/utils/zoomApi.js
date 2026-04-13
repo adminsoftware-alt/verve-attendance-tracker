@@ -321,6 +321,15 @@ export async function fetchUnrecognizedMonthly(year, month) {
   return apiFetch(`/employees/unrecognized-monthly?year=${year}&month=${month}`);
 }
 
+export async function splitSharedAttendance(sharedName, employee1, employee2, daily) {
+  return apiPost('/employees/split-shared-attendance', {
+    shared_name: sharedName,
+    employee1,
+    employee2,
+    daily,
+  });
+}
+
 export async function fetchClassifiedMonthly(year, month, categories) {
   const cats = Array.isArray(categories) ? categories.join(',') : (categories || '');
   const catParam = cats ? `&categories=${encodeURIComponent(cats)}` : '';

@@ -9453,6 +9453,168 @@ def delete_employee(employee_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/employees/split-shared-attendance', methods=['POST'])
+def split_shared_attendance():
+    """
+    Split attendance from a shared session (e.g., "Shashank & Satyam") to two employees.
+    Both employees get the same attendance data for the dates in the shared session.
+
+    Request body:
+    {
+        "shared_name": "Shashank & Satyam",
+        "employee1": { "name": "Shashank", "email": "...", "team_id": "..." },
+        "employee2": { "name": "Satyam", "email": "...", "team_id": "..." },
+        "daily": [ { "date": "2026-04-01", "first_seen_ist": "09:30", "last_seen_ist": "18:00",
+                     "active_minutes": 330, "break_minutes": 15, "isolation_minutes": 5, "status": "Present" }, ... ]
+    }
+    """
+    try:
+        ensure_team_tables_once()
+        data = request.get_json() or {}
+        shared_name = data.get('shared_name', '').strip()
+        emp1 = data.get('employee1', {})
+        emp2 = data.get('employee2', {})
+        daily = data.get('daily', [])
+
+        if not shared_name:
+            return jsonify({'success': False, 'error': 'shared_name is required'}), 400
+        if not emp1.get('name') or not emp2.get('name'):
+            return jsonify({'success': False, 'error': 'Both employee names are required'}), 400
+        if not daily:
+            return jsonify({'success': False, 'error': 'No daily attendance data provided'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        employees_created = []
+        overrides_created = 0
+
+        for emp in [emp1, emp2]:
+            emp_name = emp.get('name', '').strip()
+            emp_email = emp.get('email', '').strip()
+            team_id = emp.get('team_id', '').strip()
+
+            if not emp_name:
+                continue
+
+            # Check if employee already exists in registry
+            check_query = f"""
+            SELECT employee_id FROM `{dataset_ref}.employee_registry`
+            WHERE LOWER(TRIM(participant_name)) = LOWER(TRIM(@name))
+            LIMIT 1
+            """
+            existing = list(client.query(check_query, job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("name", "STRING", emp_name)]
+            )).result())
+
+            if not existing:
+                # Create new employee in registry
+                employee_id = str(uuid_lib.uuid4())
+                registry_row = {
+                    'employee_id': employee_id,
+                    'participant_name': normalize_participant_name(emp_name),
+                    'display_name': normalize_participant_name(emp_name),
+                    'participant_email': emp_email,
+                    'status': 'active',
+                    'category': 'employee',
+                    'team_id': team_id,
+                    'notes': f'Split from shared session: {shared_name}',
+                    'created_at': datetime.utcnow().isoformat(),
+                    'updated_at': datetime.utcnow().isoformat(),
+                }
+                errors = client.insert_rows_json(f"{dataset_ref}.employee_registry", [registry_row])
+                if errors:
+                    print(f"[Split] Registry insert error: {errors}")
+                else:
+                    employees_created.append(emp_name)
+
+                # Add to team_members if team specified
+                if team_id:
+                    member_row = {
+                        'member_id': str(uuid_lib.uuid4()),
+                        'team_id': team_id,
+                        'participant_name': normalize_participant_name(emp_name),
+                        'participant_email': emp_email,
+                        'added_at': datetime.utcnow().isoformat(),
+                    }
+                    client.insert_rows_json(f"{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}", [member_row])
+
+            # Create attendance overrides for each day
+            for day in daily:
+                date_str = day.get('date')
+                if not date_str:
+                    continue
+
+                # Delete existing override for this employee/date (if any)
+                del_query = f"""
+                DELETE FROM `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
+                WHERE LOWER(TRIM(employee_name)) = LOWER(TRIM(@emp_name)) AND event_date = @date
+                """
+                try:
+                    client.query(del_query, job_config=bigquery.QueryJobConfig(query_parameters=[
+                        bigquery.ScalarQueryParameter("emp_name", "STRING", emp_name),
+                        bigquery.ScalarQueryParameter("date", "DATE", date_str),
+                    ])).result()
+                except:
+                    pass
+
+                # Insert new override
+                override_row = {
+                    'override_id': str(uuid_lib.uuid4()),
+                    'employee_id': None,
+                    'employee_name': normalize_participant_name(emp_name),
+                    'event_date': date_str,
+                    'first_seen_ist': day.get('first_seen_ist', ''),
+                    'last_seen_ist': day.get('last_seen_ist', ''),
+                    'status': day.get('status', 'Present'),
+                    'active_mins': day.get('active_minutes', 0),
+                    'break_mins': day.get('break_minutes', 0),
+                    'isolation_mins': day.get('isolation_minutes', 0),
+                    'notes': f'Split from: {shared_name}',
+                    'created_by': 'system-split',
+                    'created_at': datetime.utcnow().isoformat(),
+                    'updated_at': datetime.utcnow().isoformat(),
+                }
+                errors = client.insert_rows_json(f"{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}", [override_row])
+                if not errors:
+                    overrides_created += 1
+
+        # Mark the shared name as 'split' in registry so it doesn't appear in unrecognized
+        check_shared = list(client.query(
+            f"SELECT employee_id FROM `{dataset_ref}.employee_registry` WHERE LOWER(TRIM(participant_name)) = LOWER(TRIM(@name))",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("name", "STRING", shared_name)
+            ])
+        ).result())
+
+        if not check_shared:
+            shared_row = {
+                'employee_id': str(uuid_lib.uuid4()),
+                'participant_name': shared_name,
+                'display_name': shared_name,
+                'participant_email': '',
+                'status': 'inactive',
+                'category': 'split',
+                'team_id': '',
+                'notes': f'Split into: {emp1.get("name")}, {emp2.get("name")}',
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat(),
+            }
+            client.insert_rows_json(f"{dataset_ref}.employee_registry", [shared_row])
+
+        return jsonify({
+            'success': True,
+            'employees_created': employees_created,
+            'overrides_created': overrides_created,
+            'message': f'Attendance split to {emp1.get("name")} and {emp2.get("name")} for {len(daily)} days'
+        })
+
+    except Exception as e:
+        print(f"[Split] Error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/employees/sync-from-teams', methods=['POST'])
 def sync_employees_from_teams():
     """Populate employee_registry from existing team_members. Run once to initialize."""

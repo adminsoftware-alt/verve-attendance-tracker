@@ -223,54 +223,97 @@ export default function HolidayManager({ user }) {
   const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December'];
 
+  const refresh = () => {
+    if (tab === 'team' && selectedTeamId) loadHolidays();
+    else if (tab === 'individual') { loadLeave(); loadEmployees(); }
+  };
+
   return (
     <div style={s.container}>
-      <h1 style={s.title}>Holidays & Leave Management</h1>
-
-      {/* Controls Row */}
-      <div style={s.controls}>
-        <div style={s.controlGroup}>
-          <label style={s.controlLabel}>Team</label>
+      {/* Header — title left, team selector right (matches Team Attendance) */}
+      <div style={s.header}>
+        <div>
+          <h2 style={s.title}>Holidays & Leave</h2>
+        </div>
+        <div style={s.headerControls}>
           <select
             value={selectedTeamId}
             onChange={e => setSelectedTeamId(e.target.value)}
             style={s.select}
           >
-            <option value="">-- Select Team --</option>
+            <option value="">Select team</option>
             {teams.map(t => (
               <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
             ))}
           </select>
         </div>
-        <div style={s.controlGroup}>
-          <label style={s.controlLabel}>Month</label>
+      </div>
+
+      {/* Date bar — year / month + add-holiday CTA + refresh on right */}
+      <div style={s.dateBar}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <select value={year} onChange={e => setYear(Number(e.target.value))} style={s.select}>
+            {[2024, 2025, 2026, 2027].map(y => <option key={y} value={y}>{y}</option>)}
+          </select>
           <select value={month} onChange={e => setMonth(Number(e.target.value))} style={s.select}>
-            {monthNames.map((m, i) => (
+            {['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].map((m, i) => (
               <option key={i} value={i + 1}>{m}</option>
             ))}
           </select>
         </div>
-        <div style={s.controlGroup}>
-          <label style={s.controlLabel}>Year</label>
-          <select value={year} onChange={e => setYear(Number(e.target.value))} style={s.select}>
-            {[2024, 2025, 2026, 2027].map(y => (
-              <option key={y} value={y}>{y}</option>
-            ))}
-          </select>
-        </div>
+        <button onClick={refresh} disabled={loading} style={s.refreshBtn}>
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
       </div>
 
+      {/* Subtitle — team + month range (matches "Accurest Client — 2026-04-01 to 2026-04-30") */}
+      {selectedTeamId && (
+        <div style={s.subtitle}>
+          <strong style={{ color: '#1e293b' }}>{selectedTeam?.team_name || 'Team'}</strong>
+          {` — ${monthNames[month - 1]} ${year}`}
+        </div>
+      )}
+
       {err && <div style={s.error}>{err}</div>}
+
+      {/* Pill tabs — mirrors Hours Pivot / Isolation / Leaves */}
+      <div style={s.tabs}>
+        <button
+          style={{ ...s.tab, ...(tab === 'team' ? s.tabActive : {}) }}
+          onClick={() => setTab('team')}
+        >
+          Team Holidays
+        </button>
+        <button
+          style={{ ...s.tab, ...(tab === 'individual' ? s.tabActive : {}) }}
+          onClick={() => setTab('individual')}
+        >
+          Individual Leave
+        </button>
+      </div>
+
+      {/* Legend bar — matches the Hours Pivot legend strip */}
+      <div style={s.legendBar}>
+        <span style={s.legendItem}>
+          <span style={{ ...s.legendSwatch, background: '#fff7ed', borderColor: '#fed7aa' }} />
+          Team Holiday
+        </span>
+        <span style={s.legendItem}>
+          <span style={{ ...s.legendSwatch, background: '#eff6ff', borderColor: '#bfdbfe' }} />
+          Individual Leave
+        </span>
+        <span style={s.legendMeta}>
+          {tab === 'team'
+            ? <>Holidays configured: <strong>{holidays.length}</strong></>
+            : <>Leave records: <strong>{leaveList.length}</strong></>}
+        </span>
+      </div>
 
       <div style={s.mainContent}>
         {/* Calendar View */}
         <div style={s.calendarSection}>
           <div style={s.calendarHeader}>
             <h3 style={s.calendarTitle}>{monthNames[month - 1]} {year}</h3>
-            <div style={s.legend}>
-              <span style={s.legendItem}><span style={{ ...s.legendDot, background: '#f97316' }}></span> Team Holiday</span>
-              <span style={s.legendItem}><span style={{ ...s.legendDot, background: '#2563eb' }}></span> Individual Leave</span>
-            </div>
           </div>
           <div style={s.calendar}>
             {/* Day headers */}
@@ -331,23 +374,8 @@ export default function HolidayManager({ user }) {
           </div>
         </div>
 
-        {/* Tabs Panel */}
+        {/* Content panel — tabs now live in the page header */}
         <div style={s.tabsSection}>
-          <div style={s.tabs}>
-            <button
-              style={{ ...s.tab, ...(tab === 'team' ? s.tabActive : {}) }}
-              onClick={() => setTab('team')}
-            >
-              Team Holidays
-            </button>
-            <button
-              style={{ ...s.tab, ...(tab === 'individual' ? s.tabActive : {}) }}
-              onClick={() => setTab('individual')}
-            >
-              Individual Leave
-            </button>
-          </div>
-
           <div style={s.tabContent}>
             {/* TEAM HOLIDAYS TAB */}
             {tab === 'team' && (
@@ -571,16 +599,29 @@ function getLeaveTypeStyle(type) {
 const s = {
   container: { maxWidth: 1400, margin: '0 auto' },
 
-  // Header — matches TeamView.jsx title treatment
-  title: { fontSize: 22, fontWeight: 800, color: '#0f172a', margin: '0 0 16px 0' },
+  // Header row — title left, team selector right (Team Attendance layout)
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap', gap: 12 },
+  title: { fontSize: 22, fontWeight: 800, color: '#0f172a', margin: 0 },
+  headerControls: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' },
 
-  // Controls row — same selects as TeamView
+  // Date bar — year / month + actions (left) + refresh (right)
+  dateBar: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 10 },
+  subtitle: { marginBottom: 14, fontSize: 13, color: '#64748b' },
+  refreshBtn: { padding: '8px 16px', background: '#f1f5f9', color: '#475569', border: '1px solid #e5e7eb', borderRadius: 8, fontSize: 12, cursor: 'pointer' },
+
+  // Legacy leftover fields kept for compat (unused now but harmless)
   controls: { display: 'flex', gap: 10, alignItems: 'flex-end', marginBottom: 20, flexWrap: 'wrap' },
   controlGroup: { display: 'flex', flexDirection: 'column', gap: 4 },
   controlLabel: { fontSize: 10, fontWeight: 600, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' },
+
   select: { padding: '8px 12px', border: '1px solid #d1d5db', borderRadius: 8, fontSize: 13, background: '#fff', cursor: 'pointer', minWidth: 160 },
 
   error: { padding: '10px 14px', background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: 10, fontSize: 13, marginBottom: 16 },
+
+  // Legend strip under tabs — mirrors Hours Pivot legend
+  legendBar: { display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12, padding: '8px 12px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8 },
+  legendSwatch: { width: 14, height: 14, border: '1px solid', borderRadius: 3, display: 'inline-block', marginRight: 6, verticalAlign: 'middle' },
+  legendMeta: { fontSize: 11, color: '#64748b', marginLeft: 'auto' },
 
   mainContent: { display: 'grid', gridTemplateColumns: '340px 1fr', gap: 20, alignItems: 'start' },
 
@@ -606,12 +647,12 @@ const s = {
   tooltipBadge: { display: 'inline-block', padding: '2px 8px', borderRadius: 10, fontSize: 9, fontWeight: 600, textTransform: 'uppercase', marginRight: 6 },
   tooltipSub: { fontSize: 10, color: '#94a3b8', marginTop: 2 },
 
-  // Tabs panel — card shell with pill-style tab toggle (like TeamView modeToggle)
-  tabsSection: { background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb', overflow: 'hidden' },
-  tabs: { display: 'flex', background: '#f1f5f9', borderRadius: 8, padding: 3, margin: 16, marginBottom: 0, gap: 2 },
-  tab: { flex: 1, padding: '7px 14px', background: 'transparent', border: 'none', borderRadius: 6, fontSize: 12, fontWeight: 500, color: '#64748b', cursor: 'pointer', transition: 'all 0.15s' },
+  // Tabs — pill bar matching Hours Pivot / Isolation / Leaves
+  tabs: { display: 'flex', gap: 4, background: '#f1f5f9', padding: 3, borderRadius: 8, marginBottom: 12, width: 'fit-content' },
+  tab: { padding: '8px 18px', background: 'transparent', border: 'none', borderRadius: 6, fontSize: 12, fontWeight: 500, color: '#64748b', cursor: 'pointer', transition: 'all 0.15s' },
   tabActive: { background: '#0f172a', color: '#fff', fontWeight: 600 },
-  tabContent: { padding: 16, maxHeight: 'calc(100vh - 320px)', overflowY: 'auto' },
+  tabsSection: {},
+  tabContent: {},
 
   // Add-holiday / add-leave form
   addForm: { display: 'flex', gap: 10, alignItems: 'flex-end', marginBottom: 16, padding: 14, background: '#fafbfc', border: '1px solid #e5e7eb', borderRadius: 12, flexWrap: 'wrap' },

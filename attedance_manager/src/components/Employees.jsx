@@ -10,6 +10,7 @@ import {
   fetchUnrecognizedMonthly,
   fetchClassifiedMonthly,
   addTeamMember,
+  splitSharedAttendance,
 } from '../utils/zoomApi';
 
 function istDate() {
@@ -93,7 +94,10 @@ export default function Employees({ user }) {
     }).catch(e => setError(e.message));
   }, [isManager, user?.name]);
 
-  // Load registry + monthly attendance for the selected team/month
+  // Load registry + monthly attendance for the selected team/month.
+  // When selectedTeam === '__all__' we fetch every team's monthly data in
+  // parallel and merge their member_summary arrays so the view shows every
+  // employee across every team.
   const loadData = useCallback(async () => {
     if (!selectedTeam) return;
     setLoading(true);
@@ -101,17 +105,57 @@ export default function Employees({ user }) {
     setExpandedId(null);
     setDetailCache({});
     try {
-      const [empRes, monthlyRes] = await Promise.all([
-        fetchEmployees({ team_id: selectedTeam }),
-        fetchTeamMonthlyReport(selectedTeam, year, month),
-      ]);
-      setRegistryEmployees(empRes.employees || []);
-      setMonthlyData(monthlyRes);
+      if (selectedTeam === '__all__') {
+        if (!teams.length) {
+          setRegistryEmployees([]);
+          setMonthlyData(null);
+          setLoading(false);
+          return;
+        }
+        const [empRes, ...monthlyResults] = await Promise.all([
+          fetchEmployees({}),
+          ...teams.map(t =>
+            fetchTeamMonthlyReport(t.team_id, year, month).catch(e => {
+              console.warn(`monthly fetch failed for ${t.team_id}:`, e);
+              return { member_summary: [] };
+            })
+          ),
+        ]);
+        const mergedByKey = {};
+        monthlyResults.forEach(res => {
+          (res?.member_summary || []).forEach(m => {
+            const key = (m.name || '').toLowerCase().trim();
+            if (!key) return;
+            if (!mergedByKey[key]) {
+              mergedByKey[key] = { ...m };
+            } else {
+              mergedByKey[key].days_present = Math.max(
+                mergedByKey[key].days_present || 0, m.days_present || 0
+              );
+              mergedByKey[key].total_active_mins =
+                (mergedByKey[key].total_active_mins || 0) + (m.total_active_mins || 0);
+              mergedByKey[key].total_break_mins =
+                (mergedByKey[key].total_break_mins || 0) + (m.total_break_mins || 0);
+              mergedByKey[key].total_isolation_mins =
+                (mergedByKey[key].total_isolation_mins || 0) + (m.total_isolation_mins || 0);
+            }
+          });
+        });
+        setRegistryEmployees(empRes.employees || []);
+        setMonthlyData({ member_summary: Object.values(mergedByKey) });
+      } else {
+        const [empRes, monthlyRes] = await Promise.all([
+          fetchEmployees({ team_id: selectedTeam }),
+          fetchTeamMonthlyReport(selectedTeam, year, month),
+        ]);
+        setRegistryEmployees(empRes.employees || []);
+        setMonthlyData(monthlyRes);
+      }
     } catch (e) {
       setError(e.message);
     }
     setLoading(false);
-  }, [selectedTeam, year, month]);
+  }, [selectedTeam, year, month, teams]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
@@ -212,7 +256,9 @@ export default function Employees({ user }) {
     }
   };
 
-  const selectedTeamName = teams.find(t => t.team_id === selectedTeam)?.team_name || '';
+  const selectedTeamName = selectedTeam === '__all__'
+    ? 'All Teams'
+    : (teams.find(t => t.team_id === selectedTeam)?.team_name || '');
 
   return (
     <div>
@@ -270,6 +316,7 @@ export default function Employees({ user }) {
           <label style={s.label}>Team</label>
           <select value={selectedTeam} onChange={e => setSelectedTeam(e.target.value)} style={s.select}>
             <option value="">Select team</option>
+            <option value="__all__">All Teams (every member)</option>
             {teams.map(t => <option key={t.team_id} value={t.team_id}>{t.team_name}</option>)}
           </select>
         </div>
@@ -496,6 +543,16 @@ function UnrecognizedPanel({ teams, onClassified }) {
   const [rowState, setRowState] = useState({});
   const [savingRow, setSavingRow] = useState(null);
 
+  // Helper: check if name contains "&" (shared session between 2 people)
+  const isSharedName = (name) => name && name.includes('&');
+
+  // Helper: split "Name1 & Name2" into two trimmed names
+  const splitNames = (name) => {
+    if (!name || !name.includes('&')) return [name, ''];
+    const parts = name.split('&').map(s => s.trim());
+    return [parts[0] || '', parts[1] || ''];
+  };
+
   const load = useCallback(async () => {
     setLoading(true);
     setErr(null);
@@ -506,12 +563,28 @@ function UnrecognizedPanel({ teams, onClassified }) {
       setItems(list);
       const initial = {};
       list.forEach(u => {
-        initial[u.name_key] = {
-          category: 'visitor',
-          team_id: '',
-          name: u.display_name || u.participant_name,
-          email: u.participant_email || '',
-        };
+        const name = u.display_name || u.participant_name;
+        if (isSharedName(name)) {
+          // For shared names, initialize split state
+          const [n1, n2] = splitNames(name);
+          initial[u.name_key] = {
+            isShared: true,
+            name1: n1,
+            name2: n2,
+            email1: '',
+            email2: '',
+            team_id1: '',
+            team_id2: '',
+          };
+        } else {
+          initial[u.name_key] = {
+            isShared: false,
+            category: 'visitor',
+            team_id: '',
+            name: name,
+            email: u.participant_email || '',
+          };
+        }
       });
       setRowState(initial);
     } catch (e) {
@@ -557,6 +630,40 @@ function UnrecognizedPanel({ teams, onClassified }) {
           console.warn('addTeamMember failed:', e);
         }
       }
+      setItems(prev => prev.filter(x => x.name_key !== key));
+      onClassified && onClassified();
+    } catch (e) {
+      setErr(e.message);
+    }
+    setSavingRow(null);
+  };
+
+  // Save split attendance for shared sessions (e.g., "Shashank & Satyam")
+  const saveSplitRow = async (item) => {
+    const key = item.name_key;
+    const state = rowState[key];
+    if (!state) return;
+    if (!state.name1?.trim() || !state.name2?.trim()) {
+      setErr('Both employee names are required for splitting.');
+      return;
+    }
+    setSavingRow(key);
+    setErr(null);
+    try {
+      await splitSharedAttendance(
+        item.participant_name,
+        {
+          name: state.name1.trim(),
+          email: state.email1?.trim() || '',
+          team_id: state.team_id1 || '',
+        },
+        {
+          name: state.name2.trim(),
+          email: state.email2?.trim() || '',
+          team_id: state.team_id2 || '',
+        },
+        item.daily || []
+      );
       setItems(prev => prev.filter(x => x.name_key !== key));
       onClassified && onClassified();
     } catch (e) {
@@ -644,6 +751,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
                 const state = rowState[key] || {};
                 const isOpen = expandedKey === key;
                 const avgMins = p.days_present > 0 ? Math.round(p.total_active_mins / p.days_present) : 0;
+                const isShared = state.isShared;
                 return (
                   <Fragment key={key}>
                     <tr
@@ -652,6 +760,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
                         cursor: 'pointer',
                         ...(i % 2 === 0 ? s.trEven : {}),
                         ...(isOpen ? { background: '#eff6ff' } : {}),
+                        ...(isShared ? { background: '#fef3c7' } : {}),
                       }}
                     >
                       <td style={s.td}>
@@ -659,7 +768,12 @@ function UnrecognizedPanel({ teams, onClassified }) {
                       </td>
                       <td style={s.td}>
                         <div style={{ fontWeight: 600 }}>{p.display_name || p.participant_name}</div>
-                        {p.participant_name !== p.display_name && (
+                        {isShared && (
+                          <div style={{ fontSize: 10, color: '#92400e', fontWeight: 600 }}>
+                            ⚠ Shared session — split to 2 employees
+                          </div>
+                        )}
+                        {p.participant_name !== p.display_name && !isShared && (
                           <div style={{ fontSize: 10, color: '#94a3b8' }}>
                             zoom name: {p.participant_name}
                           </div>
@@ -669,8 +783,8 @@ function UnrecognizedPanel({ teams, onClassified }) {
                         )}
                       </td>
                       <td style={s.td}>
-                        <span style={{ ...s.badge, background: '#f1f5f9', color: '#64748b' }}>
-                          Unclassified
+                        <span style={{ ...s.badge, background: isShared ? '#fef3c7' : '#f1f5f9', color: isShared ? '#92400e' : '#64748b' }}>
+                          {isShared ? 'Shared' : 'Unclassified'}
                         </span>
                       </td>
                       <td style={{ ...s.td, fontWeight: 600 }}>{p.days_present || 0}</td>
@@ -682,40 +796,99 @@ function UnrecognizedPanel({ teams, onClassified }) {
                       <td style={{ ...s.td, color: (p.total_isolation_mins || 0) > 120 ? '#ef4444' : '#64748b' }}>
                         {fmtMins(p.total_isolation_mins)}
                       </td>
-                      <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
-                        <select
-                          value={state.category || 'visitor'}
-                          onChange={e => updateRow(key, 'category', e.target.value)}
-                          style={{ ...s.teamSelect, fontSize: 12, minWidth: 120 }}
-                        >
-                          <option value="employee">Employee</option>
-                          <option value="visitor">Visitor</option>
-                          <option value="vendor">Vendor</option>
-                          <option value="interview">Interview</option>
-                          <option value="other">Other</option>
-                        </select>
-                      </td>
-                      <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
-                        <select
-                          value={state.team_id || ''}
-                          onChange={e => updateRow(key, 'team_id', e.target.value)}
-                          style={{ ...s.teamSelect, fontSize: 12 }}
-                        >
-                          <option value="">— None —</option>
-                          {teams.map(t => (
-                            <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
-                          ))}
-                        </select>
-                      </td>
-                      <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
-                        <button
-                          onClick={() => saveRow(p)}
-                          disabled={savingRow === key}
-                          style={s.saveRowBtn}
-                        >
-                          {savingRow === key ? 'Saving...' : 'Save'}
-                        </button>
-                      </td>
+                      {/* For shared names: show split UI; for regular: show classify UI */}
+                      {isShared ? (
+                        <>
+                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                              <input
+                                type="text"
+                                placeholder="Employee 1"
+                                value={state.name1 || ''}
+                                onChange={e => updateRow(key, 'name1', e.target.value)}
+                                style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', width: 100 }}
+                              />
+                              <input
+                                type="text"
+                                placeholder="Employee 2"
+                                value={state.name2 || ''}
+                                onChange={e => updateRow(key, 'name2', e.target.value)}
+                                style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', width: 100 }}
+                              />
+                            </div>
+                          </td>
+                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                              <select
+                                value={state.team_id1 || ''}
+                                onChange={e => updateRow(key, 'team_id1', e.target.value)}
+                                style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px' }}
+                              >
+                                <option value="">— Team 1 —</option>
+                                {teams.map(t => (
+                                  <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
+                                ))}
+                              </select>
+                              <select
+                                value={state.team_id2 || ''}
+                                onChange={e => updateRow(key, 'team_id2', e.target.value)}
+                                style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px' }}
+                              >
+                                <option value="">— Team 2 —</option>
+                                {teams.map(t => (
+                                  <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
+                                ))}
+                              </select>
+                            </div>
+                          </td>
+                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                            <button
+                              onClick={() => saveSplitRow(p)}
+                              disabled={savingRow === key}
+                              style={{ ...s.saveRowBtn, background: '#f59e0b', minWidth: 90 }}
+                            >
+                              {savingRow === key ? 'Splitting...' : 'Split & Assign'}
+                            </button>
+                          </td>
+                        </>
+                      ) : (
+                        <>
+                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                            <select
+                              value={state.category || 'visitor'}
+                              onChange={e => updateRow(key, 'category', e.target.value)}
+                              style={{ ...s.teamSelect, fontSize: 12, minWidth: 120 }}
+                            >
+                              <option value="employee">Employee</option>
+                              <option value="visitor">Visitor</option>
+                              <option value="vendor">Vendor</option>
+                              <option value="interview">Interview</option>
+                              <option value="other">Other</option>
+                            </select>
+                          </td>
+                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                            <select
+                              value={state.team_id || ''}
+                              onChange={e => updateRow(key, 'team_id', e.target.value)}
+                              style={{ ...s.teamSelect, fontSize: 12 }}
+                            >
+                              <option value="">— None —</option>
+                              {teams.map(t => (
+                                <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
+                              ))}
+                            </select>
+                          </td>
+                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                            <button
+                              onClick={() => saveRow(p)}
+                              disabled={savingRow === key}
+                              style={s.saveRowBtn}
+                            >
+                              {savingRow === key ? 'Saving...' : 'Save'}
+                            </button>
+                          </td>
+                        </>
+                      )}
                     </tr>
                     {isOpen && (
                       <tr>
