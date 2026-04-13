@@ -189,25 +189,45 @@ def generate_daily_report(report_date=None):
     main_query = f"""
     WITH
     -- ==========================================================
+    -- IDENTITY BRIDGE: Every (UUID, name) pair that appeared in
+    -- SDK snapshots today. Lets us link webhook events (which
+    -- carry only name) to the stable UUID even when a participant
+    -- renamed themselves mid-meeting (e.g. "Shashank" -> "Shashank-1").
+    -- ==========================================================
+    participant_name_map AS (
+      SELECT DISTINCT
+        COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
+        LOWER(TRIM(participant_name)) as name_key
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+      WHERE event_date = '{report_date}'
+        AND participant_name IS NOT NULL AND participant_name != ''
+    ),
+    -- ==========================================================
     -- WEBHOOK DATA: Main meeting join/leave times
+    -- Grouped by participant_key (UUID via name bridge) so that
+    -- renamed participants collapse into a single join/leave row.
+    -- Webhook names that never appear in snapshots fall back to
+    -- their own name as the key (preserves old behavior for them).
     -- ==========================================================
     webhook_times AS (
       SELECT
-        LOWER(TRIM(participant_name)) as name_key,
-        MAX(participant_email) as participant_email,
-        MIN(CASE WHEN event_type = 'participant_joined' THEN TIMESTAMP(event_timestamp) END) as main_join_time,
-        MAX(CASE WHEN event_type = 'participant_left' THEN TIMESTAMP(event_timestamp) END) as main_leave_time
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
-      WHERE event_date = '{report_date}'
-        AND participant_name IS NOT NULL AND participant_name != ''
-      GROUP BY LOWER(TRIM(participant_name))
+        COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+        MAX(pe.participant_email) as participant_email,
+        MIN(CASE WHEN pe.event_type = 'participant_joined' THEN TIMESTAMP(pe.event_timestamp) END) as main_join_time,
+        MAX(CASE WHEN pe.event_type = 'participant_left' THEN TIMESTAMP(pe.event_timestamp) END) as main_leave_time
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+      LEFT JOIN participant_name_map pnm
+        ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
+      WHERE pe.event_date = '{report_date}'
+        AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
+      GROUP BY COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
     ),
     -- ==========================================================
     -- STEP 1: Clean snapshots - remove empty room names
     -- ==========================================================
     snapshot_clean AS (
       SELECT
-        COALESCE(NULLIF(participant_uuid, ''), participant_name) as participant_key,
+        COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
         participant_name,
         COALESCE(NULLIF(participant_email, ''), '') as participant_email,
         room_name,
@@ -218,20 +238,30 @@ def generate_daily_report(report_date=None):
         AND room_name IS NOT NULL AND room_name != ''
     ),
     -- ==========================================================
-    -- STEP 2: Detect room transitions
+    -- STEP 2: Detect room transitions AND time gaps
+    -- A new visit starts when:
+    --   1. Room changes, OR
+    --   2. Time gap > 5 minutes (person left and rejoined)
     -- ==========================================================
     snapshot_transitions AS (
       SELECT *,
         LAG(room_name) OVER (
           PARTITION BY participant_key
           ORDER BY snapshot_time
-        ) as prev_room
+        ) as prev_room,
+        LAG(snapshot_time) OVER (
+          PARTITION BY participant_key
+          ORDER BY snapshot_time
+        ) as prev_snapshot_time
       FROM snapshot_clean
     ),
     visit_groups_raw AS (
       SELECT *,
         SUM(CASE
           WHEN prev_room IS NULL OR room_name != prev_room THEN 1
+          -- Also start new visit if time gap > 5 minutes (300 seconds)
+          WHEN prev_snapshot_time IS NOT NULL
+               AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) > 300 THEN 1
           ELSE 0
         END) OVER (
           PARTITION BY participant_key
@@ -307,7 +337,7 @@ def generate_daily_report(report_date=None):
       rv.room_left_ist as Room_Left_IST,
       rv.duration_mins as Duration_Minutes
     FROM room_visits_final rv
-    LEFT JOIN webhook_times w ON LOWER(TRIM(rv.participant_name)) = w.name_key
+    LEFT JOIN webhook_times w ON rv.participant_key = w.participant_key
     WHERE rv.participant_name NOT LIKE '%Scout%'
       AND rv.duration_mins > 0
     ORDER BY rv.participant_name, rv.join_time
