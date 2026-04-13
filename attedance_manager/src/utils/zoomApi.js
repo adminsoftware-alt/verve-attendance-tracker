@@ -321,6 +321,12 @@ export async function fetchUnrecognizedMonthly(year, month) {
   return apiFetch(`/employees/unrecognized-monthly?year=${year}&month=${month}`);
 }
 
+export async function fetchClassifiedMonthly(year, month, categories) {
+  const cats = Array.isArray(categories) ? categories.join(',') : (categories || '');
+  const catParam = cats ? `&categories=${encodeURIComponent(cats)}` : '';
+  return apiFetch(`/employees/classified-monthly?year=${year}&month=${month}${catParam}`);
+}
+
 export async function fetchEmployeeDetail(employeeId, yearMonth) {
   return apiFetch(`/employees/${employeeId}/attendance/${yearMonth}`);
 }

@@ -9919,6 +9919,267 @@ def list_unrecognized_monthly():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/employees/classified-monthly', methods=['GET'])
+def list_classified_monthly():
+    """Monthly attendance tracking for REGISTERED non-employee participants
+    (visitors/vendors/interviews/others). Query params:
+      year, month, categories=visitor,vendor,interview,other.
+    Same shape as /employees/unrecognized-monthly so the frontend can reuse
+    the same row + daily-breakdown component."""
+    try:
+        ensure_team_tables_once()
+        year = int(request.args.get('year', get_ist_now().year))
+        month = int(request.args.get('month', get_ist_now().month))
+        if month < 1 or month > 12:
+            return jsonify({'success': False, 'error': 'Invalid month'}), 400
+        categories_param = request.args.get('categories', 'visitor,vendor,interview,other')
+        categories = [c.strip().lower() for c in categories_param.split(',') if c.strip()]
+        if not categories:
+            return jsonify({'success': False, 'error': 'categories required'}), 400
+
+        from calendar import monthrange
+        _, last_day = monthrange(year, month)
+        start_date = f"{year}-{month:02d}-01"
+        end_date = f"{year}-{month:02d}-{last_day:02d}"
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # 1. Pull registry entries in the requested categories.
+        reg_query = f"""
+        SELECT employee_id, participant_name, display_name, participant_email,
+               category, team_id, status
+        FROM `{dataset_ref}.employee_registry`
+        WHERE LOWER(category) IN UNNEST(@cats)
+          AND (status IS NULL OR status = '' OR status = 'active')
+        """
+        reg_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("cats", "STRING", categories)
+        ])
+        reg_rows = list(client.query(reg_query, job_config=reg_config).result())
+
+        if not reg_rows:
+            return jsonify({
+                'success': True,
+                'year': year, 'month': month,
+                'start_date': start_date, 'end_date': end_date,
+                'participants': [], 'count': 0,
+            })
+
+        # Build name_key -> registry_info lookup. Match via raw name, display
+        # name, and normalized form so renamers / suffix variants still map.
+        name_to_reg = {}
+        def _reg_info(r):
+            return {
+                'employee_id': r.employee_id,
+                'participant_name': r.participant_name,
+                'display_name': r.display_name or r.participant_name,
+                'participant_email': r.participant_email or '',
+                'category': (r.category or 'other').lower(),
+                'team_id': r.team_id or '',
+            }
+        for r in reg_rows:
+            info = _reg_info(r)
+            for n in (r.participant_name, r.display_name):
+                if not n:
+                    continue
+                for key in (n.lower().strip(), normalize_participant_name(n).lower().strip()):
+                    if key and key not in name_to_reg:
+                        name_to_reg[key] = info
+
+        # 2. Per-day snapshot stats (same pattern as /employees/unrecognized-monthly).
+        query = f"""
+        WITH deduped AS (
+            SELECT
+                s.event_date,
+                s.participant_name,
+                s.participant_email,
+                s.room_name,
+                s.snapshot_time
+            FROM `{dataset_ref}.room_snapshots` s
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.participant_name IS NOT NULL AND s.participant_name != ''
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND LOWER(s.room_name) != 'main room'
+              AND LOWER(s.room_name) NOT LIKE '0.main%'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY s.event_date, LOWER(TRIM(s.participant_name)), s.snapshot_time
+                ORDER BY s.room_name
+            ) = 1
+        ),
+        ordered_snaps AS (
+            SELECT
+                event_date,
+                LOWER(TRIM(participant_name)) as name_key,
+                participant_name,
+                participant_email,
+                snapshot_time,
+                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
+                LAG(snapshot_time) OVER (
+                    PARTITION BY event_date, LOWER(TRIM(participant_name))
+                    ORDER BY snapshot_time
+                ) as prev_time
+            FROM deduped
+        ),
+        daily_stats AS (
+            SELECT
+                event_date,
+                name_key,
+                MAX(participant_name) as participant_name,
+                MAX(participant_email) as participant_email,
+                MIN(snapshot_ist) as first_seen,
+                MAX(snapshot_ist) as last_seen,
+                CEILING(SUM(
+                    CASE
+                        WHEN prev_time IS NULL THEN 0.5
+                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
+                            TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
+                        ELSE 0.5
+                    END
+                )) as active_mins
+            FROM ordered_snaps
+            GROUP BY event_date, name_key
+        ),
+        daily_breaks AS (
+            SELECT
+                event_date,
+                name_key,
+                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 60
+                    THEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) - 30 ELSE 0 END) as break_seconds
+            FROM ordered_snaps
+            WHERE prev_time IS NOT NULL
+            GROUP BY event_date, name_key
+        ),
+        room_occupancy AS (
+            SELECT snapshot_time, room_name,
+                   COUNT(DISTINCT LOWER(TRIM(participant_name))) as cnt
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date >= @start_date AND event_date <= @end_date
+              AND room_name IS NOT NULL AND room_name != ''
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+            GROUP BY snapshot_time, room_name
+        ),
+        daily_isolation AS (
+            SELECT
+                s.event_date,
+                LOWER(TRIM(s.participant_name)) as name_key,
+                COUNT(*) * 30 as isolation_seconds
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN room_occupancy ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND ro.cnt = 1
+            GROUP BY s.event_date, name_key
+        )
+        SELECT
+            ds.event_date,
+            ds.name_key,
+            ds.participant_name,
+            ds.participant_email,
+            FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
+            ds.active_mins,
+            COALESCE(ROUND(db.break_seconds / 60), 0) as break_mins,
+            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins
+        FROM daily_stats ds
+        LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.name_key = db.name_key
+        LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.name_key = di.name_key
+        ORDER BY ds.name_key, ds.event_date
+        """
+
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
+            bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+        ])
+        snap_rows = list(client.query(query, job_config=job_config).result())
+
+        # 3. Group per registered person, attaching their daily rows.
+        by_person = {}
+        for r in snap_rows:
+            reg = name_to_reg.get(r.name_key)
+            if not reg:
+                normed = normalize_participant_name(r.participant_name or '').lower().strip()
+                if normed:
+                    reg = name_to_reg.get(normed)
+            if not reg:
+                continue  # snapshot not in our category filter
+
+            emp_id = reg['employee_id']
+            person = by_person.get(emp_id)
+            if person is None:
+                person = {
+                    'employee_id': emp_id,
+                    'participant_name': reg['participant_name'],
+                    'display_name': reg['display_name'],
+                    'participant_email': reg['participant_email'],
+                    'category': reg['category'],
+                    'team_id': reg['team_id'],
+                    'days_present': 0,
+                    'total_active_mins': 0,
+                    'total_break_mins': 0,
+                    'total_isolation_mins': 0,
+                    'daily': [],
+                }
+                by_person[emp_id] = person
+
+            active = int(r.active_mins or 0)
+            break_mins = int(r.break_mins or 0)
+            iso_mins = int(r.isolation_mins or 0)
+            status = 'Present' if active >= 300 else 'Half Day' if active >= 240 else 'Absent'
+            person['daily'].append({
+                'date': str(r.event_date),
+                'first_seen_ist': r.first_seen_ist,
+                'last_seen_ist': r.last_seen_ist,
+                'active_minutes': active,
+                'break_minutes': break_mins,
+                'isolation_minutes': iso_mins,
+                'status': status,
+            })
+            if active > 0:
+                person['days_present'] += 1
+            person['total_active_mins'] += active
+            person['total_break_mins'] += break_mins
+            person['total_isolation_mins'] += iso_mins
+            if (r.participant_email or '') and not person['participant_email']:
+                person['participant_email'] = r.participant_email
+
+        # 4. Also include registered people with zero attendance this month.
+        for r in reg_rows:
+            if r.employee_id in by_person:
+                continue
+            by_person[r.employee_id] = {
+                'employee_id': r.employee_id,
+                'participant_name': r.participant_name,
+                'display_name': r.display_name or r.participant_name,
+                'participant_email': r.participant_email or '',
+                'category': (r.category or 'other').lower(),
+                'team_id': r.team_id or '',
+                'days_present': 0,
+                'total_active_mins': 0,
+                'total_break_mins': 0,
+                'total_isolation_mins': 0,
+                'daily': [],
+            }
+
+        participants = list(by_person.values())
+        # Sort by total active time descending so most-present first.
+        participants.sort(key=lambda p: (-p['total_active_mins'], p['display_name'].lower()))
+
+        return jsonify({
+            'success': True,
+            'year': year, 'month': month,
+            'start_date': start_date, 'end_date': end_date,
+            'participants': participants,
+            'count': len(participants),
+        })
+    except Exception as e:
+        print(f"[Employees] Classified monthly error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/employees/<employee_id>/attendance/<date>', methods=['GET'])
 def employee_attendance_detail(employee_id, date):
     """Get detailed attendance for one employee for a month.

@@ -8,6 +8,7 @@ import {
   fetchEmployeeDetail,
   fetchUnrecognized,
   fetchUnrecognizedMonthly,
+  fetchClassifiedMonthly,
   addTeamMember,
 } from '../utils/zoomApi';
 
@@ -59,7 +60,7 @@ function fmtHours(m) {
 
 export default function Employees({ user }) {
   // Top-level view toggle
-  const [mainView, setMainView] = useState('members'); // 'members' | 'unrecognized'
+  const [mainView, setMainView] = useState('members'); // 'members' | 'classified' | 'unrecognized'
 
   const [teams, setTeams] = useState([]);
   const [selectedTeam, setSelectedTeam] = useState('');
@@ -228,7 +229,7 @@ export default function Employees({ user }) {
 
       {error && <div style={s.error}>{error}</div>}
 
-      {/* Main view toggle: Members vs Unrecognized */}
+      {/* Main view toggle: Members / Visitors & Others / Unrecognized */}
       <div style={s.mainToggle}>
         <button
           onClick={() => setMainView('members')}
@@ -237,12 +238,22 @@ export default function Employees({ user }) {
           Team Members
         </button>
         <button
+          onClick={() => setMainView('classified')}
+          style={{ ...s.mainToggleBtn, ...(mainView === 'classified' ? s.mainToggleBtnOn : {}) }}
+        >
+          Visitors & Others
+        </button>
+        <button
           onClick={() => setMainView('unrecognized')}
           style={{ ...s.mainToggleBtn, ...(mainView === 'unrecognized' ? s.mainToggleBtnOn : {}) }}
         >
           Unrecognized Participants
         </button>
       </div>
+
+      {mainView === 'classified' && (
+        <ClassifiedPanel teams={teams} />
+      )}
 
       {mainView === 'unrecognized' && (
         <UnrecognizedPanel
@@ -709,6 +720,241 @@ function UnrecognizedPanel({ teams, onClassified }) {
                     {isOpen && (
                       <tr>
                         <td colSpan={11} style={s.detailCell}>
+                          <DailyBreakdown detail={{ daily: p.daily || [] }} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Classified participants panel (visitors, vendors, interviews, others) ─
+// Shows people already marked in the registry as non-employees, with their
+// full monthly attendance (days present, active, break, isolation + daily
+// breakdown) so they can be tracked month over month.
+function ClassifiedPanel({ teams }) {
+  const [year, setYear] = useState(new Date().getFullYear());
+  const [month, setMonth] = useState(new Date().getMonth() + 1);
+  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [expandedKey, setExpandedKey] = useState(null);
+
+  const CLASSIFIED_CATEGORIES = ['visitor', 'vendor', 'interview', 'other'];
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setErr(null);
+    setExpandedKey(null);
+    try {
+      const res = await fetchClassifiedMonthly(year, month, CLASSIFIED_CATEGORIES);
+      setItems(res.participants || []);
+    } catch (e) {
+      setErr(e.message);
+    }
+    setLoading(false);
+  }, [year, month]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const teamNameById = useMemo(() => {
+    const m = {};
+    teams.forEach(t => { m[t.team_id] = t.team_name; });
+    return m;
+  }, [teams]);
+
+  // Filtered rows: by category chip + search text
+  const rows = useMemo(() => {
+    return items.filter(p => {
+      if (categoryFilter !== 'all' && (p.category || '').toLowerCase() !== categoryFilter) return false;
+      if (search) {
+        const q = search.toLowerCase();
+        const hay = `${p.display_name || ''} ${p.participant_name || ''} ${p.participant_email || ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [items, categoryFilter, search]);
+
+  // Counts per category for chip badges
+  const counts = useMemo(() => {
+    const c = { all: items.length };
+    CLASSIFIED_CATEGORIES.forEach(cat => { c[cat] = 0; });
+    items.forEach(p => { c[(p.category || '').toLowerCase()] = (c[(p.category || '').toLowerCase()] || 0) + 1; });
+    return c;
+  }, [items]);
+
+  const totals = useMemo(() => {
+    const count = rows.length;
+    const totalHours = rows.reduce((sum, p) => sum + (p.total_active_mins || 0), 0) / 60;
+    const totalBreak = rows.reduce((sum, p) => sum + (p.total_break_mins || 0), 0);
+    const totalIso = rows.reduce((sum, p) => sum + (p.total_isolation_mins || 0), 0);
+    return { count, totalHours, totalBreak, totalIso };
+  }, [rows]);
+
+  const chipLabels = [
+    { value: 'all',       label: 'All' },
+    { value: 'visitor',   label: 'Visitor' },
+    { value: 'vendor',    label: 'Vendor' },
+    { value: 'interview', label: 'Interview' },
+    { value: 'other',     label: 'Other' },
+  ];
+
+  return (
+    <div>
+      {/* Controls: year/month + search */}
+      <div style={s.controlBar}>
+        <div style={s.controlGroup}>
+          <label style={s.label}>Year</label>
+          <select value={year} onChange={e => setYear(+e.target.value)} style={s.select}>
+            {[2024, 2025, 2026].map(y => <option key={y} value={y}>{y}</option>)}
+          </select>
+        </div>
+        <div style={s.controlGroup}>
+          <label style={s.label}>Month</label>
+          <select value={month} onChange={e => setMonth(+e.target.value)} style={s.select}>
+            {['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].map((m, i) => (
+              <option key={i} value={i + 1}>{m}</option>
+            ))}
+          </select>
+        </div>
+        <div style={{ ...s.controlGroup, flex: 1, minWidth: 180 }}>
+          <label style={s.label}>Search</label>
+          <input
+            type="text"
+            placeholder="Name or email"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            style={s.input}
+          />
+        </div>
+        <div style={s.controlGroup}>
+          <label style={s.label}>&nbsp;</label>
+          <button onClick={load} style={s.refreshBtn} disabled={loading}>
+            {loading ? 'Loading...' : 'Refresh'}
+          </button>
+        </div>
+      </div>
+
+      {/* Category chips */}
+      <div style={s.chipRow}>
+        {chipLabels.map(c => (
+          <button
+            key={c.value}
+            onClick={() => setCategoryFilter(c.value)}
+            style={{
+              ...s.chip,
+              ...(categoryFilter === c.value ? s.chipOn : {}),
+            }}
+          >
+            {c.label}
+            <span style={{
+              ...s.chipCount,
+              background: categoryFilter === c.value ? 'rgba(255,255,255,0.25)' : '#f1f5f9',
+              color: categoryFilter === c.value ? '#fff' : '#64748b',
+            }}>
+              {counts[c.value] ?? 0}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {err && <div style={s.error}>{err}</div>}
+
+      {!loading && items.length > 0 && (
+        <div style={s.statsRow}>
+          <Stat label="People" value={totals.count} color="#3b82f6" />
+          <Stat label="Total Hours" value={`${totals.totalHours.toFixed(0)}h`} color="#10b981" />
+          <Stat label="Total Break" value={fmtMins(totals.totalBreak)} color="#f97316" />
+          <Stat label="Total Isolation" value={fmtMins(totals.totalIso)} color="#ef4444" />
+        </div>
+      )}
+
+      {loading && <div style={s.loader}>Loading classified participants...</div>}
+
+      {!loading && items.length === 0 && (
+        <div style={s.empty}>
+          No visitors, vendors, interviews or others registered yet. Classify unrecognized
+          participants from the <strong>Unrecognized Participants</strong> tab.
+        </div>
+      )}
+
+      {!loading && items.length > 0 && rows.length === 0 && (
+        <div style={s.empty}>No results for the current filters.</div>
+      )}
+
+      {!loading && rows.length > 0 && (
+        <div style={s.tableWrap}>
+          <table style={s.table}>
+            <thead>
+              <tr>
+                <th style={s.th}></th>
+                <th style={s.th}>Name</th>
+                <th style={s.th}>Category</th>
+                <th style={s.th}>Days Present</th>
+                <th style={s.th}>Total Hours</th>
+                <th style={s.th}>Avg / Day</th>
+                <th style={s.th}>Break</th>
+                <th style={s.th}>Isolation</th>
+                <th style={s.th}>Team</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((p, i) => {
+                const key = p.employee_id || p.participant_name;
+                const isOpen = expandedKey === key;
+                const avgMins = p.days_present > 0 ? Math.round(p.total_active_mins / p.days_present) : 0;
+                return (
+                  <Fragment key={key}>
+                    <tr
+                      onClick={() => setExpandedKey(isOpen ? null : key)}
+                      style={{
+                        cursor: 'pointer',
+                        ...(i % 2 === 0 ? s.trEven : {}),
+                        ...(isOpen ? { background: '#eff6ff' } : {}),
+                      }}
+                    >
+                      <td style={s.td}>
+                        <span style={{ color: '#64748b', fontSize: 11 }}>{isOpen ? '▼' : '▶'}</span>
+                      </td>
+                      <td style={s.td}>
+                        <div style={{ fontWeight: 600 }}>{p.display_name || p.participant_name}</div>
+                        {p.participant_email && (
+                          <div style={{ fontSize: 11, color: '#64748b' }}>{p.participant_email}</div>
+                        )}
+                      </td>
+                      <td style={s.td}>
+                        <span style={{ ...s.badge, ...catBadgeStyle(p.category) }}>
+                          {p.category || 'other'}
+                        </span>
+                      </td>
+                      <td style={{ ...s.td, fontWeight: 600 }}>{p.days_present || 0}</td>
+                      <td style={{ ...s.td, color: '#10b981', fontWeight: 700 }}>
+                        {fmtHours(p.total_active_mins)}
+                      </td>
+                      <td style={s.td}>{fmtMins(avgMins)}</td>
+                      <td style={{ ...s.td, color: '#f97316' }}>{fmtMins(p.total_break_mins)}</td>
+                      <td style={{ ...s.td, color: (p.total_isolation_mins || 0) > 120 ? '#ef4444' : '#64748b' }}>
+                        {fmtMins(p.total_isolation_mins)}
+                      </td>
+                      <td style={s.td}>
+                        <span style={{ fontSize: 12, color: p.team_id ? '#1e293b' : '#94a3b8' }}>
+                          {p.team_id ? (teamNameById[p.team_id] || p.team_id) : '—'}
+                        </span>
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr>
+                        <td colSpan={9} style={s.detailCell}>
                           <DailyBreakdown detail={{ daily: p.daily || [] }} />
                         </td>
                       </tr>
