@@ -1,26 +1,25 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { getAllData, getUploadedDates, getDayData } from '../utils/storage';
+import { getUploadedDates, getDayData } from '../utils/storage';
 import { mergeDayEmployees, todayIST } from '../utils/parser';
 import { fetchSummary, transformSummaryToEmployees, fetchLiveRooms, transformLiveToEmployees } from '../utils/zoomApi';
 
 const LIVE_INTERVAL = 30000; // 30 seconds
 
-// Central data hook — loads stored data + auto-fetches today from Zoom API
+// Central data hook — loads dates list + auto-fetches today from Zoom API
+// Data is loaded on-demand per date to prevent performance issues as history grows
 export function useAllData(refreshKey) {
-  const [storedData, setStoredData] = useState({});
   const [storedDates, setStoredDates] = useState([]);
   const [liveData, setLiveData] = useState({});
   const [loading, setLoading] = useState(true);
   const liveTimer = useRef(null);
 
-  // Load stored data from Supabase/localStorage
+  // Load only the dates list (lightweight) - individual day data loaded on demand
   const loadStored = useCallback(async () => {
     try {
-      const [allData, allDates] = await Promise.all([getAllData(), getUploadedDates()]);
-      setStoredData(allData);
+      const allDates = await getUploadedDates();
       setStoredDates(allDates);
     } catch (err) {
-      console.error('Stored data load error:', err);
+      console.error('Dates load error:', err);
     }
   }, []);
 
@@ -62,27 +61,14 @@ export function useAllData(refreshKey) {
     return () => window.clearInterval(liveTimer.current);
   }, [loadLive]);
 
-  // Merge stored + live data intelligently
-  // - 'summary' source: full data, can override stored
-  // - 'live' source: partial (no times), only use if no stored data exists for that date
+  // Live data only (historical data loaded on-demand via useDayData hook)
   const data = useMemo(() => {
-    const combined = { ...storedData };
-    for (const [date, entry] of Object.entries(liveData)) {
-      if (entry.source === 'summary') {
-        // Full data — override stored
-        combined[date] = entry.employees;
-      } else if (!combined[date] || combined[date].length === 0) {
-        // Partial live data — only use if no stored data exists
-        combined[date] = entry.employees;
-      }
-      // else: stored data exists AND live is partial — keep stored
-    }
     const merged = {};
-    for (const date of Object.keys(combined)) {
-      merged[date] = mergeDayEmployees(combined[date]);
+    for (const [date, entry] of Object.entries(liveData)) {
+      merged[date] = mergeDayEmployees(entry.employees);
     }
     return merged;
-  }, [storedData, liveData]);
+  }, [liveData]);
 
   const dates = useMemo(() => {
     const set = new Set([...storedDates, ...Object.keys(liveData)]);

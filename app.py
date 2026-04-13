@@ -10970,12 +10970,12 @@ def admin_edit_snapshots():
             sets.append("snapshot_time = @snap_time")
             params.append(bigquery.ScalarQueryParameter("snap_time", "TIMESTAMP", new_time))
 
-        # Use IN with string array for snapshot_ids
-        id_list = ", ".join([f"'{sid}'" for sid in snapshot_ids])
+        # Use parameterized ARRAY to prevent SQL injection
+        params.append(bigquery.ArrayQueryParameter("snapshot_ids", "STRING", snapshot_ids))
         query = f"""
         UPDATE `{dataset_ref}.room_snapshots`
         SET {', '.join(sets)}
-        WHERE snapshot_id IN ({id_list})
+        WHERE snapshot_id IN UNNEST(@snapshot_ids)
         """
         job_config = bigquery.QueryJobConfig(query_parameters=params)
         result = client.query(query, job_config=job_config).result()
@@ -11000,9 +11000,12 @@ def admin_delete_snapshots():
 
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
-        id_list = ", ".join([f"'{sid}'" for sid in snapshot_ids])
-        query = f"DELETE FROM `{dataset_ref}.room_snapshots` WHERE snapshot_id IN ({id_list})"
-        result = client.query(query).result()
+        # Use parameterized ARRAY to prevent SQL injection
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("snapshot_ids", "STRING", snapshot_ids)
+        ])
+        query = f"DELETE FROM `{dataset_ref}.room_snapshots` WHERE snapshot_id IN UNNEST(@snapshot_ids)"
+        result = client.query(query, job_config=job_config).result()
         deleted = result.num_dml_affected_rows if hasattr(result, 'num_dml_affected_rows') else len(snapshot_ids)
 
         print(f"[Admin] Deleted {deleted} snapshots")

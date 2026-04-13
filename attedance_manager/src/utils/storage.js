@@ -68,16 +68,12 @@ export function clearSession() {
 
 // ─── ATTENDANCE DATA ────────────────────────────────────
 
+// DEPRECATED: Don't load all historical data at startup - use getUploadedDates() + getDayData() instead
+// This function now returns empty to prevent performance degradation as data grows
 export async function getAllData() {
-  try {
-    const res = await fetch(`${API_BASE}/data/attendance`);
-    const data = await res.json();
-    if (data.success && data.dates) {
-      const result = {};
-      data.dates.forEach(row => { result[row.report_date] = row.employees; });
-      return result;
-    }
-    return {};
+  console.warn('getAllData() is deprecated - use getUploadedDates() + getDayData() for lazy loading');
+  // Return empty - data should be loaded on-demand per date
+  return {};
   } catch (err) {
     console.error('Attendance API error, using fallback:', err);
     // Fallback: localStorage
