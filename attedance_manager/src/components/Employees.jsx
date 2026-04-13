@@ -304,7 +304,7 @@ export default function Employees({ user }) {
       {mainView === 'unrecognized' && (
         <UnrecognizedPanel
           teams={teams}
-          onClassified={() => { if (mainView === 'members') loadData(); }}
+          onClassified={() => loadData()}
         />
       )}
 
@@ -742,7 +742,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
                 <th style={s.th}>Isolation</th>
                 <th style={s.th}>Classify As</th>
                 <th style={s.th}>Team</th>
-                <th style={s.th}></th>
+                <th style={s.stickyActionTh}>Save</th>
               </tr>
             </thead>
             <tbody>
@@ -841,7 +841,10 @@ function UnrecognizedPanel({ teams, onClassified }) {
                               </select>
                             </div>
                           </td>
-                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                          <td
+                            style={{ ...s.stickyActionTd, ...(isOpen ? { background: '#eff6ff' } : {}), ...(isShared ? { background: '#fef3c7' } : {}) }}
+                            onClick={(ev) => ev.stopPropagation()}
+                          >
                             <button
                               onClick={() => saveSplitRow(p)}
                               disabled={savingRow === key}
@@ -878,7 +881,10 @@ function UnrecognizedPanel({ teams, onClassified }) {
                               ))}
                             </select>
                           </td>
-                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                          <td
+                            style={{ ...s.stickyActionTd, ...(isOpen ? { background: '#eff6ff' } : {}), ...(i % 2 === 0 ? { background: isOpen ? '#eff6ff' : '#fafbfc' } : {}) }}
+                            onClick={(ev) => ev.stopPropagation()}
+                          >
                             <button
                               onClick={() => saveRow(p)}
                               disabled={savingRow === key}
@@ -1283,6 +1289,25 @@ const s = {
     padding: '6px 14px', background: '#10b981', color: '#fff',
     border: 'none', borderRadius: 6, fontSize: 11, fontWeight: 700,
     cursor: 'pointer',
+  },
+
+  // Sticky-right "Save" column so it stays visible even when the
+  // unrecognized / classified tables overflow horizontally.
+  stickyActionTh: {
+    padding: '10px 14px', textAlign: 'center',
+    fontSize: 11, fontWeight: 600, color: '#64748b',
+    textTransform: 'uppercase', letterSpacing: '0.05em',
+    borderBottom: '1px solid #e5e7eb', borderLeft: '1px solid #e5e7eb',
+    background: '#f8fafc', whiteSpace: 'nowrap',
+    position: 'sticky', right: 0, zIndex: 2,
+    boxShadow: '-4px 0 6px -4px rgba(15, 23, 42, 0.12)',
+  },
+  stickyActionTd: {
+    padding: '8px 14px', fontSize: 12,
+    borderBottom: '1px solid #f1f5f9', borderLeft: '1px solid #e5e7eb',
+    background: '#fff', whiteSpace: 'nowrap',
+    position: 'sticky', right: 0, zIndex: 1,
+    boxShadow: '-4px 0 6px -4px rgba(15, 23, 42, 0.12)',
   },
 
   controlBar: {
