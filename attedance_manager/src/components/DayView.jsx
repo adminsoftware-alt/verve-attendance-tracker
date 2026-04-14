@@ -130,7 +130,7 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
         <>
           <div style={s.statsGrid}>
             {[
-              { label: 'Employees', value: stats.count, color: '#1a365d', bg: '#eef2ff' },
+              { label: 'Employees', value: stats.count, color: '#0f172a', bg: '#eef2ff' },
               { label: 'Avg Duration', value: stats.avgDur, color: '#047857', bg: '#ecfdf5' },
               { label: 'Avg Login', value: stats.avgJoin, color: '#1d4ed8', bg: '#eff6ff' },
               { label: 'Avg Logout', value: stats.avgLeave, color: '#b91c1c', bg: '#fef2f2' },
@@ -152,7 +152,7 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
             <div style={s.sortGroup}>
               {[['name', 'A-Z'], ['early', 'Early'], ['late', 'Late'], ['duration', 'Longest']].map(([k, l]) => (
                 <button key={k} onClick={() => { setSortBy(k); setExpanded(null); }}
-                  style={{ ...s.sortBtn, background: sortBy === k ? '#1a365d' : '#fff', color: sortBy === k ? '#fff' : '#64748b', border: sortBy === k ? '1px solid #1a365d' : '1px solid #e5e7eb' }}>
+                  style={{ ...s.sortBtn, background: sortBy === k ? '#0f172a' : '#fff', color: sortBy === k ? '#fff' : '#64748b', border: sortBy === k ? '1px solid #0f172a' : '1px solid #e5e7eb' }}>
                   {l}
                 </button>
               ))}
@@ -191,7 +191,7 @@ function EmployeeRow({ emp, isExpanded, onToggle }) {
   const namedRooms = emp.rooms.filter(r => r.isNamed);
   return (
     <>
-      <tr onClick={onToggle} style={{ cursor: 'pointer', background: isExpanded ? '#fafaf8' : 'transparent' }}>
+      <tr onClick={onToggle} style={{ cursor: 'pointer', background: isExpanded ? '#f8fafc' : 'transparent' }}>
         <td style={s.td}><span style={{ fontWeight: 500, color: '#1e293b' }}>{emp.name}</span></td>
         <td style={{ ...s.td, color: '#94a3b8', fontSize: 12 }}>{emp.email || '\u2014'}</td>
         <td style={s.td}><span style={{ color: '#047857', fontWeight: 600, fontFamily: 'monospace', fontSize: 13 }}>{emp.joined || '\u2014'}</span></td>
@@ -202,7 +202,7 @@ function EmployeeRow({ emp, isExpanded, onToggle }) {
         <td style={s.td}><span style={{ fontSize: 11, color: '#94a3b8' }}>{isExpanded ? '\u25B2' : '\u25BC'}</span></td>
       </tr>
       {isExpanded && (
-        <tr><td colSpan={8} style={{ padding: '4px 16px 16px', background: '#fafaf8', borderBottom: '2px solid #e5e7eb' }}>
+        <tr><td colSpan={8} style={{ padding: '4px 16px 16px', background: '#f8fafc', borderBottom: '2px solid #e5e7eb' }}>
           <RoomTable rooms={emp.rooms} />
         </td></tr>
       )}
@@ -215,9 +215,9 @@ const s = {
   emptyIcon: { fontSize: 40, marginBottom: 12, opacity: 0.4 },
   emptyTitle: { fontWeight: 600, fontSize: 18, marginBottom: 6 },
   emptyDesc: { fontSize: 13, color: '#94a3b8', marginBottom: 20 },
-  primaryBtn: { padding: '10px 28px', background: '#1a365d', color: '#fff', border: 'none', borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: 'pointer' },
+  primaryBtn: { padding: '10px 28px', background: '#0f172a', color: '#fff', border: 'none', borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: 'pointer' },
   dateNav: { display: 'flex', alignItems: 'center', gap: 14, marginBottom: 24 },
-  arrowBtn: { width: 38, height: 38, borderRadius: 10, border: '1px solid #e5e7eb', background: '#fff', fontSize: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#1a365d', fontWeight: 600 },
+  arrowBtn: { width: 38, height: 38, borderRadius: 10, border: '1px solid #e5e7eb', background: '#fff', fontSize: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#0f172a', fontWeight: 600 },
   dateCenter: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 },
   dateInput: { padding: '7px 12px', border: '1px solid #d1d5db', borderRadius: 8, fontSize: 13, outline: 'none', background: '#fff' },
   dateLabel: { fontSize: 12, color: '#64748b', fontWeight: 500 },
@@ -232,10 +232,10 @@ const s = {
   sortBtn: { padding: '8px 14px', borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s' },
   tableCard: { background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' },
   table: { width: '100%', borderCollapse: 'collapse', fontSize: 13 },
-  th: { padding: '12px 14px', textAlign: 'left', fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', borderBottom: '2px solid #f1f5f9', background: '#fafaf8' },
+  th: { padding: '12px 14px', textAlign: 'left', fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', borderBottom: '2px solid #f1f5f9', background: '#f8fafc' },
   td: { padding: '11px 14px', borderBottom: '1px solid #f1f5f9' },
   chipNeutral: { padding: '3px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600, background: '#f1f5f9', color: '#475569' },
-  chipBlue: { padding: '3px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600, background: '#eef2ff', color: '#1a365d' },
+  chipBlue: { padding: '3px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600, background: '#eef2ff', color: '#0f172a' },
   noResults: { padding: 32, textAlign: 'center', color: '#94a3b8', fontSize: 13 },
   count: { marginTop: 10, fontSize: 12, color: '#94a3b8', textAlign: 'right' },
 };

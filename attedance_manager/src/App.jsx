@@ -56,7 +56,7 @@ export default function App() {
         <button onClick={() => {}} style={styles.menuBtn} aria-label="Menu">
           {'\u2630'}
         </button>
-        <span style={{ fontSize: 14, fontWeight: 700, color: '#1a365d' }}>Verve Attendance</span>
+        <span style={{ fontSize: 14, fontWeight: 700, color: '#0f172a' }}>Verve Attendance</span>
       </div>
 
       <Sidebar
@@ -120,14 +120,14 @@ const styles = {
     flex: 1,
     overflow: 'auto',
     padding: '28px 32px',
-    background: '#f5f5f0',
+    background: '#f8fafc',
   },
   mobileHeader: {
     display: 'none',
     alignItems: 'center',
     gap: 10,
     padding: '10px 16px',
-    background: '#0f2847',
+    background: '#060c1d',
     position: 'fixed',
     top: 0,
     left: 0,

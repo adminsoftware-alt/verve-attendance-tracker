@@ -76,11 +76,11 @@ export default function Isolation({ allData, uploadedDates: dates }) {
         <div style={s.controls}>
           <div style={s.modeToggle}>
             <button onClick={() => { setMode('daily'); setExpandedIdx(null); }}
-              style={{ ...s.modeBtn, background: mode === 'daily' ? '#1a365d' : '#f1f5f9', color: mode === 'daily' ? '#fff' : '#64748b' }}>
+              style={{ ...s.modeBtn, background: mode === 'daily' ? '#0f172a' : '#f1f5f9', color: mode === 'daily' ? '#fff' : '#64748b' }}>
               Daily
             </button>
             <button onClick={() => { setMode('aggregate'); setExpandedIdx(null); }}
-              style={{ ...s.modeBtn, background: mode === 'aggregate' ? '#1a365d' : '#f1f5f9', color: mode === 'aggregate' ? '#fff' : '#64748b' }}>
+              style={{ ...s.modeBtn, background: mode === 'aggregate' ? '#0f172a' : '#f1f5f9', color: mode === 'aggregate' ? '#fff' : '#64748b' }}>
               All Dates
             </button>
           </div>

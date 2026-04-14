@@ -107,13 +107,13 @@ const styles = {
   ring: {
     borderRadius: '50%',
     border: '4px solid #e2e8f0',
-    borderTopColor: '#1a365d',
+    borderTopColor: '#0f172a',
     animation: 'spin 0.8s linear infinite',
   },
   pulse: {
     position: 'absolute',
     borderRadius: '50%',
-    background: '#1a365d',
+    background: '#0f172a',
     animation: 'pulse 1.5s ease-in-out infinite',
   },
   message: {
@@ -149,7 +149,7 @@ const styles = {
     width: 48,
     height: 48,
     borderRadius: 12,
-    background: 'linear-gradient(135deg, #1a365d 0%, #2d5a87 100%)',
+    background: 'linear-gradient(135deg, #0f172a 0%, #2d5a87 100%)',
     color: '#fff',
     display: 'flex',
     alignItems: 'center',
@@ -176,7 +176,7 @@ const styles = {
     width: 8,
     height: 8,
     borderRadius: '50%',
-    background: '#1a365d',
+    background: '#0f172a',
     animation: 'bounce 1s ease-in-out infinite',
   },
   tableSkeleton: {

@@ -158,7 +158,7 @@ export default function DataEditor({ user }) {
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 20 }}>
-        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: '#1a365d' }}>Data Editor</h2>
+        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: '#0f172a' }}>Data Editor</h2>
         <span style={S.roleBadge}>SUPERADMIN</span>
       </div>
 
@@ -396,10 +396,10 @@ const S = {
   controls: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16, flexWrap: 'wrap' },
   tabs: { display: 'flex', gap: 0, marginRight: 8 },
   tabBtn: { padding: '8px 16px', border: '1px solid #d1d5db', background: '#fff', cursor: 'pointer', fontSize: 12, fontWeight: 600, color: '#666' },
-  tabActive: { background: '#1a365d', color: '#fff', borderColor: '#1a365d' },
+  tabActive: { background: '#0f172a', color: '#fff', borderColor: '#0f172a' },
   dateInput: { padding: '7px 10px', border: '1px solid #d1d5db', borderRadius: 6, fontSize: 13 },
   searchInput: { padding: '7px 12px', border: '1px solid #d1d5db', borderRadius: 6, fontSize: 13, width: 200 },
-  searchBtn: { padding: '8px 18px', background: '#1a365d', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer', fontWeight: 600, fontSize: 13 },
+  searchBtn: { padding: '8px 18px', background: '#0f172a', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer', fontWeight: 600, fontSize: 13 },
   sectionTitle: { fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 8 },
   summaryCard: { padding: '8px 14px', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s' },
   actionBar: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, padding: '8px 12px', background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0' },
@@ -416,7 +416,7 @@ const S = {
   overlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
   modal: { background: '#fff', borderRadius: 12, padding: 24, width: 400, maxWidth: '90vw' },
   modalInput: { width: '100%', padding: '8px 12px', border: '1px solid #d1d5db', borderRadius: 6, fontSize: 13, boxSizing: 'border-box' },
-  saveBtn: { padding: '8px 20px', background: '#1a365d', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer', fontWeight: 600, fontSize: 13 },
+  saveBtn: { padding: '8px 20px', background: '#0f172a', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer', fontWeight: 600, fontSize: 13 },
   cancelBtn: { padding: '8px 20px', background: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer', fontSize: 13 },
   removeRowBtn: { background: '#fee2e2', color: '#991b1b', border: 'none', borderRadius: 4, cursor: 'pointer', padding: '0 8px', fontWeight: 700 },
 };

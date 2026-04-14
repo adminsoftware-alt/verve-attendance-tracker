@@ -488,7 +488,7 @@ const z = {
   // Boot
   bootScreen: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '65vh', gap: 16 },
   bootGlow: { width: 80, height: 80, borderRadius: '50%', background: 'radial-gradient(circle, rgba(59,130,246,0.3) 0%, transparent 70%)', animation: 'pulse 2s infinite', position: 'absolute' },
-  bootLogo: { width: 56, height: 56, borderRadius: 16, background: 'linear-gradient(135deg,#0f2847,#1a365d)', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 28, fontWeight: 800, animation: 'glow 2s ease infinite', position: 'relative', zIndex: 1 },
+  bootLogo: { width: 56, height: 56, borderRadius: 16, background: 'linear-gradient(135deg,#060c1d,#0f172a)', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 28, fontWeight: 800, animation: 'glow 2s ease infinite', position: 'relative', zIndex: 1 },
   bootTitle: { fontSize: 16, fontWeight: 700, color: '#1e293b', animation: 'fadeIn 0.5s ease 0.3s both' },
   bootBarTrack: { width: 220, height: 4, background: '#e2e8f0', borderRadius: 2, overflow: 'hidden' },
   bootBarFill: { height: '100%', background: 'linear-gradient(90deg,#3b82f6,#10b981,#3b82f6)', backgroundSize: '200%', borderRadius: 2, animation: 'progress 1.8s ease-in-out infinite, gradientShift 3s ease infinite' },

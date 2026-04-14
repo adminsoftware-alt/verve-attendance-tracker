@@ -58,7 +58,7 @@ export default function Rooms({ allData, uploadedDates: dates }) {
       <div style={s.summaryRow}>
         <div style={s.summaryCard}>
           <div style={s.summaryLabel}>Total Rooms</div>
-          <div style={{ ...s.summaryValue, color: '#1a365d' }}>{roomStats.length}</div>
+          <div style={{ ...s.summaryValue, color: '#0f172a' }}>{roomStats.length}</div>
         </div>
         <div style={s.summaryCard}>
           <div style={s.summaryLabel}>Total Visits</div>
