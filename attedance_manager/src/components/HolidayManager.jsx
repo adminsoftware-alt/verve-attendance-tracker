@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
-  fetchTeams, fetchTeamHolidays, addTeamHoliday, deleteTeamHoliday,
-  fetchAllEmployeeLeave, addEmployeeLeave, deleteEmployeeLeave, addBulkEmployeeLeave,
+  fetchTeams, fetchTeamHolidays, addTeamHoliday, deleteTeamHoliday, updateTeamHoliday,
+  fetchAllEmployeeLeave, addEmployeeLeave, deleteEmployeeLeave, addBulkEmployeeLeave, updateEmployeeLeave,
   fetchEmployees
 } from '../utils/zoomApi';
 
@@ -40,6 +40,17 @@ export default function HolidayManager({ user }) {
 
   // Hover state for calendar
   const [hoverDay, setHoverDay] = useState(null);
+
+  // Edit state for holidays
+  const [editingHolidayId, setEditingHolidayId] = useState(null);
+  const [editHolidayDate, setEditHolidayDate] = useState('');
+  const [editHolidayDesc, setEditHolidayDesc] = useState('');
+
+  // Edit state for leave
+  const [editingLeaveId, setEditingLeaveId] = useState(null);
+  const [editLeaveDate, setEditLeaveDate] = useState('');
+  const [editLeaveType, setEditLeaveType] = useState('leave');
+  const [editLeaveDesc, setEditLeaveDesc] = useState('');
 
   const monthStr = String(month).padStart(2, '0');
   const daysInMonth = new Date(year, month, 0).getDate();
@@ -135,12 +146,42 @@ export default function HolidayManager({ user }) {
   // Delete team holiday
   const handleDeleteHoliday = async (holidayId) => {
     if (!selectedTeamId) return;
+    if (!window.confirm('Delete this holiday?')) return;
     try {
       await deleteTeamHoliday(selectedTeamId, holidayId);
       await loadHolidays();
     } catch (e) {
       setErr(e.message);
     }
+  };
+
+  // Start editing a holiday
+  const startEditHoliday = (h) => {
+    setEditingHolidayId(h.holiday_id);
+    setEditHolidayDate(h.date);
+    setEditHolidayDesc(h.description || '');
+  };
+
+  // Cancel editing holiday
+  const cancelEditHoliday = () => {
+    setEditingHolidayId(null);
+    setEditHolidayDate('');
+    setEditHolidayDesc('');
+  };
+
+  // Save edited holiday
+  const handleSaveHoliday = async (holidayId) => {
+    if (!selectedTeamId) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      await updateTeamHoliday(selectedTeamId, holidayId, editHolidayDate, editHolidayDesc);
+      setEditingHolidayId(null);
+      await loadHolidays();
+    } catch (e) {
+      setErr(e.message);
+    }
+    setSaving(false);
   };
 
   // Add individual leave
@@ -167,12 +208,43 @@ export default function HolidayManager({ user }) {
 
   // Delete individual leave
   const handleDeleteLeave = async (employeeId, leaveId) => {
+    if (!window.confirm('Delete this leave record?')) return;
     try {
       await deleteEmployeeLeave(employeeId, leaveId);
       await loadLeave();
     } catch (e) {
       setErr(e.message);
     }
+  };
+
+  // Start editing leave
+  const startEditLeave = (l) => {
+    setEditingLeaveId(l.leave_id);
+    setEditLeaveDate(l.date);
+    setEditLeaveType(l.leave_type || 'leave');
+    setEditLeaveDesc(l.description || '');
+  };
+
+  // Cancel editing leave
+  const cancelEditLeave = () => {
+    setEditingLeaveId(null);
+    setEditLeaveDate('');
+    setEditLeaveType('leave');
+    setEditLeaveDesc('');
+  };
+
+  // Save edited leave
+  const handleSaveLeave = async (employeeId, leaveId) => {
+    setSaving(true);
+    setErr(null);
+    try {
+      await updateEmployeeLeave(employeeId, leaveId, editLeaveDate, editLeaveType, editLeaveDesc);
+      setEditingLeaveId(null);
+      await loadLeave();
+    } catch (e) {
+      setErr(e.message);
+    }
+    setSaving(false);
   };
 
   // Toggle employee selection
@@ -425,23 +497,57 @@ export default function HolidayManager({ user }) {
                               <th style={s.th}>Date</th>
                               <th style={s.th}>Day</th>
                               <th style={s.th}>Description</th>
-                              <th style={s.th}></th>
+                              <th style={s.th}>Actions</th>
                             </tr>
                           </thead>
                           <tbody>
                             {holidays.map((h, i) => {
-                              const [y, m, d] = h.date.split('-').map(Number);
+                              const isEditing = editingHolidayId === h.holiday_id;
+                              const [y, m, d] = (isEditing ? editHolidayDate : h.date).split('-').map(Number);
                               const dow = new Date(y, m - 1, d).getDay();
                               const dayName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dow];
                               return (
                                 <tr key={h.holiday_id} style={i % 2 === 0 ? s.trEven : {}}>
-                                  <td style={s.td}><strong>{h.date}</strong></td>
-                                  <td style={s.td}>{dayName}</td>
-                                  <td style={s.td}>{h.description || <span style={{ color: '#94a3b8' }}>—</span>}</td>
                                   <td style={s.td}>
-                                    <button onClick={() => handleDeleteHoliday(h.holiday_id)} style={s.deleteBtn}>
-                                      Remove
-                                    </button>
+                                    {isEditing ? (
+                                      <input
+                                        type="date"
+                                        value={editHolidayDate}
+                                        onChange={e => setEditHolidayDate(e.target.value)}
+                                        style={s.editInput}
+                                      />
+                                    ) : (
+                                      <strong>{h.date}</strong>
+                                    )}
+                                  </td>
+                                  <td style={s.td}>{dayName}</td>
+                                  <td style={s.td}>
+                                    {isEditing ? (
+                                      <input
+                                        type="text"
+                                        value={editHolidayDesc}
+                                        onChange={e => setEditHolidayDesc(e.target.value)}
+                                        placeholder="Description"
+                                        style={{ ...s.editInput, width: '100%' }}
+                                      />
+                                    ) : (
+                                      h.description || <span style={{ color: '#94a3b8' }}>—</span>
+                                    )}
+                                  </td>
+                                  <td style={s.td}>
+                                    {isEditing ? (
+                                      <div style={s.actionBtns}>
+                                        <button onClick={() => handleSaveHoliday(h.holiday_id)} disabled={saving} style={s.saveBtn}>
+                                          {saving ? '...' : 'Save'}
+                                        </button>
+                                        <button onClick={cancelEditHoliday} style={s.cancelBtn}>Cancel</button>
+                                      </div>
+                                    ) : (
+                                      <div style={s.actionBtns}>
+                                        <button onClick={() => startEditHoliday(h)} style={s.editBtn}>Edit</button>
+                                        <button onClick={() => handleDeleteHoliday(h.holiday_id)} style={s.deleteBtn}>Remove</button>
+                                      </div>
+                                    )}
                                   </td>
                                 </tr>
                               );
@@ -548,27 +654,72 @@ export default function HolidayManager({ user }) {
                           <th style={s.th}>Employee</th>
                           <th style={s.th}>Type</th>
                           <th style={s.th}>Note</th>
-                          <th style={s.th}></th>
+                          <th style={s.th}>Actions</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {leaveList.map((l, i) => (
-                          <tr key={l.leave_id} style={i % 2 === 0 ? s.trEven : {}}>
-                            <td style={s.td}><strong>{l.date}</strong></td>
-                            <td style={s.td}>{l.employee_name}</td>
-                            <td style={s.td}>
-                              <span style={{ ...s.badge, ...getLeaveTypeStyle(l.leave_type) }}>
-                                {l.leave_type || 'leave'}
-                              </span>
-                            </td>
-                            <td style={s.td}>{l.description || <span style={{ color: '#94a3b8' }}>—</span>}</td>
-                            <td style={s.td}>
-                              <button onClick={() => handleDeleteLeave(l.employee_id, l.leave_id)} style={s.deleteBtn}>
-                                Remove
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
+                        {leaveList.map((l, i) => {
+                          const isEditing = editingLeaveId === l.leave_id;
+                          return (
+                            <tr key={l.leave_id} style={i % 2 === 0 ? s.trEven : {}}>
+                              <td style={s.td}>
+                                {isEditing ? (
+                                  <input
+                                    type="date"
+                                    value={editLeaveDate}
+                                    onChange={e => setEditLeaveDate(e.target.value)}
+                                    style={s.editInput}
+                                  />
+                                ) : (
+                                  <strong>{l.date}</strong>
+                                )}
+                              </td>
+                              <td style={s.td}>{l.employee_name}</td>
+                              <td style={s.td}>
+                                {isEditing ? (
+                                  <select value={editLeaveType} onChange={e => setEditLeaveType(e.target.value)} style={s.editInput}>
+                                    <option value="leave">Leave</option>
+                                    <option value="sick">Sick</option>
+                                    <option value="personal">Personal</option>
+                                    <option value="wfh">WFH</option>
+                                  </select>
+                                ) : (
+                                  <span style={{ ...s.badge, ...getLeaveTypeStyle(l.leave_type) }}>
+                                    {l.leave_type || 'leave'}
+                                  </span>
+                                )}
+                              </td>
+                              <td style={s.td}>
+                                {isEditing ? (
+                                  <input
+                                    type="text"
+                                    value={editLeaveDesc}
+                                    onChange={e => setEditLeaveDesc(e.target.value)}
+                                    placeholder="Note"
+                                    style={{ ...s.editInput, width: '100%' }}
+                                  />
+                                ) : (
+                                  l.description || <span style={{ color: '#94a3b8' }}>—</span>
+                                )}
+                              </td>
+                              <td style={s.td}>
+                                {isEditing ? (
+                                  <div style={s.actionBtns}>
+                                    <button onClick={() => handleSaveLeave(l.employee_id, l.leave_id)} disabled={saving} style={s.saveBtn}>
+                                      {saving ? '...' : 'Save'}
+                                    </button>
+                                    <button onClick={cancelEditLeave} style={s.cancelBtn}>Cancel</button>
+                                  </div>
+                                ) : (
+                                  <div style={s.actionBtns}>
+                                    <button onClick={() => startEditLeave(l)} style={s.editBtn}>Edit</button>
+                                    <button onClick={() => handleDeleteLeave(l.employee_id, l.leave_id)} style={s.deleteBtn}>Remove</button>
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -663,6 +814,11 @@ const s = {
   // Buttons — match TeamView CTAs
   addBtn: { padding: '8px 18px', background: '#f97316', color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap', boxShadow: '0 2px 4px rgba(249,115,22,0.35)' },
   deleteBtn: { padding: '4px 10px', background: '#fef2f2', color: '#b91c1c', border: '1px solid #fecaca', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' },
+  editBtn: { padding: '4px 10px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' },
+  saveBtn: { padding: '4px 10px', background: '#f0fdf4', color: '#16a34a', border: '1px solid #bbf7d0', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' },
+  cancelBtn: { padding: '4px 10px', background: '#f1f5f9', color: '#64748b', border: '1px solid #e2e8f0', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' },
+  actionBtns: { display: 'flex', gap: 6, flexWrap: 'nowrap' },
+  editInput: { padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: 6, fontSize: 13, background: '#fff' },
   selectAllBtn: { padding: '6px 12px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' },
 
   // Section headings — match TeamView sectionTitle

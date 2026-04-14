@@ -236,6 +236,10 @@ export async function deleteTeamHoliday(teamId, holidayId) {
   return apiDelete(`/teams/${teamId}/holidays/${holidayId}`);
 }
 
+export async function updateTeamHoliday(teamId, holidayId, date, description) {
+  return apiPut(`/teams/${teamId}/holidays/${holidayId}`, { date, description });
+}
+
 // ─── EMPLOYEE LEAVE ───────────────────────────────────
 export async function fetchAllEmployeeLeave(year, month) {
   const q = new URLSearchParams();
@@ -259,6 +263,10 @@ export async function addEmployeeLeave(employeeId, date, leaveType, description)
 
 export async function deleteEmployeeLeave(employeeId, leaveId) {
   return apiDelete(`/employees/${employeeId}/leave/${leaveId}`);
+}
+
+export async function updateEmployeeLeave(employeeId, leaveId, date, leaveType, description) {
+  return apiPut(`/employees/${employeeId}/leave/${leaveId}`, { date, leave_type: leaveType, description });
 }
 
 export async function addBulkEmployeeLeave(date, employeeIds, leaveType, description) {

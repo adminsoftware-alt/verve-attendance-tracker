@@ -10666,13 +10666,14 @@ def list_unrecognized_monthly():
 
         # Load registry to decide which name_keys are unrecognized.
         reg_rows = list(client.query(
-            f"""SELECT e.participant_name, e.display_name, e.team_id, t.team_name
+            f"""SELECT e.participant_name, e.display_name, e.participant_email, e.team_id, t.team_name
                 FROM `{dataset_ref}.employee_registry` e
                 LEFT JOIN `{dataset_ref}.teams` t ON e.team_id = t.team_id"""
         ).result())
 
         reg_names = set()
         reg_first_names = {}
+        reg_emails = set()
         for r in reg_rows:
             name_low = (r.participant_name or '').lower().strip()
             if name_low:
@@ -10685,6 +10686,47 @@ def list_unrecognized_monthly():
             first = name_low.split()[0] if name_low.split() else ''
             if first and len(first) >= 3:
                 reg_first_names.setdefault(first, []).append(name_low)
+            if getattr(r, 'participant_email', None):
+                reg_emails.add(r.participant_email.lower().strip())
+
+        # ── UUID / email bridge ─────────────────────────────────────
+        # Fetch every (uuid, name, email) triple seen in snapshots this month
+        # so we can recognise a participant even if they were renamed to a
+        # brand-new string (same UUID) or if their email alone matches a
+        # registered employee.
+        bridge_rows = list(client.query(
+            f"""
+            SELECT DISTINCT
+              COALESCE(NULLIF(participant_uuid, ''), '') AS uuid,
+              LOWER(TRIM(participant_name)) AS name_key,
+              LOWER(TRIM(COALESCE(participant_email, ''))) AS email_key
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date >= @start_date AND event_date <= @end_date
+              AND participant_name IS NOT NULL AND participant_name != ''
+            """,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
+                bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+            ]),
+        ).result())
+
+        uuid_to_names = {}
+        uuid_to_emails = {}
+        email_to_uuids = {}
+        name_to_uuids = {}
+        name_to_emails = {}
+        for b in bridge_rows:
+            u = b.uuid or ''
+            nk = b.name_key or ''
+            ek = b.email_key or ''
+            if u:
+                if nk: uuid_to_names.setdefault(u, set()).add(nk)
+                if ek: uuid_to_emails.setdefault(u, set()).add(ek)
+            if nk:
+                if u: name_to_uuids.setdefault(nk, set()).add(u)
+                if ek: name_to_emails.setdefault(nk, set()).add(ek)
+            if ek and u:
+                email_to_uuids.setdefault(ek, set()).add(u)
 
         team_keywords = set()
         seen_teams = set()
@@ -10709,10 +10751,11 @@ def list_unrecognized_monthly():
             n = _re.sub(r'[\u00ad\u200b\u200c\u200d]', '', n)
             return n.strip()
 
-        def is_recognized(raw_name):
+        def _name_in_registry(raw_name):
+            """Original name-only recognition (multi-pass)."""
             raw_low = (raw_name or '').lower().strip()
             if not raw_low:
-                return True  # skip empties
+                return True  # empty = ignore, treat as recognised
             if raw_low in reg_names:
                 return True
             stripped_raw = _strip_team_and_clean(raw_low)
@@ -10733,6 +10776,55 @@ def list_unrecognized_monthly():
                     return True
             return False
 
+        # Seed "known" sets from registry + name matches.
+        known_uuids = set()
+        known_emails = set(reg_emails)
+        known_name_keys = set()
+
+        for name_key in set(list(name_to_uuids.keys()) + list(name_to_emails.keys())):
+            if _name_in_registry(name_key):
+                known_name_keys.add(name_key)
+                for u in name_to_uuids.get(name_key, set()):
+                    if u: known_uuids.add(u)
+                for e in name_to_emails.get(name_key, set()):
+                    if e: known_emails.add(e)
+
+        # Transitive closure: if a UUID is known, any other email/name it ever
+        # used is also known; if an email is known, any UUID it appeared under
+        # is also known. Keep iterating until nothing new is added.
+        changed = True
+        while changed:
+            changed = False
+            for u in list(known_uuids):
+                for e in uuid_to_emails.get(u, set()):
+                    if e and e not in known_emails:
+                        known_emails.add(e); changed = True
+                for nk in uuid_to_names.get(u, set()):
+                    if nk and nk not in known_name_keys:
+                        known_name_keys.add(nk); changed = True
+            for e in list(known_emails):
+                for u in email_to_uuids.get(e, set()):
+                    if u and u not in known_uuids:
+                        known_uuids.add(u); changed = True
+
+        def is_recognized_row(name_key, raw_name):
+            """Augmented recognition: name → UUID → email transitive match."""
+            if not name_key:
+                return True
+            if name_key in known_name_keys:
+                return True
+            # UUID-based bridging: is any UUID used under this name known?
+            for u in name_to_uuids.get(name_key, set()):
+                if u and u in known_uuids:
+                    return True
+            # Email-based bridging: is any email tied to this name known?
+            for e in name_to_emails.get(name_key, set()):
+                if e and e in known_emails:
+                    return True
+            # Fallback to multi-pass name heuristic (handles team-keyword
+            # strips, first-name matches for brand-new names).
+            return _name_in_registry(raw_name)
+
         # Group per name_key, attach daily list. Skip recognized people.
         by_person = {}
         for r in rows:
@@ -10742,7 +10834,7 @@ def list_unrecognized_monthly():
             else:
                 # Decide on first sighting whether they are unrecognized.
                 raw = r.participant_name
-                if is_recognized(raw):
+                if is_recognized_row(key, raw):
                     by_person[key] = None  # sentinel: skip rest of their rows
                     continue
                 normed = normalize_participant_name(raw)
