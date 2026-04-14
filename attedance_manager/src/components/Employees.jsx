@@ -11,6 +11,7 @@ import {
   fetchClassifiedMonthly,
   addTeamMember,
   splitSharedAttendance,
+  assignUnrecognizedAttendance,
 } from '../utils/zoomApi';
 
 function istDate() {
@@ -575,6 +576,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
             email2: '',
             team_id1: '',
             team_id2: '',
+            apply_attendance: true,
           };
         } else {
           initial[u.name_key] = {
@@ -583,6 +585,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
             team_id: '',
             name: name,
             email: u.participant_email || '',
+            assign_attendance: true,
           };
         }
       });
@@ -613,21 +616,36 @@ function UnrecognizedPanel({ teams, onClassified }) {
     setSavingRow(key);
     setErr(null);
     try {
-      await createEmployee({
-        participant_name: state.name.trim() || item.participant_name,
-        participant_email: state.email.trim(),
-        category: state.category,
-        team_id: state.team_id || null,
-      });
-      if (state.category === 'employee' && state.team_id) {
-        try {
-          await addTeamMember(
-            state.team_id,
-            state.name.trim() || item.participant_name,
-            state.email.trim(),
-          );
-        } catch (e) {
-          console.warn('addTeamMember failed:', e);
+      const targetName = state.name.trim() || item.participant_name;
+      const targetEmail = state.email.trim();
+      if (state.category === 'employee' && state.assign_attendance) {
+        await assignUnrecognizedAttendance(
+          item.participant_name,
+          {
+            name: targetName,
+            email: targetEmail,
+            team_id: state.team_id || '',
+          },
+          item.daily || [],
+          true,
+        );
+      } else {
+        await createEmployee({
+          participant_name: targetName,
+          participant_email: targetEmail,
+          category: state.category,
+          team_id: state.team_id || null,
+        });
+        if (state.category === 'employee' && state.team_id) {
+          try {
+            await addTeamMember(
+              state.team_id,
+              targetName,
+              targetEmail,
+            );
+          } catch (e) {
+            console.warn('addTeamMember failed:', e);
+          }
         }
       }
       setItems(prev => prev.filter(x => x.name_key !== key));
@@ -662,7 +680,8 @@ function UnrecognizedPanel({ teams, onClassified }) {
           email: state.email2?.trim() || '',
           team_id: state.team_id2 || '',
         },
-        item.daily || []
+        item.daily || [],
+        state.apply_attendance !== false
       );
       setItems(prev => prev.filter(x => x.name_key !== key));
       onClassified && onClassified();
@@ -839,6 +858,14 @@ function UnrecognizedPanel({ teams, onClassified }) {
                                   <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
                                 ))}
                               </select>
+                              <label style={s.rowCheckbox}>
+                                <input
+                                  type="checkbox"
+                                  checked={state.apply_attendance !== false}
+                                  onChange={e => updateRow(key, 'apply_attendance', e.target.checked)}
+                                />
+                                Copy attendance to both employees
+                              </label>
                             </div>
                           </td>
                           <td
@@ -857,17 +884,38 @@ function UnrecognizedPanel({ teams, onClassified }) {
                       ) : (
                         <>
                           <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
-                            <select
-                              value={state.category || 'visitor'}
-                              onChange={e => updateRow(key, 'category', e.target.value)}
-                              style={{ ...s.teamSelect, fontSize: 12, minWidth: 120 }}
-                            >
-                              <option value="employee">Employee</option>
-                              <option value="visitor">Visitor</option>
-                              <option value="vendor">Vendor</option>
-                              <option value="interview">Interview</option>
-                              <option value="other">Other</option>
-                            </select>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                              <select
+                                value={state.category || 'visitor'}
+                                onChange={e => updateRow(key, 'category', e.target.value)}
+                                style={{ ...s.teamSelect, fontSize: 12, minWidth: 120 }}
+                              >
+                                <option value="employee">Employee</option>
+                                <option value="visitor">Visitor</option>
+                                <option value="vendor">Vendor</option>
+                                <option value="interview">Interview</option>
+                                <option value="other">Other</option>
+                              </select>
+                              {state.category === 'employee' && (
+                                <>
+                                  <input
+                                    type="text"
+                                    placeholder="Assign to employee name"
+                                    value={state.name || ''}
+                                    onChange={e => updateRow(key, 'name', e.target.value)}
+                                    style={{ ...s.teamSelect, fontSize: 11, padding: '5px 8px', minWidth: 150 }}
+                                  />
+                                  <label style={s.rowCheckbox}>
+                                    <input
+                                      type="checkbox"
+                                      checked={state.assign_attendance !== false}
+                                      onChange={e => updateRow(key, 'assign_attendance', e.target.checked)}
+                                    />
+                                    Copy this participant's attendance
+                                  </label>
+                                </>
+                              )}
+                            </div>
                           </td>
                           <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
                             <select
@@ -1342,6 +1390,7 @@ const s = {
   td: { padding: '10px 14px', fontSize: 13, color: '#1e293b', borderBottom: '1px solid #f1f5f9' },
   badge: { padding: '3px 10px', borderRadius: 12, fontSize: 10, fontWeight: 700, textTransform: 'capitalize', display: 'inline-block' },
   teamSelect: { padding: '5px 8px', border: '1px solid #e5e7eb', borderRadius: 6, fontSize: 11, background: '#fff', cursor: 'pointer' },
+  rowCheckbox: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#475569' },
   detailCell: { padding: 0, background: '#f8fafc', borderBottom: '1px solid #e5e7eb' },
 
   // Modal

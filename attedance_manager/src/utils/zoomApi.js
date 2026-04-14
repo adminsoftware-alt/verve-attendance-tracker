@@ -321,12 +321,22 @@ export async function fetchUnrecognizedMonthly(year, month) {
   return apiFetch(`/employees/unrecognized-monthly?year=${year}&month=${month}`);
 }
 
-export async function splitSharedAttendance(sharedName, employee1, employee2, daily) {
+export async function splitSharedAttendance(sharedName, employee1, employee2, daily, applyAttendance = true) {
   return apiPost('/employees/split-shared-attendance', {
     shared_name: sharedName,
     employee1,
     employee2,
     daily,
+    apply_attendance: applyAttendance,
+  });
+}
+
+export async function assignUnrecognizedAttendance(sourceName, employee, daily, markSource = true) {
+  return apiPost('/employees/assign-attendance', {
+    source_name: sourceName,
+    employee,
+    daily,
+    mark_source: markSource,
   });
 }
 
