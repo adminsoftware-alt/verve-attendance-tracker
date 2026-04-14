@@ -764,14 +764,13 @@ function UnrecognizedPanel({ teams, onClassified }) {
     }).catch(() => {});
   }, []);
 
-  // Helper: check if name contains "&" (shared session between 2 people)
+  // Helper: check if name contains "&" (shared session between 2+ people)
   const isSharedName = (name) => name && name.includes('&');
 
-  // Helper: split "Name1 & Name2" into two trimmed names
+  // Helper: split "A & B & C" into N trimmed names (min length 2)
   const splitNames = (name) => {
-    if (!name || !name.includes('&')) return [name, ''];
-    const parts = name.split('&').map(s => s.trim());
-    return [parts[0] || '', parts[1] || ''];
+    if (!name || !name.includes('&')) return [name];
+    return name.split('&').map(s => s.trim()).filter(Boolean);
   };
 
   const load = useCallback(async () => {
@@ -786,16 +785,13 @@ function UnrecognizedPanel({ teams, onClassified }) {
       list.forEach(u => {
         const name = u.display_name || u.participant_name;
         if (isSharedName(name)) {
-          // For shared names, initialize split state
-          const [n1, n2] = splitNames(name);
+          // N-way shared session. Seed one split entry per "&"-delimited name.
+          const parts = splitNames(name);
+          // Ensure at least 2 split slots (some "A & " strings parse to 1 part).
+          while (parts.length < 2) parts.push('');
           initial[u.name_key] = {
             isShared: true,
-            name1: n1,
-            name2: n2,
-            email1: '',
-            email2: '',
-            team_id1: '',
-            team_id2: '',
+            splits: parts.map(n => ({ name: n, email: '', team_id: '' })),
             apply_attendance: true,
           };
         } else {
@@ -823,6 +819,31 @@ function UnrecognizedPanel({ teams, onClassified }) {
       ...prev,
       [key]: { ...prev[key], [field]: value },
     }));
+  };
+
+  // Split-UI helpers (N-person shared sessions)
+  const updateSplit = (key, idx, field, value) => {
+    setRowState(prev => {
+      const cur = prev[key] || {};
+      const splits = [...(cur.splits || [])];
+      splits[idx] = { ...(splits[idx] || {}), [field]: value };
+      return { ...prev, [key]: { ...cur, splits } };
+    });
+  };
+  const addSplit = (key) => {
+    setRowState(prev => {
+      const cur = prev[key] || {};
+      const splits = [...(cur.splits || []), { name: '', email: '', team_id: '' }];
+      return { ...prev, [key]: { ...cur, splits } };
+    });
+  };
+  const removeSplit = (key, idx) => {
+    setRowState(prev => {
+      const cur = prev[key] || {};
+      const splits = [...(cur.splits || [])];
+      splits.splice(idx, 1);
+      return { ...prev, [key]: { ...cur, splits } };
+    });
   };
 
   const saveRow = async (item) => {
@@ -876,13 +897,21 @@ function UnrecognizedPanel({ teams, onClassified }) {
     setSavingRow(null);
   };
 
-  // Save split attendance for shared sessions (e.g., "Shashank & Satyam")
+  // Save split attendance for shared sessions of N people
+  // (e.g., "A & B" or "A & B & C"). All selected employees get the same
+  // daily attendance overrides.
   const saveSplitRow = async (item) => {
     const key = item.name_key;
     const state = rowState[key];
     if (!state) return;
-    if (!state.name1?.trim() || !state.name2?.trim()) {
-      setErr('Both employee names are required for splitting.');
+    const splits = (state.splits || []).map(s => ({
+      name: (s.name || '').trim(),
+      email: (s.email || '').trim(),
+      team_id: s.team_id || '',
+    })).filter(s => s.name);
+
+    if (splits.length < 2) {
+      setErr('Enter at least 2 employee names for a shared session split.');
       return;
     }
     setSavingRow(key);
@@ -890,18 +919,9 @@ function UnrecognizedPanel({ teams, onClassified }) {
     try {
       await splitSharedAttendance(
         item.participant_name,
-        {
-          name: state.name1.trim(),
-          email: state.email1?.trim() || '',
-          team_id: state.team_id1 || '',
-        },
-        {
-          name: state.name2.trim(),
-          email: state.email2?.trim() || '',
-          team_id: state.team_id2 || '',
-        },
-        item.daily || [],
-        state.apply_attendance !== false
+        splits,                               // N employees
+        item.daily || [],                      // daily rows to copy
+        state.apply_attendance !== false,      // apply attendance?
       );
       setItems(prev => prev.filter(x => x.name_key !== key));
       onClassified && onClassified();
@@ -1107,7 +1127,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
                 <th style={s.th}>Isolation</th>
                 <th style={s.th}>Classify As</th>
                 <th style={s.th}>Team</th>
-                <th style={s.stickyActionTh}>Save</th>
+                <th style={s.th}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -1170,90 +1190,96 @@ function UnrecognizedPanel({ teams, onClassified }) {
                       <td style={{ ...s.td, color: (p.total_isolation_mins || 0) > 120 ? '#ef4444' : '#64748b' }}>
                         {fmtMins(p.total_isolation_mins)}
                       </td>
-                      {/* For shared names: show split UI; for regular: show classify UI */}
+                      {/* Shared sessions: N-person split UI (one block per "&"-delimited name).
+                          Users can add/remove people so any N ≥ 2 is supported. */}
                       {isShared ? (
                         <>
-                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                          <td style={s.td} onClick={(ev) => ev.stopPropagation()} colSpan={2}>
                             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                                <input
-                                  type="text"
-                                  placeholder="Employee 1 (pick or type new)"
-                                  value={state.name1 || ''}
-                                  list="employee-names-datalist"
-                                  onChange={e => updateRow(key, 'name1', e.target.value)}
-                                  style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', width: 140 }}
-                                />
-                                <input
-                                  type="email"
-                                  placeholder="Email 1 (optional)"
-                                  value={state.email1 || ''}
-                                  onChange={e => updateRow(key, 'email1', e.target.value)}
-                                  style={{ ...s.teamSelect, fontSize: 10, padding: '3px 6px', width: 140, color: '#64748b' }}
-                                />
+                              {(state.splits || []).map((sp, idx) => (
+                                <div key={idx} style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                                    <input
+                                      type="text"
+                                      placeholder={`Employee ${idx + 1} (pick or type new)`}
+                                      value={sp.name || ''}
+                                      list="employee-names-datalist"
+                                      onChange={e => updateSplit(key, idx, 'name', e.target.value)}
+                                      style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', width: 140 }}
+                                    />
+                                    <input
+                                      type="email"
+                                      placeholder={`Email ${idx + 1} (optional)`}
+                                      value={sp.email || ''}
+                                      onChange={e => updateSplit(key, idx, 'email', e.target.value)}
+                                      style={{ ...s.teamSelect, fontSize: 10, padding: '3px 6px', width: 140, color: '#64748b' }}
+                                    />
+                                  </div>
+                                  <select
+                                    value={sp.team_id || ''}
+                                    onChange={e => updateSplit(key, idx, 'team_id', e.target.value)}
+                                    style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', minWidth: 110 }}
+                                  >
+                                    <option value="">— Team {idx + 1} —</option>
+                                    {teams.map(t => (
+                                      <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
+                                    ))}
+                                  </select>
+                                  {state.splits.length > 2 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => removeSplit(key, idx)}
+                                      title="Remove this employee"
+                                      style={{ ...s.deleteBtn, padding: '4px 8px', fontSize: 11 }}
+                                    >
+                                      ×
+                                    </button>
+                                  )}
+                                </div>
+                              ))}
+                              <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 4 }}>
+                                <button
+                                  type="button"
+                                  onClick={() => addSplit(key)}
+                                  style={{
+                                    padding: '4px 10px', fontSize: 11, fontWeight: 600,
+                                    border: '1px dashed #cbd5e1', background: '#f8fafc',
+                                    color: '#475569', borderRadius: 6, cursor: 'pointer',
+                                  }}
+                                >
+                                  + Add employee
+                                </button>
+                                <label style={s.rowCheckbox}>
+                                  <input
+                                    type="checkbox"
+                                    checked={state.apply_attendance !== false}
+                                    onChange={e => updateRow(key, 'apply_attendance', e.target.checked)}
+                                  />
+                                  Copy attendance to all
+                                </label>
                               </div>
-                              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                                <input
-                                  type="text"
-                                  placeholder="Employee 2 (pick or type new)"
-                                  value={state.name2 || ''}
-                                  list="employee-names-datalist"
-                                  onChange={e => updateRow(key, 'name2', e.target.value)}
-                                  style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', width: 140 }}
-                                />
-                                <input
-                                  type="email"
-                                  placeholder="Email 2 (optional)"
-                                  value={state.email2 || ''}
-                                  onChange={e => updateRow(key, 'email2', e.target.value)}
-                                  style={{ ...s.teamSelect, fontSize: 10, padding: '3px 6px', width: 140, color: '#64748b' }}
-                                />
-                              </div>
-                            </div>
-                          </td>
-                          <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                              <select
-                                value={state.team_id1 || ''}
-                                onChange={e => updateRow(key, 'team_id1', e.target.value)}
-                                style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px' }}
-                              >
-                                <option value="">— Team 1 —</option>
-                                {teams.map(t => (
-                                  <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
-                                ))}
-                              </select>
-                              <select
-                                value={state.team_id2 || ''}
-                                onChange={e => updateRow(key, 'team_id2', e.target.value)}
-                                style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px' }}
-                              >
-                                <option value="">— Team 2 —</option>
-                                {teams.map(t => (
-                                  <option key={t.team_id} value={t.team_id}>{t.team_name}</option>
-                                ))}
-                              </select>
-                              <label style={s.rowCheckbox}>
-                                <input
-                                  type="checkbox"
-                                  checked={state.apply_attendance !== false}
-                                  onChange={e => updateRow(key, 'apply_attendance', e.target.checked)}
-                                />
-                                Copy attendance to both
-                              </label>
                             </div>
                           </td>
                           <td
-                            style={{ ...s.stickyActionTd, ...(isOpen ? { background: '#eff6ff' } : {}), ...(isShared ? { background: '#fef3c7' } : {}) }}
+                            style={{ ...s.td, ...(isOpen ? { background: '#eff6ff' } : {}), ...(isShared ? { background: '#fef3c7' } : {}) }}
                             onClick={(ev) => ev.stopPropagation()}
                           >
-                            <button
-                              onClick={() => saveSplitRow(p)}
-                              disabled={savingRow === key}
-                              style={{ ...s.saveRowBtn, background: '#f59e0b', minWidth: 90 }}
-                            >
-                              {savingRow === key ? 'Splitting...' : 'Split & Assign'}
-                            </button>
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <button
+                                onClick={() => saveSplitRow(p)}
+                                disabled={savingRow === key}
+                                style={{ ...s.saveRowBtn, background: '#f59e0b', minWidth: 70 }}
+                              >
+                                {savingRow === key ? '...' : 'Split'}
+                              </button>
+                              <button
+                                onClick={() => setItems(prev => prev.filter(x => x.name_key !== key))}
+                                style={s.deleteBtn}
+                                title="Dismiss from list"
+                              >
+                                ×
+                              </button>
+                            </div>
                           </td>
                         </>
                       ) : (
@@ -1305,16 +1331,25 @@ function UnrecognizedPanel({ teams, onClassified }) {
                             </select>
                           </td>
                           <td
-                            style={{ ...s.stickyActionTd, ...(isOpen ? { background: '#eff6ff' } : {}), ...(i % 2 === 0 ? { background: isOpen ? '#eff6ff' : '#fafbfc' } : {}) }}
+                            style={{ ...s.td, ...(isOpen ? { background: '#eff6ff' } : {}), ...(i % 2 === 0 ? { background: isOpen ? '#eff6ff' : '#fafbfc' } : {}) }}
                             onClick={(ev) => ev.stopPropagation()}
                           >
-                            <button
-                              onClick={() => saveRow(p)}
-                              disabled={savingRow === key}
-                              style={s.saveRowBtn}
-                            >
-                              {savingRow === key ? 'Saving...' : 'Save'}
-                            </button>
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <button
+                                onClick={() => saveRow(p)}
+                                disabled={savingRow === key}
+                                style={s.saveRowBtn}
+                              >
+                                {savingRow === key ? '...' : 'Save'}
+                              </button>
+                              <button
+                                onClick={() => setItems(prev => prev.filter(x => x.name_key !== key))}
+                                style={s.deleteBtn}
+                                title="Dismiss from list"
+                              >
+                                ×
+                              </button>
+                            </div>
                           </td>
                         </>
                       )}
@@ -1736,6 +1771,11 @@ const s = {
     padding: '6px 14px', background: '#10b981', color: '#fff',
     border: 'none', borderRadius: 6, fontSize: 11, fontWeight: 700,
     cursor: 'pointer',
+  },
+  deleteBtn: {
+    padding: '6px 10px', background: '#fee2e2', color: '#dc2626',
+    border: '1px solid #fecaca', borderRadius: 6, fontSize: 14, fontWeight: 700,
+    cursor: 'pointer', lineHeight: 1,
   },
 
   // Sticky-right "Save" column so it stays visible even when the

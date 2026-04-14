@@ -329,14 +329,25 @@ export async function fetchUnrecognizedMonthly(year, month) {
   return apiFetch(`/employees/unrecognized-monthly?year=${year}&month=${month}`);
 }
 
-export async function splitSharedAttendance(sharedName, employee1, employee2, daily, applyAttendance = true) {
-  return apiPost('/employees/split-shared-attendance', {
-    shared_name: sharedName,
-    employee1,
-    employee2,
-    daily,
-    apply_attendance: applyAttendance,
-  });
+// Split a shared session ("A & B & C") to N employees. Accepts either the
+// new form (array of employee objects) or legacy (employee1, employee2).
+export async function splitSharedAttendance(sharedName, employeesOrFirst, secondOrDaily, dailyOrApply, applyAttendance = true) {
+  // Legacy signature: (sharedName, employee1, employee2, daily, applyAttendance?)
+  const isLegacy = !Array.isArray(employeesOrFirst);
+  const body = isLegacy
+    ? {
+        shared_name: sharedName,
+        employees: [employeesOrFirst, secondOrDaily].filter(Boolean),
+        daily: dailyOrApply,
+        apply_attendance: applyAttendance,
+      }
+    : {
+        shared_name: sharedName,
+        employees: employeesOrFirst,
+        daily: secondOrDaily,
+        apply_attendance: dailyOrApply !== undefined ? dailyOrApply : true,
+      };
+  return apiPost('/employees/split-shared-attendance', body);
 }
 
 export async function assignUnrecognizedAttendance(sourceName, employee, daily, markSource = true) {

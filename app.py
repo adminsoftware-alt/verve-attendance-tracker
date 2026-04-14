@@ -10236,45 +10236,60 @@ def assign_unrecognized_attendance():
 @app.route('/employees/split-shared-attendance', methods=['POST'])
 def split_shared_attendance():
     """
-    Split attendance from a shared session (e.g., "Shashank & Satyam") to two employees.
-    Both employees get the same attendance data for the dates in the shared session.
+    Split attendance from a shared session (e.g., "Shashank & Satyam & Ram")
+    into N employees. All employees get the same attendance data for the
+    dates in the shared session.
 
-    Request body:
+    Request body (new form — N employees):
     {
-        "shared_name": "Shashank & Satyam",
-        "employee1": { "name": "Shashank", "email": "...", "team_id": "..." },
-        "employee2": { "name": "Satyam", "email": "...", "team_id": "..." },
-        "daily": [ { "date": "2026-04-01", "first_seen_ist": "09:30", "last_seen_ist": "18:00",
-                     "active_minutes": 330, "break_minutes": 15, "isolation_minutes": 5, "status": "Present" }, ... ]
+        "shared_name": "Shashank & Satyam & Ram",
+        "employees": [
+            { "name": "Shashank", "email": "...", "team_id": "..." },
+            { "name": "Satyam",   "email": "...", "team_id": "..." },
+            { "name": "Ram",      "email": "...", "team_id": "..." }
+        ],
+        "daily": [ { "date": "2026-04-01", "first_seen_ist": "09:30", ... }, ... ],
+        "apply_attendance": true
     }
+
+    Also accepts the legacy 2-person form (employee1 / employee2).
     """
     try:
         ensure_team_tables_once()
         data = request.get_json() or {}
-        shared_name = data.get('shared_name', '').strip()
-        emp1 = data.get('employee1', {})
-        emp2 = data.get('employee2', {})
+        shared_name = (data.get('shared_name') or '').strip()
         daily = data.get('daily', [])
         apply_attendance = bool(data.get('apply_attendance', True))
 
+        # Accept both the new `employees` array and the old employee1/employee2 pair.
+        employees_payload = data.get('employees')
+        if not employees_payload:
+            emp1 = data.get('employee1')
+            emp2 = data.get('employee2')
+            employees_payload = [e for e in (emp1, emp2) if e]
+
         if not shared_name:
             return jsonify({'success': False, 'error': 'shared_name is required'}), 400
-        if not emp1.get('name') or not emp2.get('name'):
-            return jsonify({'success': False, 'error': 'Both employee names are required'}), 400
+        if not isinstance(employees_payload, list) or len(employees_payload) < 2:
+            return jsonify({'success': False, 'error': 'At least two employees are required'}), 400
         if apply_attendance and not daily:
             return jsonify({'success': False, 'error': 'No daily attendance data provided'}), 400
+        # All employees must have a name
+        missing = [i for i, e in enumerate(employees_payload) if not (e or {}).get('name', '').strip()]
+        if missing:
+            return jsonify({'success': False, 'error': f'All employees must have a name (missing for index {missing})'}), 400
 
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
         employees_created = []
         overrides_created = 0
+        assigned_names = []
 
-        for emp in [emp1, emp2]:
-            emp_name = emp.get('name', '').strip()
-            emp_email = emp.get('email', '').strip()
-            team_id = emp.get('team_id', '').strip()
-
+        for emp in employees_payload:
+            emp_name = (emp.get('name') or '').strip()
+            emp_email = (emp.get('email') or '').strip()
+            team_id = (emp.get('team_id') or '').strip()
             if not emp_name:
                 continue
 
@@ -10288,6 +10303,7 @@ def split_shared_attendance():
             )
             if created:
                 employees_created.append(normalized_name)
+            assigned_names.append(normalized_name)
 
             if apply_attendance:
                 overrides_created += apply_daily_attendance_overrides(
@@ -10303,15 +10319,16 @@ def split_shared_attendance():
             client,
             dataset_ref,
             shared_name,
-            f'Split into: {emp1.get("name")}, {emp2.get("name")}',
+            f'Split into: {", ".join(assigned_names)}',
         )
 
         return jsonify({
             'success': True,
             'employees_created': employees_created,
             'overrides_created': overrides_created,
+            'assigned_to': assigned_names,
             'message': (
-                f'Shared participant split to {emp1.get("name")} and {emp2.get("name")}'
+                f'Shared participant split to {len(assigned_names)} employees: {", ".join(assigned_names)}'
                 + (f' with attendance copied for {len(daily)} days' if apply_attendance else ' without copying attendance')
             )
         })
