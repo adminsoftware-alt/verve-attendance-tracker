@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
 import { timeToMin, minToTime, formatDuration, todayIST } from '../utils/parser';
 import { exportDayViewCsv } from '../utils/exportCsv';
+import { useDayData } from '../hooks/useData';
 import RoomTable from './RoomTable';
 
 export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
@@ -24,7 +25,11 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
     }
   }, [uploadedDates, today]);
 
-  const employees = allData[date] || [];
+  // Load data on-demand for selected date (lazy loading)
+  const { employees: dayEmployees, loading: dayLoading } = useDayData(date, 0);
+
+  // Use live data from allData if available, otherwise use lazy-loaded data
+  const employees = allData[date] || dayEmployees || [];
 
   const changeDate = (dir) => {
     const idx = uploadedDates.indexOf(date);
@@ -65,6 +70,31 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
         <h3 style={s.emptyTitle}>No attendance data yet</h3>
         <p style={s.emptyDesc}>Upload a CSV or XLSX attendance report to get started.</p>
         <button onClick={onNavigateUpload} style={s.primaryBtn}>Go to Upload</button>
+      </div>
+    );
+  }
+
+  // Show loading state while fetching data
+  if (dayLoading && !allData[date]) {
+    return (
+      <div>
+        <div style={s.dateNav}>
+          <button onClick={() => changeDate(-1)} style={s.arrowBtn}
+            disabled={uploadedDates.indexOf(date) <= 0}>{'\u2190'}</button>
+          <div style={s.dateCenter}>
+            <input type="date" value={date}
+              onChange={(e) => { setDate(e.target.value); setExpanded(null); }}
+              style={s.dateInput} />
+            <div style={s.dateLabel}>
+              {new Date(date + 'T00:00').toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+            </div>
+          </div>
+          <button onClick={() => changeDate(1)} style={s.arrowBtn}
+            disabled={uploadedDates.indexOf(date) >= uploadedDates.length - 1}>{'\u2192'}</button>
+        </div>
+        <div style={s.emptyState}>
+          <p style={{ fontSize: 14 }}>Loading data for <strong>{date}</strong>...</p>
+        </div>
       </div>
     );
   }
