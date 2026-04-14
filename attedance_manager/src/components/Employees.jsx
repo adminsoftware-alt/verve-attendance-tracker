@@ -13,6 +13,7 @@ import {
   splitSharedAttendance,
   assignUnrecognizedAttendance,
 } from '../utils/zoomApi';
+import { exportRowsCsv } from '../utils/exportCsv';
 
 function istDate() {
   const now = new Date();
@@ -58,6 +59,18 @@ function fmtMins(m) {
 function fmtHours(m) {
   if (!m) return '0.0h';
   return `${(m / 60).toFixed(1)}h`;
+}
+
+function attendanceStatusStyle(status) {
+  switch ((status || '').toLowerCase()) {
+    case 'present': return { background: '#dcfce7', color: '#15803d' };
+    case 'half day':
+    case 'half_day': return { background: '#fef3c7', color: '#92400e' };
+    case 'leave': return { background: '#dbeafe', color: '#1d4ed8' };
+    case 'manual override': return { background: '#ede9fe', color: '#6d28d9' };
+    case 'absent':
+    default: return { background: '#fee2e2', color: '#b91c1c' };
+  }
 }
 
 export default function Employees({ user }) {
@@ -345,6 +358,30 @@ export default function Employees({ user }) {
             style={s.input}
           />
         </div>
+        <div style={s.controlGroup}>
+          <label style={s.label}>&nbsp;</label>
+          <button
+            onClick={() => {
+              if (!rows.length) return;
+              const headers = ['Name', 'Email', 'Category', 'Team', 'Days Present', 'Total Active (min)', 'Break (min)', 'Isolation (min)'];
+              const csvRows = rows.map(e => [
+                e.participant_name || e.display_name || '',
+                e.participant_email || '',
+                e.category || 'employee',
+                teams.find(t => t.team_id === e.team_id)?.team_name || '',
+                e.days_present || 0,
+                e.total_active_mins || 0,
+                e.total_break_mins || 0,
+                e.total_isolation_mins || 0,
+              ]);
+              exportRowsCsv(`employees_${selectedTeamName.replace(/\s+/g,'_')}_${year}-${String(month).padStart(2,'0')}.csv`, headers, csvRows);
+            }}
+            style={s.refreshBtn}
+            disabled={!rows.length}
+          >
+            Export CSV
+          </button>
+        </div>
       </div>
 
       {/* Category chips */}
@@ -405,7 +442,6 @@ export default function Employees({ user }) {
               {rows.map((e) => {
                 const isOpen = expandedId === e.employee_id;
                 const avgMins = e.days_present > 0 ? Math.round(e.total_active_mins / e.days_present) : 0;
-                const detail = detailCache[e.employee_id];
                 return (
                   <Fragment key={e.employee_id}>
                     <tr
@@ -449,17 +485,6 @@ export default function Employees({ user }) {
                         </select>
                       </td>
                     </tr>
-                    {isOpen && (
-                      <tr>
-                        <td colSpan={9} style={s.detailCell}>
-                          {!detail ? (
-                            <div style={{ color: '#94a3b8', fontSize: 12, padding: 12 }}>Loading daily breakdown...</div>
-                          ) : (
-                            <DailyBreakdown detail={detail} />
-                          )}
-                        </td>
-                      </tr>
-                    )}
                   </Fragment>
                 );
               })}
@@ -484,6 +509,179 @@ export default function Employees({ user }) {
           onSave={handleAdd}
         />
       )}
+
+      {expandedId && (
+        <EmployeeDetailDrawer
+          employee={rows.find(r => r.employee_id === expandedId) || registryEmployees.find(r => r.employee_id === expandedId)}
+          detail={detailCache[expandedId]}
+          year={year}
+          month={month}
+          onClose={() => setExpandedId(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Employee detail drawer (row click) ──────────────────
+// Right-side overlay showing one employee's monthly activity:
+//   - summary stat cards
+//   - color-coded monthly calendar
+//   - full daily breakdown table
+function EmployeeDetailDrawer({ employee, detail, year, month, onClose }) {
+  if (!employee) return null;
+
+  // Handle ESC to close
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const daily = detail?.daily || [];
+  const byDate = {};
+  daily.forEach(d => { if (d?.date) byDate[d.date] = d; });
+
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const firstDow = new Date(year, month - 1, 1).getDay();
+  const cells = [];
+  for (let i = 0; i < firstDow; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+  const totals = daily.reduce((acc, d) => {
+    acc.active += d.active_minutes || 0;
+    acc.break += d.break_minutes || 0;
+    acc.iso += d.isolation_minutes || 0;
+    if ((d.active_minutes || 0) > 0) acc.days += 1;
+    return acc;
+  }, { active: 0, break: 0, iso: 0, days: 0 });
+  const avg = totals.days > 0 ? Math.round(totals.active / totals.days) : 0;
+
+  const statusColor = (day) => {
+    const row = byDate[`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`];
+    if (!row) return { bg: '#f8fafc', fg: '#94a3b8' };
+    const s = (row.status || '').toLowerCase();
+    if (s === 'present') return { bg: '#dcfce7', fg: '#15803d' };
+    if (s === 'half day' || s === 'half_day') return { bg: '#fef3c7', fg: '#92400e' };
+    if (s === 'leave') return { bg: '#dbeafe', fg: '#1d4ed8' };
+    return { bg: '#fee2e2', fg: '#b91c1c' };
+  };
+
+  const monthLabel = ['January','February','March','April','May','June','July','August','September','October','November','December'][month - 1];
+  const exportEmployee = () => {
+    if (!daily.length) return;
+    const headers = ['Date', 'First Seen', 'Last Seen', 'Active (min)', 'Break (min)', 'Isolation (min)', 'Status'];
+    const csvRows = daily.map(d => [
+      d.date, d.first_seen_ist || '', d.last_seen_ist || '',
+      d.active_minutes || 0, d.break_minutes || 0, d.isolation_minutes || 0, d.status || '',
+    ]);
+    exportRowsCsv(
+      `employee_${(employee.participant_name || 'employee').replace(/\s+/g, '_')}_${year}-${String(month).padStart(2,'0')}.csv`,
+      headers, csvRows
+    );
+  };
+
+  return (
+    <div style={s.drawerOverlay} onClick={onClose}>
+      <div style={s.drawer} onClick={e => e.stopPropagation()}>
+        <div style={s.drawerHeader}>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: '#0f172a' }}>
+              {employee.participant_name || employee.display_name}
+            </div>
+            <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
+              {employee.participant_email || '—'} · {monthLabel} {year}
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={exportEmployee} style={s.refreshBtn} disabled={!daily.length}>Export CSV</button>
+            <button onClick={onClose} style={s.modalClose}>×</button>
+          </div>
+        </div>
+
+        <div style={s.drawerBody}>
+          {!detail ? (
+            <div style={{ padding: 24, color: '#94a3b8' }}>Loading attendance…</div>
+          ) : (
+            <>
+              {/* Summary cards */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))', gap: 10, marginBottom: 16 }}>
+                <MiniStat label="Days Present" value={totals.days} color="#10b981" />
+                <MiniStat label="Total Hours" value={fmtHours(totals.active)} color="#3b82f6" />
+                <MiniStat label="Avg / Day" value={fmtMins(avg)} color="#6366f1" />
+                <MiniStat label="Break" value={fmtMins(totals.break)} color="#f97316" />
+                <MiniStat label="Isolation" value={fmtMins(totals.iso)} color="#ef4444" />
+              </div>
+
+              {/* Monthly calendar */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
+                {monthLabel} {year}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 4, marginBottom: 6 }}>
+                {['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d => (
+                  <div key={d} style={{ fontSize: 10, fontWeight: 600, color: '#94a3b8', textAlign: 'center', padding: '4px 0', textTransform: 'uppercase' }}>{d}</div>
+                ))}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 4, marginBottom: 16 }}>
+                {cells.map((day, i) => {
+                  if (day === null) return <div key={`e${i}`} style={{ aspectRatio: '1' }} />;
+                  const row = byDate[`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`];
+                  const { bg, fg } = statusColor(day);
+                  const hours = row ? ((row.active_minutes || 0) / 60).toFixed(1) : null;
+                  const title = row
+                    ? `${row.date}: ${row.status || '-'} · ${fmtMins(row.active_minutes)}${row.first_seen_ist ? ` (${row.first_seen_ist}–${row.last_seen_ist})` : ''}`
+                    : `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}: no data`;
+                  return (
+                    <div
+                      key={day}
+                      title={title}
+                      style={{
+                        aspectRatio: '1', background: bg, color: fg,
+                        borderRadius: 6, display: 'flex', flexDirection: 'column',
+                        alignItems: 'center', justifyContent: 'center',
+                        fontSize: 12, fontWeight: 600,
+                      }}
+                    >
+                      <div>{day}</div>
+                      {hours && row?.active_minutes > 0 && (
+                        <div style={{ fontSize: 9, fontWeight: 500, opacity: 0.85 }}>{hours}h</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Legend */}
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 10, color: '#64748b', marginBottom: 12 }}>
+                {[
+                  { bg: '#dcfce7', label: 'Present' },
+                  { bg: '#fef3c7', label: 'Half Day' },
+                  { bg: '#fee2e2', label: 'Absent' },
+                  { bg: '#dbeafe', label: 'Leave' },
+                  { bg: '#f8fafc', label: 'No data' },
+                ].map(l => (
+                  <span key={l.label} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <span style={{ width: 12, height: 12, background: l.bg, borderRadius: 3, border: '1px solid #e2e8f0' }} />
+                    {l.label}
+                  </span>
+                ))}
+              </div>
+
+              {/* Daily table */}
+              <DailyBreakdown detail={detail} />
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MiniStat({ label, value, color }) {
+  return (
+    <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 10, padding: '10px 12px' }}>
+      <div style={{ fontSize: 9, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, marginBottom: 2 }}>{label}</div>
+      <div style={{ fontSize: 18, fontWeight: 800, color, lineHeight: 1.1 }}>{value}</div>
     </div>
   );
 }
@@ -520,7 +718,11 @@ function DailyBreakdown({ detail }) {
               <td style={{ ...detailTd, color: '#10b981', fontWeight: 600 }}>{fmtMins(d.active_minutes)}</td>
               <td style={{ ...detailTd, color: '#f97316' }}>{fmtMins(d.break_minutes)}</td>
               <td style={{ ...detailTd, color: '#64748b' }}>{fmtMins(d.isolation_minutes)}</td>
-              <td style={detailTd}>{d.status || '-'}</td>
+              <td style={detailTd}>
+                <span style={{ ...s.badge, ...attendanceStatusStyle(d.status || '-') }}>
+                  {d.status || '-'}
+                </span>
+              </td>
             </tr>
           ))}
         </tbody>
@@ -543,6 +745,11 @@ function UnrecognizedPanel({ teams, onClassified }) {
   // per-row classification form state, keyed by name_key
   const [rowState, setRowState] = useState({});
   const [savingRow, setSavingRow] = useState(null);
+  // Bulk classify
+  const [selected, setSelected] = useState(() => new Set());
+  const [bulkCategory, setBulkCategory] = useState('visitor');
+  const [bulkTeam, setBulkTeam] = useState('');
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   // Helper: check if name contains "&" (shared session between 2 people)
   const isSharedName = (name) => name && name.includes('&');
@@ -691,6 +898,76 @@ function UnrecognizedPanel({ teams, onClassified }) {
     setSavingRow(null);
   };
 
+  // Bulk classify selected rows with the chosen category/team. Shared-name
+  // rows are skipped (they need the split flow, not a single category).
+  const bulkApply = async () => {
+    const keys = Array.from(selected);
+    if (keys.length === 0) return;
+    if (bulkCategory === 'employee' && !bulkTeam) {
+      setErr('Pick a team before bulk-classifying as employee.');
+      return;
+    }
+    setBulkBusy(true);
+    setErr(null);
+    const successful = [];
+    for (const key of keys) {
+      const item = items.find(x => x.name_key === key);
+      if (!item) continue;
+      const st = rowState[key] || {};
+      if (st.isShared) continue;  // shared names skip bulk
+      try {
+        const targetName = (st.name || item.display_name || item.participant_name || '').trim();
+        const targetEmail = (st.email || item.participant_email || '').trim();
+        await createEmployee({
+          participant_name: targetName,
+          participant_email: targetEmail,
+          category: bulkCategory,
+          team_id: bulkTeam || null,
+        });
+        if (bulkCategory === 'employee' && bulkTeam) {
+          try { await addTeamMember(bulkTeam, targetName, targetEmail); }
+          catch (e) { console.warn('bulk addTeamMember failed:', e); }
+        }
+        successful.push(key);
+      } catch (e) {
+        console.warn(`bulk classify failed for ${key}:`, e);
+      }
+    }
+    setItems(prev => prev.filter(x => !successful.includes(x.name_key)));
+    setSelected(new Set());
+    setBulkBusy(false);
+    onClassified && onClassified();
+  };
+
+  const toggleAll = () => {
+    const selectable = items.filter(p => !rowState[p.name_key]?.isShared).map(p => p.name_key);
+    if (selected.size === selectable.length) setSelected(new Set());
+    else setSelected(new Set(selectable));
+  };
+
+  const toggleOne = (key) => {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+
+  // CSV export of the currently loaded unrecognized rows
+  const exportCsv = () => {
+    if (!items.length) return;
+    const headers = ['Name', 'Email', 'Days Present', 'Total Active (min)', 'Break (min)', 'Isolation (min)'];
+    const rows = items.map(p => [
+      p.display_name || p.participant_name || '',
+      p.participant_email || '',
+      p.days_present || 0,
+      p.total_active_mins || 0,
+      p.total_break_mins || 0,
+      p.total_isolation_mins || 0,
+    ]);
+    exportRowsCsv(`unrecognized_${year}-${String(month).padStart(2,'0')}.csv`, headers, rows);
+  };
+
   // Monthly aggregates shown in the header stat cards
   const totals = useMemo(() => {
     const count = items.length;
@@ -724,6 +1001,10 @@ function UnrecognizedPanel({ teams, onClassified }) {
             {loading ? 'Loading...' : 'Refresh'}
           </button>
         </div>
+        <div style={s.controlGroup}>
+          <label style={s.label}>&nbsp;</label>
+          <button onClick={exportCsv} style={s.refreshBtn} disabled={!items.length}>Export CSV</button>
+        </div>
         <div style={{ flex: 1, minWidth: 220, alignSelf: 'flex-end', fontSize: 12, color: '#64748b' }}>
           {loading
             ? ''
@@ -734,6 +1015,41 @@ function UnrecognizedPanel({ teams, onClassified }) {
       </div>
 
       {err && <div style={s.error}>{err}</div>}
+
+      {/* Bulk classify bar — appears when rows are selected */}
+      {selected.size > 0 && (
+        <div style={s.bulkBar}>
+          <strong style={{ fontSize: 13 }}>{selected.size} selected</strong>
+          <span style={{ fontSize: 11, color: '#94a3b8' }}>→ classify as</span>
+          <select
+            value={bulkCategory}
+            onChange={e => setBulkCategory(e.target.value)}
+            style={s.bulkSelect}
+          >
+            <option value="visitor">Visitor</option>
+            <option value="vendor">Vendor</option>
+            <option value="interview">Interview</option>
+            <option value="other">Other (ignore)</option>
+            <option value="employee">Employee</option>
+          </select>
+          {bulkCategory === 'employee' && (
+            <select
+              value={bulkTeam}
+              onChange={e => setBulkTeam(e.target.value)}
+              style={s.bulkSelect}
+            >
+              <option value="">— Pick team —</option>
+              {teams.map(t => <option key={t.team_id} value={t.team_id}>{t.team_name}</option>)}
+            </select>
+          )}
+          <button onClick={bulkApply} disabled={bulkBusy} style={s.bulkApply}>
+            {bulkBusy ? 'Applying…' : 'Apply to selected'}
+          </button>
+          <button onClick={() => setSelected(new Set())} style={{ ...s.bulkSelect, cursor: 'pointer' }}>
+            Clear
+          </button>
+        </div>
+      )}
 
       {!loading && items.length > 0 && (
         <div style={s.statsRow}>
@@ -751,6 +1067,17 @@ function UnrecognizedPanel({ teams, onClassified }) {
           <table style={s.table}>
             <thead>
               <tr>
+                <th style={s.th}>
+                  <input
+                    type="checkbox"
+                    checked={
+                      items.filter(p => !rowState[p.name_key]?.isShared).length > 0 &&
+                      selected.size === items.filter(p => !rowState[p.name_key]?.isShared).length
+                    }
+                    onChange={toggleAll}
+                    title="Select all (non-shared)"
+                  />
+                </th>
                 <th style={s.th}></th>
                 <th style={s.th}>Name</th>
                 <th style={s.th}>Category</th>
@@ -782,6 +1109,15 @@ function UnrecognizedPanel({ teams, onClassified }) {
                         ...(isShared ? { background: '#fef3c7' } : {}),
                       }}
                     >
+                      <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          checked={selected.has(key)}
+                          onChange={() => toggleOne(key)}
+                          disabled={isShared}
+                          title={isShared ? 'Shared sessions need the Split flow' : 'Select for bulk classify'}
+                        />
+                      </td>
                       <td style={s.td}>
                         <span style={{ color: '#64748b', fontSize: 11 }}>{isOpen ? '▼' : '▶'}</span>
                       </td>
@@ -946,7 +1282,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
                     </tr>
                     {isOpen && (
                       <tr>
-                        <td colSpan={11} style={s.detailCell}>
+                        <td colSpan={12} style={s.detailCell}>
                           <DailyBreakdown detail={{ daily: p.daily || [] }} />
                         </td>
                       </tr>
@@ -1068,6 +1404,30 @@ function ClassifiedPanel({ teams }) {
           <label style={s.label}>&nbsp;</label>
           <button onClick={load} style={s.refreshBtn} disabled={loading}>
             {loading ? 'Loading...' : 'Refresh'}
+          </button>
+        </div>
+        <div style={s.controlGroup}>
+          <label style={s.label}>&nbsp;</label>
+          <button
+            onClick={() => {
+              if (!rows.length) return;
+              const headers = ['Name', 'Email', 'Category', 'Team', 'Days Present', 'Total Active (min)', 'Break (min)', 'Isolation (min)'];
+              const csvRows = rows.map(p => [
+                p.display_name || p.participant_name || '',
+                p.participant_email || '',
+                p.category || '',
+                teamNameById[p.team_id] || '',
+                p.days_present || 0,
+                p.total_active_mins || 0,
+                p.total_break_mins || 0,
+                p.total_isolation_mins || 0,
+              ]);
+              exportRowsCsv(`classified_${year}-${String(month).padStart(2,'0')}.csv`, headers, csvRows);
+            }}
+            style={s.refreshBtn}
+            disabled={!rows.length}
+          >
+            Export CSV
           </button>
         </div>
       </div>
@@ -1416,4 +1776,30 @@ const s = {
   formHint: { fontSize: 11, color: '#94a3b8', marginTop: 2 },
   btnPrimary: { padding: '8px 18px', background: '#0f172a', color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: 'pointer' },
   btnSecondary: { padding: '8px 18px', background: '#f1f5f9', color: '#475569', border: '1px solid #e5e7eb', borderRadius: 8, fontSize: 13, fontWeight: 500, cursor: 'pointer' },
+
+  // Employee detail drawer (right-side slide-out)
+  drawerOverlay: {
+    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+    background: 'rgba(15,23,42,0.45)',
+    display: 'flex', justifyContent: 'flex-end', zIndex: 1000,
+  },
+  drawer: {
+    background: '#f8fafc', width: 'min(720px, 96vw)', height: '100%',
+    boxShadow: '-8px 0 24px rgba(0,0,0,0.2)',
+    display: 'flex', flexDirection: 'column',
+  },
+  drawerHeader: {
+    padding: '16px 20px', borderBottom: '1px solid #e5e7eb', background: '#fff',
+    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+  },
+  drawerBody: { padding: 20, overflowY: 'auto', flex: 1 },
+
+  // Bulk action bar
+  bulkBar: {
+    display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap',
+    padding: '10px 14px', background: '#0f172a', color: '#fff',
+    borderRadius: 10, marginBottom: 12,
+  },
+  bulkSelect: { padding: '6px 10px', borderRadius: 6, border: '1px solid #334155', background: '#1e293b', color: '#fff', fontSize: 12 },
+  bulkApply: { padding: '7px 16px', background: '#10b981', color: '#fff', border: 'none', borderRadius: 6, fontSize: 12, fontWeight: 700, cursor: 'pointer' },
 };

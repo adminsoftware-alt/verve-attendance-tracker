@@ -15,6 +15,11 @@ function downloadCsv(filename, csvContent) {
   URL.revokeObjectURL(url);
 }
 
+export function exportRowsCsv(filename, headers, rows) {
+  const csv = [headers, ...rows].map(r => r.map(escapeCsv).join(',')).join('\n');
+  downloadCsv(filename, csv);
+}
+
 // Export Day View data
 export function exportDayViewCsv(employees, date) {
   const headers = ['Name', 'Email', 'Login', 'Logout', 'Duration', 'Sessions', 'Rooms'];
@@ -27,8 +32,7 @@ export function exportDayViewCsv(employees, date) {
     emp.sessions || 1,
     emp.rooms.filter(r => r.isNamed).length,
   ]);
-  const csv = [headers, ...rows].map(r => r.map(escapeCsv).join(',')).join('\n');
-  downloadCsv(`attendance_${date}.csv`, csv);
+  exportRowsCsv(`attendance_${date}.csv`, headers, rows);
 }
 
 // Export Employee profile across dates
@@ -42,6 +46,5 @@ export function exportEmployeeCsv(emp) {
     d.duration || '',
     d.rooms.filter(r => r.isNamed).length,
   ]);
-  const csv = [headers, ...rows].map(r => r.map(escapeCsv).join(',')).join('\n');
-  downloadCsv(`employee_${emp.name.replace(/\s+/g, '_')}.csv`, csv);
+  exportRowsCsv(`employee_${emp.name.replace(/\s+/g, '_')}.csv`, headers, rows);
 }
