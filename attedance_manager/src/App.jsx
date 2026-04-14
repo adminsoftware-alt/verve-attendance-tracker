@@ -16,6 +16,7 @@ import EmployeeManager from './components/EmployeeManager';
 import EmployeeSummary from './components/EmployeeSummary';
 import DataEditor from './components/DataEditor';
 import HolidayManager from './components/HolidayManager';
+import LeaveOverview from './components/LeaveOverview';
 import { FullPageLoader } from './components/LoadingSpinner';
 
 // Pages managers are allowed to see
@@ -95,6 +96,9 @@ export default function App() {
         )}
         {!isManager && page === 'holidays' && (
           <HolidayManager user={user} />
+        )}
+        {!isManager && page === 'leaveoverview' && (
+          <LeaveOverview user={user} />
         )}
 
         {/* Shared pages (all roles) */}
