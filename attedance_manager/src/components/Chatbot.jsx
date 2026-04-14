@@ -36,23 +36,31 @@ export default function Chatbot({ user }) {
 
   const send = useCallback(async (prompt, confirmToken = null) => {
     if (busy) return;
+    let nextMessages = messages;
     if (prompt) {
-      setMessages(prev => [...prev, { role: 'user', message: prompt }]);
+      nextMessages = [...messages, { role: 'user', message: prompt }];
+      setMessages(nextMessages);
     }
     setBusy(true);
     try {
+      // Send the last 8 turns as context so general_chat can keep a thread.
+      const history = nextMessages
+        .slice(-8)
+        .map(m => ({ role: m.role, message: m.message || '' }))
+        .filter(m => m.message);
       const res = await sendChatPrompt({
         prompt: prompt || '',
         user: user?.name || user?.username || '',
         role: user?.role || '',
         confirmToken,
+        history,
       });
       setMessages(prev => [...prev, { role: 'bot', ...res }]);
     } catch (e) {
       setMessages(prev => [...prev, { role: 'bot', success: false, message: `Network error: ${e.message}` }]);
     }
     setBusy(false);
-  }, [busy, user]);
+  }, [busy, user, messages]);
 
   const onSubmit = (e) => {
     e.preventDefault();
@@ -131,6 +139,57 @@ export default function Chatbot({ user }) {
   );
 }
 
+// Tiny markdown: **bold** + line breaks. Avoids pulling in a full lib.
+function renderRich(text) {
+  if (!text) return null;
+  const lines = String(text).split('\n');
+  const elems = [];
+  lines.forEach((line, li) => {
+    const parts = line.split(/(\*\*[^*]+\*\*)/g);
+    elems.push(
+      <span key={li}>
+        {parts.map((p, pi) => {
+          if (p.startsWith('**') && p.endsWith('**')) {
+            return <strong key={pi}>{p.slice(2, -2)}</strong>;
+          }
+          return <span key={pi}>{p}</span>;
+        })}
+        {li < lines.length - 1 ? <br /> : null}
+      </span>
+    );
+  });
+  return elems;
+}
+
+function ChatTable({ table }) {
+  if (!table || !table.rows?.length) return null;
+  return (
+    <div style={s.tableWrap}>
+      {table.title && <div style={s.tableTitle}>{table.title}</div>}
+      <div style={{ overflow: 'auto', maxHeight: 240 }}>
+        <table style={s.dataTable}>
+          <thead>
+            <tr>
+              {(table.columns || []).map((c, i) => (
+                <th key={i} style={s.th}>{c}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {table.rows.map((row, ri) => (
+              <tr key={ri} style={ri % 2 === 0 ? { background: '#fafbfc' } : {}}>
+                {row.map((cell, ci) => (
+                  <td key={ci} style={s.td}>{String(cell)}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function ChatMessage({ m, idx, onConfirm, onCancel }) {
   const isUser = m.role === 'user';
   const bubble = isUser ? s.msgUser : s.msgBot;
@@ -138,7 +197,10 @@ function ChatMessage({ m, idx, onConfirm, onCancel }) {
   return (
     <div style={{ ...s.msgRow, justifyContent: isUser ? 'flex-end' : 'flex-start' }}>
       <div style={bubble}>
-        <div style={s.msgText}>{m.message || ''}</div>
+        <div style={s.msgText}>{renderRich(m.message)}</div>
+
+        {/* Inline data table (employee daily, team summary, attendance for date) */}
+        <ChatTable table={m.table} />
 
         {/* Edit confirm card */}
         {m.confirm_required && m.confirm_token && (
@@ -171,7 +233,7 @@ function ChatMessage({ m, idx, onConfirm, onCancel }) {
         )}
 
         {/* Inline data link */}
-        {m.data?.detail_url && !m.download_url && (
+        {m.data?.detail_url && !m.download_url && !m.table && (
           <a href={m.data.detail_url} target="_blank" rel="noreferrer" style={s.linkBtn}>
             Open data →
           </a>
@@ -274,4 +336,19 @@ const s = {
     background: '#94a3b8', margin: '0 2px',
     animation: 'chatDot 1s infinite ease-in-out',
   },
+
+  // Inline data table inside a bot bubble
+  tableWrap: { marginTop: 10, border: '1px solid #e2e8f0', borderRadius: 8, background: '#fff' },
+  tableTitle: {
+    padding: '6px 10px', fontSize: 10, fontWeight: 700, color: '#64748b',
+    textTransform: 'uppercase', letterSpacing: '0.05em',
+    borderBottom: '1px solid #e2e8f0', background: '#f8fafc',
+  },
+  dataTable: { borderCollapse: 'collapse', width: '100%', fontSize: 11 },
+  th: {
+    padding: '6px 8px', textAlign: 'left', background: '#f8fafc',
+    color: '#475569', fontWeight: 600, borderBottom: '1px solid #e2e8f0',
+    whiteSpace: 'nowrap',
+  },
+  td: { padding: '5px 8px', borderBottom: '1px solid #f1f5f9', color: '#0f172a' },
 };

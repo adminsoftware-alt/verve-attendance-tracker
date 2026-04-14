@@ -292,28 +292,71 @@ def _fmt_mins(m):
 #    confirm_required?: bool, confirm_token?: str, confirm_summary?: str}
 # ════════════════════════════════════════════════════════════
 
+def _http_get_json(url, timeout=20):
+    """Internal helper: fetch JSON from one of our own endpoints."""
+    import requests as _r
+    try:
+        r = _r.get(url, timeout=timeout)
+        if r.status_code >= 300:
+            return None
+        return r.json()
+    except Exception as e:
+        print(f"[Chatbot] _http_get_json {url} failed: {e}")
+        return None
+
+
 def h_lookup_employee(params, ctx):
     name_q = params.get('name', '')
     year, month = _yymm_from_params(params)
     emp = _find_employee(ctx['client'], ctx['dataset_ref'], name_q)
     if not emp:
         return {'message': f"I couldn't find an employee matching “{name_q}”."}
-    # Reuse the existing /employees/<id>/attendance/<yymm> endpoint by hitting
-    # its data path directly via BigQuery. For simplicity, call the JSON
-    # endpoint URL so the same logic runs.
+
     yymm = f"{year}-{month:02d}"
     detail_url = f"{ctx['base_url']}/employees/{emp['employee_id']}/attendance/{yymm}"
-    csv_url = f"{detail_url}?format=csv"
+    payload = _http_get_json(detail_url) or {}
+    daily = payload.get('daily') or []
+
+    # Aggregate
+    days_present = sum(1 for d in daily if (d.get('active_minutes') or 0) > 0)
+    total_active = sum(d.get('active_minutes') or 0 for d in daily)
+    total_break = sum(d.get('break_minutes') or 0 for d in daily)
+    total_iso = sum(d.get('isolation_minutes') or 0 for d in daily)
+    avg = (total_active // days_present) if days_present else 0
+
+    msg = (
+        f"**{emp['display_name']}** — {yymm}\n"
+        f"• Days present: **{days_present}**\n"
+        f"• Total active: **{_fmt_mins(total_active)}**\n"
+        f"• Avg / day: **{_fmt_mins(avg)}**\n"
+        f"• Total break: **{_fmt_mins(total_break)}**\n"
+        f"• Total isolation: **{_fmt_mins(total_iso)}**"
+    )
+    if emp.get('participant_email'):
+        msg += f"\n• Email: {emp['participant_email']}"
+
+    table_rows = [
+        [
+            d.get('date') or '',
+            d.get('status') or '',
+            d.get('first_seen_ist') or '-',
+            d.get('last_seen_ist') or '-',
+            _fmt_mins(d.get('active_minutes') or 0),
+            _fmt_mins(d.get('break_minutes') or 0),
+        ]
+        for d in daily[:31]
+    ]
+    table = {
+        'title': 'Daily breakdown',
+        'columns': ['Date', 'Status', 'First seen', 'Last seen', 'Active', 'Break'],
+        'rows': table_rows,
+    } if table_rows else None
+
     return {
-        'message': f"**{emp['display_name']}** — attendance for {yymm}.",
-        'data': {
-            'employee_id': emp['employee_id'],
-            'name': emp['display_name'],
-            'email': emp['participant_email'],
-            'team_id': emp['team_id'],
-            'detail_url': detail_url,
-        },
-        'download_url': csv_url,
+        'message': msg,
+        'data': {'employee_id': emp['employee_id'], 'name': emp['display_name'], 'email': emp['participant_email']},
+        'table': table,
+        'download_url': f"{detail_url}?format=csv",
         'filename': f"{emp['display_name'].replace(' ','_')}_{yymm}.csv",
     }
 
@@ -322,10 +365,34 @@ def h_attendance_for_date(params, ctx):
     date = params.get('date') or _today_ist()
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
         return {'message': f"Date format should be YYYY-MM-DD (got “{date}”)."}
-    return {
-        'message': f"Full attendance for **{date}**:",
-        'data': {'date': date, 'detail_url': f"{ctx['base_url']}/attendance/summary/{date}"},
+
+    detail_url = f"{ctx['base_url']}/attendance/summary/{date}"
+    payload = _http_get_json(detail_url) or {}
+    parts = payload.get('participants') or []
+    if not parts:
+        return {'message': f"No attendance records for **{date}**."}
+
+    # Sort by total time desc, take top 25 for display
+    parts_sorted = sorted(parts, key=lambda p: -(p.get('total_duration_mins') or 0))
+    top = parts_sorted[:25]
+
+    total_people = len(parts)
+    total_mins = sum(p.get('total_duration_mins') or 0 for p in parts)
+    msg = (
+        f"Attendance on **{date}** — {total_people} people · "
+        f"{_fmt_mins(total_mins)} total active time. "
+        f"{'Top ' + str(len(top)) + ' shown:' if len(parts) > len(top) else ''}"
+    )
+    table = {
+        'title': f"Participants on {date}",
+        'columns': ['Name', 'First seen', 'Last seen', 'Total time'],
+        'rows': [
+            [p.get('name') or '', p.get('first_seen_ist') or '-', p.get('last_seen_ist') or '-',
+             _fmt_mins(p.get('total_duration_mins') or 0)]
+            for p in top
+        ],
     }
+    return {'message': msg, 'data': {'date': date}, 'table': table}
 
 
 def h_team_summary(params, ctx):
@@ -334,11 +401,46 @@ def h_team_summary(params, ctx):
     team = _find_team(ctx['client'], ctx['dataset_ref'], team_q)
     if not team:
         return {'message': f"I couldn't find a team matching “{team_q}”."}
+
     detail_url = f"{ctx['base_url']}/teams/{team['team_id']}/report/monthly?year={year}&month={month}"
     csv_url = detail_url + '&format=csv'
+    payload = _http_get_json(detail_url) or {}
+    summary = payload.get('member_summary') or []
+
+    if not summary:
+        return {
+            'message': f"No data for **{team['team_name']}** in {year}-{month:02d}.",
+            'download_url': csv_url,
+        }
+
+    summary_sorted = sorted(summary, key=lambda m: -(m.get('total_active_mins') or 0))
+    total_active = sum(m.get('total_active_mins') or 0 for m in summary)
+    total_break = sum(m.get('total_break_mins') or 0 for m in summary)
+    msg = (
+        f"**{team['team_name']}** — {year}-{month:02d}\n"
+        f"• Members: **{len(summary)}**\n"
+        f"• Combined active: **{_fmt_mins(total_active)}**\n"
+        f"• Combined break: **{_fmt_mins(total_break)}**"
+    )
+    table = {
+        'title': 'Member summary',
+        'columns': ['Name', 'Days', 'Total active', 'Avg / day', 'Break', 'Isolation'],
+        'rows': [
+            [
+                m.get('name') or '',
+                m.get('days_present') or 0,
+                _fmt_mins(m.get('total_active_mins') or 0),
+                _fmt_mins((m.get('total_active_mins') or 0) // (m.get('days_present') or 1)),
+                _fmt_mins(m.get('total_break_mins') or 0),
+                _fmt_mins(m.get('total_isolation_mins') or 0),
+            ]
+            for m in summary_sorted
+        ],
+    }
     return {
-        'message': f"**{team['team_name']}** monthly summary for {year}-{month:02d}.",
-        'data': {'team_id': team['team_id'], 'team_name': team['team_name'], 'detail_url': detail_url},
+        'message': msg,
+        'data': {'team_id': team['team_id'], 'team_name': team['team_name']},
+        'table': table,
         'download_url': csv_url,
         'filename': f"team_{team['team_name'].replace(' ','_')}_{year}-{month:02d}.csv",
     }
@@ -548,8 +650,63 @@ def _apply_leave(ctx, employee_id, date, leave_type):
 # Registry + dispatcher
 # ════════════════════════════════════════════════════════════
 
+def h_general_chat(params, ctx):
+    """Conversational fallback. Sends the prompt to Gemini with a system
+    primer about what the app does + capabilities, and returns the reply
+    inline. Used when no structured intent matches."""
+    prompt = (params.get('prompt') or '').strip()
+    history = params.get('history') or []
+    if not prompt:
+        return {'message': "Ask me anything about attendance, teams, exports, or overrides."}
+
+    # If Gemini is unavailable, return a fixed help message.
+    if not (_GEMINI_AVAILABLE and GEMINI_API_KEY):
+        return {
+            'message': (
+                "I can answer attendance questions when Gemini is configured. "
+                "Right now I only handle direct commands — try:\n"
+                "• show Shashank attendance\n"
+                "• team Accurest April summary\n"
+                "• download Shashank April CSV\n"
+                "• mark Shashank present on 2026-04-12 (admin)"
+            )
+        }
+
+    primer = (
+        "You are the AI assistant inside Verve Advisory's attendance tracker. "
+        "You help HR / managers / admins explore Zoom-based attendance data: "
+        "rooms occupied, time tracked, breaks, isolation, leaves, holidays. "
+        "Be concise (max 4 sentences). If the user asks for actual employee "
+        "or team numbers, tell them to phrase it as one of: "
+        "'show <name> attendance', 'team <team> summary', 'attendance for <date>', "
+        "'download <name> April', or 'mark <name> present on <date>'. "
+        "Answer general operational, conceptual, or how-to questions directly. "
+        f"Today is {_today_ist()} (IST)."
+    )
+
+    try:
+        model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=primer)
+        # Build short history (last 6) as Gemini chat turns
+        history_turns = []
+        for h in (history or [])[-6:]:
+            role = 'user' if h.get('role') == 'user' else 'model'
+            txt = (h.get('message') or '').strip()
+            if txt:
+                history_turns.append({'role': role, 'parts': [txt]})
+        chat = model.start_chat(history=history_turns)
+        resp = chat.send_message(prompt, generation_config={
+            'temperature': 0.4,
+            'max_output_tokens': 512,
+        })
+        text = (resp.text or '').strip() or "I'm not sure how to answer that."
+        return {'message': text}
+    except Exception as e:
+        print(f"[Chatbot] general_chat failed: {e}")
+        return {'message': f"Sorry, I couldn't answer that just now ({e})."}
+
+
 INTENTS = {
-    # Read
+    # Read (data-rich)
     'lookup_employee':     {'role': None,    'requires_confirm': False, 'handler': h_lookup_employee},
     'attendance_for_date': {'role': None,    'requires_confirm': False, 'handler': h_attendance_for_date},
     'team_summary':        {'role': None,    'requires_confirm': False, 'handler': h_team_summary},
@@ -561,11 +718,15 @@ INTENTS = {
     'set_status':       {'role': 'admin', 'requires_confirm': True, 'handler': h_set_status},
     'set_active_mins':  {'role': 'admin', 'requires_confirm': True, 'handler': h_set_active_mins},
     'add_leave':        {'role': 'admin', 'requires_confirm': True, 'handler': h_add_leave},
+    # Conversational fallback
+    'general_chat':     {'role': None,    'requires_confirm': False, 'handler': h_general_chat},
 }
 
 
-def dispatch(prompt, ctx, confirm_token=None):
-    """Main entry. Returns dict response; never raises."""
+def dispatch(prompt, ctx, confirm_token=None, history=None):
+    """Main entry. Returns dict response; never raises.
+    `history` is the recent conversation (list of {role,message}) used as
+    context for the general-chat fallback."""
     try:
         # Confirm path: token tells us the intent + params, skip LLM
         if confirm_token:
@@ -586,20 +747,14 @@ def dispatch(prompt, ctx, confirm_token=None):
         confidence = float(clf.get('confidence', 0.0))
         params = clf.get('params', {}) or {}
 
-        if intent == 'unknown' or confidence < 0.4:
-            return {
-                'success': True, 'intent': 'unknown',
-                'message': "I'm not sure what you'd like. Try: " +
-                           "“download Shashank's April attendance”, " +
-                           "“show team Accurest April summary”, or " +
-                           "“mark Shashank present on 2026-04-12”.",
-            }
+        # Low confidence OR explicitly unknown → conversational fallback so
+        # the user always gets a helpful answer instead of a canned hint.
+        if intent == 'unknown' or confidence < 0.4 or intent not in INTENTS:
+            params = {'prompt': prompt, 'history': history or []}
+            result = INTENTS['general_chat']['handler'](params, ctx)
+            return {'success': True, 'intent': 'general_chat', 'confidence': confidence, **result}
 
-        spec = INTENTS.get(intent)
-        if not spec:
-            return {'success': True, 'intent': 'unknown',
-                    'message': f"I recognised the intent “{intent}” but don't know how to handle it yet."}
-
+        spec = INTENTS[intent]
         result = spec['handler'](params, ctx)
         return {'success': True, 'intent': intent, 'confidence': confidence, **result}
 

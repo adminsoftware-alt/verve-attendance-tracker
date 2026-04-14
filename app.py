@@ -2709,7 +2709,8 @@ def chat_endpoint():
             'user': (data.get('user') or '').strip() or None,
             'role': (data.get('role') or '').strip() or None,
         }
-        return jsonify(_chat_dispatch(prompt, ctx, confirm_token=confirm_token))
+        history = data.get('history') if isinstance(data.get('history'), list) else None
+        return jsonify(_chat_dispatch(prompt, ctx, confirm_token=confirm_token, history=history))
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'success': False, 'message': f'Chatbot dispatch error: {e}'})

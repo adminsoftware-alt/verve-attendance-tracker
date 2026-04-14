@@ -343,7 +343,7 @@ export async function fetchUnrecognizedMonthly(year, month) {
 // chatbot UI displays the message field directly so users can see real
 // error text ("Chatbot module failed to load: ...") instead of a generic
 // "API error" toast.
-export async function sendChatPrompt({ prompt, user, role, confirmToken } = {}) {
+export async function sendChatPrompt({ prompt, user, role, confirmToken, history } = {}) {
   const res = await fetch(`${ZOOM_API_BASE}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -352,6 +352,7 @@ export async function sendChatPrompt({ prompt, user, role, confirmToken } = {}) 
       user: user || '',
       role: role || '',
       confirm_token: confirmToken || null,
+      history: history || [],
     }),
   });
   // Try to parse JSON regardless of status code; surface raw text on parse fail.
