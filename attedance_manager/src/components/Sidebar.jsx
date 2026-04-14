@@ -4,7 +4,6 @@ const ADMIN_NAV = [
   { key: 'employees', label: 'Employees', icon: '\u{1F465}' },
   { key: 'empsummary', label: 'Employee Summary', icon: '\u{1F4C8}' },
   { key: 'roomanalytics', label: 'Room Analytics', icon: '\u{1F3E2}' },
-  { key: 'dashboard', label: 'Dashboard', icon: '\u{1F3E0}' },
   { key: 'teams', label: 'Teams', icon: '\u{1F46A}' },
   { key: 'teamview', label: 'Team View', icon: '\u{1F4CA}' },
   { key: 'holidays', label: 'Holidays & Leave', icon: '\u{1F4C6}' },
@@ -18,7 +17,6 @@ const SUPERADMIN_EXTRA = [
 ];
 
 const MANAGER_NAV = [
-  { key: 'dashboard', label: 'Dashboard', icon: '\u{1F3E0}' },
   { key: 'teamview', label: 'Team View', icon: '\u{1F4CA}' },
   { key: 'reports', label: 'Reports', icon: '\u{1F4CB}' },
   { key: 'teams', label: 'My Teams', icon: '\u{1F46A}' },

@@ -38,7 +38,7 @@ function statusLabel(status) {
 export default function TeamView({ user }) {
   const [teams, setTeams] = useState([]);
   const [selectedTeam, setSelectedTeam] = useState('');
-  const [mode, setMode] = useState('daily');        // daily | range | monthly
+  const [mode, setMode] = useState('monthly');      // daily | range | monthly
   const [date, setDate] = useState(istDate);
   const [startDate, setStartDate] = useState(istDate);
   const [endDate, setEndDate] = useState(istDate);

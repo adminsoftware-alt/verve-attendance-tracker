@@ -19,13 +19,13 @@ import HolidayManager from './components/HolidayManager';
 import { FullPageLoader } from './components/LoadingSpinner';
 
 // Pages managers are allowed to see
-const MANAGER_PAGES = new Set(['dashboard', 'teamview', 'reports', 'teams']);
+const MANAGER_PAGES = new Set(['teamview', 'reports', 'teams']);
 
 export default function App() {
   const [user, setUser] = useState(getSession);
 
   const isManager = user?.role === 'manager';
-  const defaultPage = isManager ? 'dashboard' : 'live';
+  const defaultPage = isManager ? 'teamview' : 'live';
   const [page, setPage] = useState(defaultPage);
 
   const { data: allData, dates: uploadedDates, loading } = useAllData(0);
@@ -33,7 +33,7 @@ export default function App() {
   const handleLogin = useCallback((u) => {
     setUser(u);
     // Set default page based on role
-    setPage(u?.role === 'manager' ? 'dashboard' : 'live');
+    setPage(u?.role === 'manager' ? 'teamview' : 'live');
   }, []);
   const handleLogout = useCallback(() => { clearSession(); setUser(null); }, []);
 

@@ -31,10 +31,16 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
   // Use live data from allData if available, otherwise use lazy-loaded data
   const employees = allData[date] || dayEmployees || [];
 
+  // Step by ±1 calendar day. Don't constrain to uploadedDates — useDayData
+  // fetches for any date and the UI handles "No data" gracefully.
   const changeDate = (dir) => {
-    const idx = uploadedDates.indexOf(date);
-    if (dir === -1 && idx > 0) setDate(uploadedDates[idx - 1]);
-    if (dir === 1 && idx < uploadedDates.length - 1) setDate(uploadedDates[idx + 1]);
+    const [y, m, d] = date.split('-').map(Number);
+    const cur = new Date(y, m - 1, d);
+    cur.setDate(cur.getDate() + dir);
+    const yy = cur.getFullYear();
+    const mm = String(cur.getMonth() + 1).padStart(2, '0');
+    const dd = String(cur.getDate()).padStart(2, '0');
+    setDate(`${yy}-${mm}-${dd}`);
     setExpanded(null);
   };
 
@@ -79,8 +85,7 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
     return (
       <div>
         <div style={s.dateNav}>
-          <button onClick={() => changeDate(-1)} style={s.arrowBtn}
-            disabled={uploadedDates.indexOf(date) <= 0}>{'\u2190'}</button>
+          <button onClick={() => changeDate(-1)} style={s.arrowBtn}>{'\u2190'}</button>
           <div style={s.dateCenter}>
             <input type="date" value={date}
               onChange={(e) => { setDate(e.target.value); setExpanded(null); }}
@@ -90,7 +95,7 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
             </div>
           </div>
           <button onClick={() => changeDate(1)} style={s.arrowBtn}
-            disabled={uploadedDates.indexOf(date) >= uploadedDates.length - 1}>{'\u2192'}</button>
+            disabled={date >= today}>{'\u2192'}</button>
         </div>
         <div style={s.emptyState}>
           <p style={{ fontSize: 14 }}>Loading data for <strong>{date}</strong>...</p>

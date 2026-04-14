@@ -750,6 +750,19 @@ function UnrecognizedPanel({ teams, onClassified }) {
   const [bulkCategory, setBulkCategory] = useState('visitor');
   const [bulkTeam, setBulkTeam] = useState('');
   const [bulkBusy, setBulkBusy] = useState(false);
+  // Existing employee names — used as datalist options so HR can pick a known
+  // person (avoids duplicate registry entries from typos) OR type a new name.
+  const [registryNames, setRegistryNames] = useState([]);
+
+  useEffect(() => {
+    fetchEmployees({}).then(res => {
+      const list = (res?.employees || [])
+        .map(e => e.display_name || e.participant_name)
+        .filter(Boolean);
+      // Dedupe + sort
+      setRegistryNames([...new Set(list)].sort((a, b) => a.localeCompare(b)));
+    }).catch(() => {});
+  }, []);
 
   // Helper: check if name contains "&" (shared session between 2 people)
   const isSharedName = (name) => name && name.includes('&');
@@ -1062,6 +1075,12 @@ function UnrecognizedPanel({ teams, onClassified }) {
 
       {loading && <div style={s.loader}>Loading unrecognized participants...</div>}
 
+      {/* Datalist of registered employee names — referenced by name inputs
+          via list="employee-names-datalist" so HR can pick existing or type new. */}
+      <datalist id="employee-names-datalist">
+        {registryNames.map(n => <option key={n} value={n} />)}
+      </datalist>
+
       {!loading && items.length > 0 && (
         <div style={s.tableWrap}>
           <table style={s.table}>
@@ -1155,21 +1174,41 @@ function UnrecognizedPanel({ teams, onClassified }) {
                       {isShared ? (
                         <>
                           <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                              <input
-                                type="text"
-                                placeholder="Employee 1"
-                                value={state.name1 || ''}
-                                onChange={e => updateRow(key, 'name1', e.target.value)}
-                                style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', width: 100 }}
-                              />
-                              <input
-                                type="text"
-                                placeholder="Employee 2"
-                                value={state.name2 || ''}
-                                onChange={e => updateRow(key, 'name2', e.target.value)}
-                                style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', width: 100 }}
-                              />
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                                <input
+                                  type="text"
+                                  placeholder="Employee 1 (pick or type new)"
+                                  value={state.name1 || ''}
+                                  list="employee-names-datalist"
+                                  onChange={e => updateRow(key, 'name1', e.target.value)}
+                                  style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', width: 140 }}
+                                />
+                                <input
+                                  type="email"
+                                  placeholder="Email 1 (optional)"
+                                  value={state.email1 || ''}
+                                  onChange={e => updateRow(key, 'email1', e.target.value)}
+                                  style={{ ...s.teamSelect, fontSize: 10, padding: '3px 6px', width: 140, color: '#64748b' }}
+                                />
+                              </div>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                                <input
+                                  type="text"
+                                  placeholder="Employee 2 (pick or type new)"
+                                  value={state.name2 || ''}
+                                  list="employee-names-datalist"
+                                  onChange={e => updateRow(key, 'name2', e.target.value)}
+                                  style={{ ...s.teamSelect, fontSize: 11, padding: '4px 6px', width: 140 }}
+                                />
+                                <input
+                                  type="email"
+                                  placeholder="Email 2 (optional)"
+                                  value={state.email2 || ''}
+                                  onChange={e => updateRow(key, 'email2', e.target.value)}
+                                  style={{ ...s.teamSelect, fontSize: 10, padding: '3px 6px', width: 140, color: '#64748b' }}
+                                />
+                              </div>
                             </div>
                           </td>
                           <td style={s.td} onClick={(ev) => ev.stopPropagation()}>
@@ -1200,7 +1239,7 @@ function UnrecognizedPanel({ teams, onClassified }) {
                                   checked={state.apply_attendance !== false}
                                   onChange={e => updateRow(key, 'apply_attendance', e.target.checked)}
                                 />
-                                Copy attendance to both employees
+                                Copy attendance to both
                               </label>
                             </div>
                           </td>

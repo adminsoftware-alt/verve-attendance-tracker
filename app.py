@@ -5727,7 +5727,9 @@ def attendance_summary(date=None):
         webhook_times AS (
           SELECT
             participant_key,
-            MAX(participant_name) as participant_name,
+            -- Pick the LATEST name the participant used (chronologically),
+            -- not the alphabetical max — so a renamer's most recent name shows.
+            ARRAY_AGG(participant_name ORDER BY event_timestamp DESC LIMIT 1)[OFFSET(0)] as participant_name,
             MAX(participant_email) as participant_email,
             MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as main_joined,
             MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as main_left
@@ -5774,7 +5776,8 @@ def attendance_summary(date=None):
         participant_breakout_times AS (
           SELECT
             participant_key,
-            MAX(participant_name) as participant_name,
+            -- Latest name from snapshots, not alphabetical max.
+            ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
             MAX(participant_email) as participant_email,
             MIN(snapshot_time) as first_breakout,
             MAX(snapshot_time) as last_breakout
@@ -6832,7 +6835,7 @@ def team_attendance(team_id, date):
         participant_summary AS (
             SELECT
                 participant_key,
-                MAX(participant_name) as participant_name,
+                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
                 MAX(participant_email) as participant_email,
                 MIN(snapshot_ist) as first_seen,
                 MAX(snapshot_ist) as last_seen,
@@ -7288,7 +7291,7 @@ def team_attendance_range(team_id):
             SELECT
                 event_date,
                 participant_key,
-                MAX(participant_name) as participant_name,
+                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
                 MIN(snapshot_ist) as first_seen,
                 MAX(snapshot_ist) as last_seen,
                 -- Actual active time: sum consecutive intervals where gap < 5 mins
@@ -10575,7 +10578,7 @@ def list_unrecognized_monthly():
             SELECT
                 event_date,
                 name_key,
-                MAX(participant_name) as participant_name,
+                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
                 MAX(participant_email) as participant_email,
                 MIN(snapshot_ist) as first_seen,
                 MAX(snapshot_ist) as last_seen,
@@ -10892,7 +10895,7 @@ def list_classified_monthly():
             SELECT
                 event_date,
                 name_key,
-                MAX(participant_name) as participant_name,
+                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
                 MAX(participant_email) as participant_email,
                 MIN(snapshot_ist) as first_seen,
                 MAX(snapshot_ist) as last_seen,
