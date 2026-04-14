@@ -2685,33 +2685,34 @@ def health_check():
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
     """Take a free-text prompt + user context, dispatch to a chatbot intent.
-    Body: { prompt: str, user?: str, role?: str, confirm_token?: str }
-    Returns: { success, intent, message, data?, download_url?, filename?,
-               confirm_required?, confirm_token?, confirm_summary? }"""
+    Always returns HTTP 200 with a JSON body so the UI can show the error
+    text instead of a generic "API error 500"."""
     try:
         from chatbot import dispatch as _chat_dispatch
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Chatbot unavailable: {e}'}), 500
+        import traceback; traceback.print_exc()
+        return jsonify({'success': False, 'message': f'Chatbot module failed to load: {e}'})
 
     data = request.get_json(silent=True) or {}
     prompt = (data.get('prompt') or '').strip()
     confirm_token = data.get('confirm_token') or None
     if not prompt and not confirm_token:
-        return jsonify({'success': False, 'message': 'prompt is required'}), 400
+        return jsonify({'success': False, 'message': 'prompt is required'})
 
-    # Build the request's own base URL so the chatbot can re-invoke our APIs
-    # (override / leave / monthly-report) regardless of deployment host.
-    base_url = request.host_url.rstrip('/')
-
-    ctx = {
-        'client': get_bq_client(),
-        'dataset_ref': f"{GCP_PROJECT_ID}.{BQ_DATASET}",
-        'project_id': GCP_PROJECT_ID,
-        'base_url': base_url,
-        'user': (data.get('user') or '').strip() or None,
-        'role': (data.get('role') or '').strip() or None,
-    }
-    return jsonify(_chat_dispatch(prompt, ctx, confirm_token=confirm_token))
+    try:
+        base_url = request.host_url.rstrip('/')
+        ctx = {
+            'client': get_bq_client(),
+            'dataset_ref': f"{GCP_PROJECT_ID}.{BQ_DATASET}",
+            'project_id': GCP_PROJECT_ID,
+            'base_url': base_url,
+            'user': (data.get('user') or '').strip() or None,
+            'role': (data.get('role') or '').strip() or None,
+        }
+        return jsonify(_chat_dispatch(prompt, ctx, confirm_token=confirm_token))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'success': False, 'message': f'Chatbot dispatch error: {e}'})
 
 
 # ==============================================================================

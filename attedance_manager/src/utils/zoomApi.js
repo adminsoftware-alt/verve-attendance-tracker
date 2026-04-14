@@ -339,15 +339,30 @@ export async function fetchUnrecognizedMonthly(year, month) {
 
 // ─── CHATBOT ──────────────────────────────────────────────
 // Sends a prompt (or a confirm_token, for two-step edits) to the LLM-backed
-// /chat endpoint. Returns: { success, intent, message, data?, download_url?,
-// filename?, confirm_required?, confirm_token?, confirm_summary? }
+// /chat endpoint. Unlike apiPost we DON'T throw on success:false here — the
+// chatbot UI displays the message field directly so users can see real
+// error text ("Chatbot module failed to load: ...") instead of a generic
+// "API error" toast.
 export async function sendChatPrompt({ prompt, user, role, confirmToken } = {}) {
-  return apiPost('/chat', {
-    prompt: prompt || '',
-    user: user || '',
-    role: role || '',
-    confirm_token: confirmToken || null,
+  const res = await fetch(`${ZOOM_API_BASE}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt: prompt || '',
+      user: user || '',
+      role: role || '',
+      confirm_token: confirmToken || null,
+    }),
   });
+  // Try to parse JSON regardless of status code; surface raw text on parse fail.
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    const text = await res.text().catch(() => '');
+    return { success: false, message: `Bad response (HTTP ${res.status}): ${text || res.statusText}` };
+  }
+  return data;
 }
 
 // Split a shared session ("A & B & C") to N employees. Accepts either the
