@@ -16,6 +16,7 @@ import EmployeeManager from './components/EmployeeManager';
 import EmployeeSummary from './components/EmployeeSummary';
 import DataEditor from './components/DataEditor';
 import HolidayManager from './components/HolidayManager';
+import Chatbot from './components/Chatbot';
 import { FullPageLoader } from './components/LoadingSpinner';
 
 // Pages managers are allowed to see
@@ -111,6 +112,9 @@ export default function App() {
           <ReportBuilder user={user} />
         )}
       </main>
+
+      {/* Floating chatbot — available on every page */}
+      <Chatbot user={user} />
     </div>
   );
 }

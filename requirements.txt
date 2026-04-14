@@ -23,3 +23,6 @@ sendgrid==6.10.0
 
 # Cloud Functions (for scheduled reports)
 functions-framework==3.5.0
+
+# Chatbot (Gemini intent routing)
+google-generativeai==0.8.3

@@ -337,6 +337,19 @@ export async function fetchUnrecognizedMonthly(year, month) {
   return apiFetch(`/employees/unrecognized-monthly?year=${year}&month=${month}`);
 }
 
+// ─── CHATBOT ──────────────────────────────────────────────
+// Sends a prompt (or a confirm_token, for two-step edits) to the LLM-backed
+// /chat endpoint. Returns: { success, intent, message, data?, download_url?,
+// filename?, confirm_required?, confirm_token?, confirm_summary? }
+export async function sendChatPrompt({ prompt, user, role, confirmToken } = {}) {
+  return apiPost('/chat', {
+    prompt: prompt || '',
+    user: user || '',
+    role: role || '',
+    confirm_token: confirmToken || null,
+  });
+}
+
 // Split a shared session ("A & B & C") to N employees. Accepts either the
 // new form (array of employee objects) or legacy (employee1, employee2).
 export async function splitSharedAttendance(sharedName, employeesOrFirst, secondOrDaily, dailyOrApply, applyAttendance = true) {
