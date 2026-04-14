@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { fetchTeams, fetchTeamDetail, createTeam, updateTeam, deleteTeam, addTeamMember, removeTeamMember, fetchParticipants, bulkImportTeams } from '../utils/zoomApi';
+import { fetchTeams, fetchTeamDetail, createTeam, updateTeam, deleteTeam, addTeamMember, removeTeamMember, fetchParticipants, bulkImportTeams, fetchTeamsHolidaysSummary } from '../utils/zoomApi';
 
 export default function Teams({ user }) {
   const [teams, setTeams] = useState([]);
@@ -19,6 +19,11 @@ export default function Teams({ user }) {
   const [addingInProgress, setAddingInProgress] = useState(false);
   const [uploadResult, setUploadResult] = useState(null);
   const fileInputRef = useRef(null);
+  const [holidaysSummary, setHolidaysSummary] = useState({});
+  const [selectedMonth, setSelectedMonth] = useState(() => {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() + 1 };
+  });
 
   // Form state
   const [formName, setFormName] = useState('');
@@ -53,6 +58,15 @@ export default function Teams({ user }) {
     }
   }, []);
 
+  const loadHolidaysSummary = useCallback(async () => {
+    try {
+      const data = await fetchTeamsHolidaysSummary(selectedMonth.year, selectedMonth.month);
+      setHolidaysSummary(data.summary || {});
+    } catch (e) {
+      console.error('Failed to load holidays summary:', e);
+    }
+  }, [selectedMonth.year, selectedMonth.month]);
+
   const loadTeamMembers = useCallback(async (teamId) => {
     try {
       const data = await fetchTeamDetail(teamId);
@@ -67,8 +81,8 @@ export default function Teams({ user }) {
 
   useEffect(() => {
     setLoading(true);
-    Promise.all([loadTeams(), loadParticipants()]).finally(() => setLoading(false));
-  }, [loadTeams, loadParticipants]);
+    Promise.all([loadTeams(), loadParticipants(), loadHolidaysSummary()]).finally(() => setLoading(false));
+  }, [loadTeams, loadParticipants, loadHolidaysSummary]);
 
   const handleCreate = async () => {
     if (!formName.trim()) return;
@@ -297,6 +311,30 @@ export default function Teams({ user }) {
         </div>
       )}
 
+      {/* Month selector for holidays */}
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 16, background: '#f8fafc', padding: '10px 14px', borderRadius: 10, border: '1px solid #e5e7eb' }}>
+        <span style={{ fontSize: 12, color: '#64748b', fontWeight: 500 }}>Holidays for:</span>
+        <select
+          value={selectedMonth.year}
+          onChange={e => setSelectedMonth(m => ({ ...m, year: +e.target.value }))}
+          style={{ padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: 6, fontSize: 13 }}
+        >
+          {[2024, 2025, 2026].map(y => <option key={y} value={y}>{y}</option>)}
+        </select>
+        <select
+          value={selectedMonth.month}
+          onChange={e => setSelectedMonth(m => ({ ...m, month: +e.target.value }))}
+          style={{ padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: 6, fontSize: 13 }}
+        >
+          {['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].map((m, i) => (
+            <option key={i} value={i + 1}>{m}</option>
+          ))}
+        </select>
+        <span style={{ fontSize: 11, color: '#94a3b8', marginLeft: 8 }}>
+          Teams with holidays configured show a badge
+        </span>
+      </div>
+
       {/* Teams Grid */}
       <div style={s.grid}>
         {teams.map(team => {
@@ -304,6 +342,7 @@ export default function Teams({ user }) {
           const isExpanded = expandedTeam === team.team_id;
           const isAdding = addingMemberTo === team.team_id;
           const filteredParts = isAdding ? getFilteredParticipants(team.team_id) : [];
+          const holidayCount = holidaysSummary[team.team_id]?.holiday_count || 0;
 
           return (
             <div key={team.team_id} style={s.card}>
@@ -312,7 +351,14 @@ export default function Teams({ user }) {
                   <div style={s.teamName}>{team.team_name}</div>
                   {team.manager_name && <div style={s.manager}>Manager: {team.manager_name}</div>}
                 </div>
-                <div style={s.memberCount}>{team.member_count || 0}</div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  {holidayCount > 0 && (
+                    <div style={s.holidayBadge} title={`${holidayCount} holidays configured`}>
+                      {holidayCount} H
+                    </div>
+                  )}
+                  <div style={s.memberCount}>{team.member_count || 0}</div>
+                </div>
               </div>
 
               <div style={s.cardActions}>
@@ -426,6 +472,7 @@ const s = {
   teamName: { fontSize: 16, fontWeight: 700, color: '#1e293b' },
   manager: { fontSize: 12, color: '#64748b', marginTop: 4 },
   memberCount: { fontSize: 24, fontWeight: 800, color: '#3b82f6', background: '#eff6ff', width: 48, height: 48, borderRadius: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+  holidayBadge: { fontSize: 12, fontWeight: 700, color: '#7c3aed', background: '#ede9fe', padding: '6px 10px', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
 
   cardActions: { display: 'flex', gap: 8, padding: '0 20px 14px' },
   actionBtn: { padding: '6px 12px', background: '#f8fafc', color: '#475569', border: '1px solid #e5e7eb', borderRadius: 6, fontSize: 12, cursor: 'pointer', transition: 'all 0.15s' },

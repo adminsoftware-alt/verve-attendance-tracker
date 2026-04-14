@@ -220,6 +220,14 @@ export async function fetchTeamHolidays(teamId, year, month) {
   return apiFetch(`/teams/${teamId}/holidays${qs ? '?' + qs : ''}`);
 }
 
+export async function fetchTeamsHolidaysSummary(year, month) {
+  const q = new URLSearchParams();
+  if (year) q.set('year', year);
+  if (month) q.set('month', month);
+  const qs = q.toString();
+  return apiFetch(`/teams/holidays-summary${qs ? '?' + qs : ''}`);
+}
+
 export async function addTeamHoliday(teamId, date, description) {
   return apiPost(`/teams/${teamId}/holidays`, { date, description: description || '' });
 }

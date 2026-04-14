@@ -8261,6 +8261,47 @@ def update_team_holiday(team_id, holiday_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/teams/holidays-summary', methods=['GET'])
+def get_teams_holidays_summary():
+    """Get holiday counts for all teams. Optional: ?year=&month="""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        year = request.args.get('year', datetime.now().year)
+        month = request.args.get('month', datetime.now().month)
+
+        query = f"""
+        SELECT t.team_id, t.team_name, COUNT(h.holiday_id) as holiday_count
+        FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` t
+        LEFT JOIN `{dataset_ref}.{BQ_TEAM_HOLIDAYS_TABLE}` h
+          ON t.team_id = h.team_id
+          AND EXTRACT(YEAR FROM h.holiday_date) = @year
+          AND EXTRACT(MONTH FROM h.holiday_date) = @month
+        GROUP BY t.team_id, t.team_name
+        ORDER BY t.team_name
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("year", "INT64", int(year)),
+            bigquery.ScalarQueryParameter("month", "INT64", int(month)),
+        ])
+        rows = list(client.query(query, job_config=job_config).result())
+
+        summary = {}
+        for row in rows:
+            summary[row.team_id] = {
+                'team_name': row.team_name,
+                'holiday_count': row.holiday_count
+            }
+
+        return jsonify({'success': True, 'summary': summary, 'year': int(year), 'month': int(month)})
+    except Exception as e:
+        print(f"[HolidaysSummary] Error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # ==============================================================================
 # EMPLOYEE LEAVE - Individual employee leave/holidays
 # ==============================================================================
