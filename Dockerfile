@@ -30,6 +30,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY app.py .
 COPY report_generator.py .
+COPY chatbot.py .
 
 # Copy Zoom SDK app build (React frontend)
 COPY breakout-calibrator/build ./breakout-calibrator/build
