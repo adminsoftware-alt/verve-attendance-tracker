@@ -111,6 +111,69 @@ def normalize_participant_name(name):
     return n.strip()
 
 
+def collapse_by_email(participants, mode='summary'):
+    """Second-pass merge: if two records (already collapsed by normalized
+    name) share the same non-empty email, merge them too. Handles the
+    "Shashank Channawar" -> "Shashank C" rename where the names don't
+    normalize to the same value but the email is identical.
+    """
+    groups = {}  # lower(email) -> primary record
+    out = []
+    for p in participants:
+        email = (p.get('email') or p.get('participant_email') or '').strip().lower()
+        if not email:
+            out.append(p)
+            continue
+        primary = groups.get(email)
+        if primary is None:
+            groups[email] = p
+            out.append(p)
+            continue
+        # Merge p into primary
+        for email_key in ('email', 'participant_email'):
+            if p.get(email_key) and not primary.get(email_key):
+                primary[email_key] = p[email_key]
+        if mode == 'summary':
+            primary_visits = primary.get('room_visits', []) or []
+            new_visits = p.get('room_visits', []) or []
+            primary['room_visits'] = sorted(
+                primary_visits + new_visits,
+                key=lambda v: v.get('room_joined_ist', '') or ''
+            )
+            for tk in ('first_seen_ist',):
+                if p.get(tk) and (not primary.get(tk) or p[tk] < primary[tk]):
+                    primary[tk] = p[tk]
+            for tk in ('last_seen_ist',):
+                if p.get(tk) and (not primary.get(tk) or p[tk] > primary[tk]):
+                    primary[tk] = p[tk]
+            primary['total_duration_mins'] = (primary.get('total_duration_mins', 0) or 0) \
+                                              + (p.get('total_duration_mins', 0) or 0)
+        elif mode == 'team':
+            for tk in ('first_seen_ist',):
+                if p.get(tk) and (not primary.get(tk) or p[tk] < primary[tk]):
+                    primary[tk] = p[tk]
+            for tk in ('last_seen_ist',):
+                if p.get(tk) and (not primary.get(tk) or p[tk] > primary[tk]):
+                    primary[tk] = p[tk]
+            for nk in ('total_duration_mins', 'breakout_mins', 'main_room_mins',
+                       'break_minutes', 'isolation_minutes'):
+                if nk in p:
+                    primary[nk] = (primary.get(nk, 0) or 0) + (p.get(nk) or 0)
+            status_rank = {'present': 3, 'half_day': 2, 'absent': 1}
+            if status_rank.get(p.get('status'), 0) > status_rank.get(primary.get('status'), 0):
+                primary['status'] = p['status']
+    # Strip duplicates that were merged in place
+    seen_ids = set()
+    deduped = []
+    for p in out:
+        pid = id(p)
+        if pid in seen_ids:
+            continue
+        seen_ids.add(pid)
+        deduped.append(p)
+    return deduped
+
+
 def merge_participants_by_name(participants, mode='summary'):
     """Merge duplicate participant entries by normalized name.
 
@@ -5625,17 +5688,36 @@ def attendance_summary(date=None):
         client = get_bq_client()
         query = f"""
         WITH
-        -- Webhook events: main meeting join/leave. Keyed by normalized name
-        -- so that a single person with multiple UUIDs today (e.g. after a
-        -- leave-and-rejoin that issued a new UUID) collapses into one record.
+        -- IDENTITY BRIDGE: every (name_key, participant_key) pair seen today.
+        -- participant_key prefers UUID (stable across renames), then email,
+        -- then the lowercased name. Webhook events (no UUID) join this bridge
+        -- to recover the stable key from just a name.
+        participant_name_map AS (
+          SELECT DISTINCT
+            LOWER(TRIM(participant_name)) as name_key,
+            COALESCE(
+              NULLIF(participant_uuid, ''),
+              NULLIF(LOWER(TRIM(participant_email)), ''),
+              LOWER(TRIM(participant_name))
+            ) as participant_key
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          WHERE event_date = '{date}'
+            AND participant_name IS NOT NULL AND participant_name != ''
+        ),
+        -- Webhook events: main meeting join/leave. Bridge the webhook name
+        -- to the UUID-based participant_key used downstream, so that a
+        -- renamer (e.g. "Shashank Channawar" -> "Shashank C", same UUID)
+        -- collapses into one row in the final output.
         webhook_events AS (
           SELECT
-            LOWER(TRIM(pe.participant_name)) as participant_key,
+            COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
             pe.participant_name,
             COALESCE(NULLIF(pe.participant_email, ''), '') as participant_email,
             pe.event_type,
             pe.event_timestamp
           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+          LEFT JOIN participant_name_map pnm
+            ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
           WHERE pe.event_date = '{date}'
             AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
             AND LOWER(pe.participant_name) NOT LIKE '%scout%'
@@ -5652,20 +5734,20 @@ def attendance_summary(date=None):
           FROM webhook_events
           GROUP BY participant_key
         ),
-        -- Clean snapshots (breakout rooms only). Three important filters:
-        --   1. Exclude "Main Room" / "0.Main Room" rows — main-room time is
-        --      produced by the main_room_visits synthesis below. If we let
-        --      snapshots also contribute main-room visits we get duplicates
-        --      that overlap the breakout-gap synthesis.
+        -- Clean snapshots (breakout rooms only). Filters:
+        --   1. Exclude "Main Room" / "0.Main Room" rows so they don't double
+        --      up with the main_room_visits synthesis below.
         --   2. QUALIFY dedupes the SDK-transition case where a participant
         --      briefly appeared in two rooms at the same snapshot_time.
-        --   3. participant_key is the normalized name, so a single person
-        --      with multiple UUIDs today collapses into one visit stream
-        --      (otherwise the synthesis fills gaps for one UUID that the
-        --      other UUID's real visits already occupy → overlaps).
+        --   3. participant_key = UUID if present, else email, else name.
+        --      Keeps renamers (same UUID, different names) in one stream.
         snapshot_clean AS (
           SELECT
-            LOWER(TRIM(participant_name)) as participant_key,
+            COALESCE(
+              NULLIF(participant_uuid, ''),
+              NULLIF(LOWER(TRIM(participant_email)), ''),
+              LOWER(TRIM(participant_name))
+            ) as participant_key,
             participant_name,
             COALESCE(NULLIF(participant_email, ''), '') as participant_email,
             room_name,
@@ -5678,7 +5760,13 @@ def attendance_summary(date=None):
             AND LOWER(room_name) != 'main room'
             AND LOWER(room_name) NOT LIKE '0.main%'
           QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY LOWER(TRIM(participant_name)), snapshot_time
+            PARTITION BY
+              COALESCE(
+                NULLIF(participant_uuid, ''),
+                NULLIF(LOWER(TRIM(participant_email)), ''),
+                LOWER(TRIM(participant_name))
+              ),
+              snapshot_time
             ORDER BY room_name
           ) = 1
         ),
@@ -5898,6 +5986,10 @@ def attendance_summary(date=None):
 
         # Merge duplicate names (e.g. "Aastha Chandwani-1", "Aastha Chandwani-2" -> "Aastha Chandwani")
         participants = merge_participants_by_name(participants, mode='summary')
+        # Second pass: also collapse records that share an email (handles
+        # renames like "Shashank Channawar" -> "Shashank C" where the names
+        # don't normalize to the same value).
+        participants = collapse_by_email(participants, mode='summary')
 
         return jsonify({
             'success': True,
@@ -7044,8 +7136,10 @@ def team_attendance(team_id, date):
                     'status': 'absent'
                 })
 
-        # Merge duplicate names
+        # Merge duplicate names, then collapse any remaining records that
+        # share an email (rename case: "Shashank Channawar" -> "Shashank C").
         participants = merge_participants_by_name(participants, mode='team')
+        participants = collapse_by_email(participants, mode='team')
 
         # Apply attendance overrides (manual edits take precedence)
         try:
@@ -8123,6 +8217,50 @@ def delete_team_holiday(team_id, holiday_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/teams/<team_id>/holidays/<holiday_id>', methods=['PUT'])
+def update_team_holiday(team_id, holiday_id):
+    """Update a holiday. Body: {date?: 'YYYY-MM-DD', description?}."""
+    try:
+        ensure_team_tables_once()
+        data = request.get_json(force=True) or {}
+        new_date = data.get('date')
+        new_desc = data.get('description')
+
+        if not new_date and new_desc is None:
+            return jsonify({'success': False, 'error': 'Provide date or description to update'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        sets = []
+        params = [
+            bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+            bigquery.ScalarQueryParameter("holiday_id", "STRING", holiday_id),
+        ]
+        if new_date:
+            try:
+                datetime.strptime(new_date, '%Y-%m-%d')
+            except:
+                return jsonify({'success': False, 'error': 'Invalid date format'}), 400
+            sets.append("holiday_date = @new_date")
+            params.append(bigquery.ScalarQueryParameter("new_date", "DATE", new_date))
+        if new_desc is not None:
+            sets.append("description = @new_desc")
+            params.append(bigquery.ScalarQueryParameter("new_desc", "STRING", new_desc))
+
+        query = f"""
+        UPDATE `{dataset_ref}.{BQ_TEAM_HOLIDAYS_TABLE}`
+        SET {', '.join(sets)}
+        WHERE team_id = @team_id AND holiday_id = @holiday_id
+        """
+        client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Holidays] Update error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # ==============================================================================
 # EMPLOYEE LEAVE - Individual employee leave/holidays
 # ==============================================================================
@@ -8300,6 +8438,52 @@ def delete_employee_leave(employee_id, leave_id):
         return jsonify({'success': True})
     except Exception as e:
         print(f"[Leave] Delete error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/employees/<employee_id>/leave/<leave_id>', methods=['PUT'])
+def update_employee_leave(employee_id, leave_id):
+    """Update leave record. Body: {date?, leave_type?, description?}."""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        data = request.json or {}
+        new_date = data.get('date')
+        new_type = data.get('leave_type')
+        new_desc = data.get('description')
+
+        if not new_date and not new_type and new_desc is None:
+            return jsonify({'success': False, 'error': 'Provide date, leave_type, or description to update'}), 400
+
+        sets = []
+        params = [
+            bigquery.ScalarQueryParameter("employee_id", "STRING", employee_id),
+            bigquery.ScalarQueryParameter("leave_id", "STRING", leave_id),
+        ]
+        if new_date:
+            if not validate_date_format(new_date):
+                return jsonify({'success': False, 'error': 'Invalid date format'}), 400
+            sets.append("leave_date = @new_date")
+            params.append(bigquery.ScalarQueryParameter("new_date", "DATE", new_date))
+        if new_type:
+            sets.append("leave_type = @new_type")
+            params.append(bigquery.ScalarQueryParameter("new_type", "STRING", new_type))
+        if new_desc is not None:
+            sets.append("description = @new_desc")
+            params.append(bigquery.ScalarQueryParameter("new_desc", "STRING", new_desc))
+
+        query = f"""
+        UPDATE `{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}`
+        SET {', '.join(sets)}
+        WHERE employee_id = @employee_id AND leave_id = @leave_id
+        """
+        client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Leave] Update error: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -8528,6 +8712,349 @@ def list_attendance_overrides():
         return jsonify({'success': True, 'overrides': overrides})
     except Exception as e:
         print(f"[Override] List error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
+# ATTENDANCE CONFLICT DETECTION - Find mismatches between leave/holiday and snapshots
+# ==============================================================================
+
+# Grace rules: configurable thresholds for attendance status
+# Default: <3hr = Absent, 3-6hr = Half Day, >6hr = Present
+DEFAULT_GRACE_RULES = {
+    'min_hours_present': 360,    # 6 hours in minutes for "Present"
+    'half_day_threshold': 180,   # 3 hours in minutes for "Half Day"
+    'absent_threshold': 180,     # Below this = Absent
+    'expected_arrival': '09:30',
+    'expected_departure': '18:30',
+    'late_grace_minutes': 15,
+    'early_logout_grace_minutes': 15,
+}
+
+
+def calculate_status_with_grace(active_mins, rules=None):
+    """Calculate attendance status based on grace rules.
+    < 3hr (180 min) = Absent
+    3-6hr (180-360 min) = Half Day
+    > 6hr (360 min) = Present
+    """
+    if rules is None:
+        rules = DEFAULT_GRACE_RULES
+    min_present = rules.get('min_hours_present', 360)
+    half_day = rules.get('half_day_threshold', 180)
+
+    if active_mins >= min_present:
+        return 'present'
+    elif active_mins >= half_day:
+        return 'half_day'
+    else:
+        return 'absent'
+
+
+@app.route('/admin/conflicts', methods=['GET'])
+def detect_attendance_conflicts():
+    """Detect conflicts between leave/holiday records and actual snapshots.
+    Returns cases where:
+    1. Leave marked but snapshots exist (person was present)
+    2. Holiday but snapshots exist (person worked on holiday)
+    Query params: ?date=YYYY-MM-DD or ?year=&month=
+    """
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        date = request.args.get('date')
+        year = request.args.get('year')
+        month = request.args.get('month')
+
+        if date:
+            start_date = date
+            end_date = date
+        elif year and month:
+            from calendar import monthrange
+            _, last_day = monthrange(int(year), int(month))
+            start_date = f"{year}-{int(month):02d}-01"
+            end_date = f"{year}-{int(month):02d}-{last_day:02d}"
+        else:
+            # Default: current month
+            now = get_ist_now()
+            from calendar import monthrange
+            _, last_day = monthrange(now.year, now.month)
+            start_date = f"{now.year}-{now.month:02d}-01"
+            end_date = f"{now.year}-{now.month:02d}-{last_day:02d}"
+
+        # Find leave records with actual snapshots (conflict: leave marked but present)
+        leave_conflict_query = f"""
+        WITH leave_records AS (
+            SELECT employee_name, leave_date, leave_type
+            FROM `{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}`
+            WHERE leave_date >= @start_date AND leave_date <= @end_date
+        ),
+        snapshot_presence AS (
+            SELECT
+                LOWER(TRIM(participant_name)) as name_key,
+                event_date,
+                COUNT(*) as snapshot_count,
+                CEILING(COUNT(*) * 0.5) as approx_mins
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date >= @start_date AND event_date <= @end_date
+              AND participant_name IS NOT NULL AND participant_name != ''
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+            GROUP BY name_key, event_date
+            HAVING COUNT(*) >= 6  -- At least 3 minutes of snapshots
+        )
+        SELECT
+            lr.employee_name,
+            FORMAT_DATE('%Y-%m-%d', lr.leave_date) as date,
+            lr.leave_type,
+            sp.snapshot_count,
+            sp.approx_mins,
+            'leave_but_present' as conflict_type
+        FROM leave_records lr
+        INNER JOIN snapshot_presence sp
+            ON LOWER(TRIM(lr.employee_name)) = sp.name_key
+            AND lr.leave_date = SAFE.PARSE_DATE('%Y-%m-%d', sp.event_date)
+        ORDER BY lr.leave_date DESC, lr.employee_name
+        """
+
+        params = [
+            bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+            bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+        ]
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        leave_conflicts = list(client.query(leave_conflict_query, job_config=job_config).result())
+
+        # Find holiday conflicts (someone worked on a team holiday)
+        holiday_conflict_query = f"""
+        WITH holidays AS (
+            SELECT team_id, holiday_date
+            FROM `{dataset_ref}.{BQ_TEAM_HOLIDAYS_TABLE}`
+            WHERE holiday_date >= @start_date AND holiday_date <= @end_date
+        ),
+        team_members AS (
+            SELECT tm.team_id, tm.participant_name, t.team_name
+            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
+            JOIN `{dataset_ref}.{BQ_TEAMS_TABLE}` t ON tm.team_id = t.team_id
+        ),
+        snapshot_presence AS (
+            SELECT
+                LOWER(TRIM(participant_name)) as name_key,
+                event_date,
+                COUNT(*) as snapshot_count
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date >= @start_date AND event_date <= @end_date
+              AND participant_name IS NOT NULL AND participant_name != ''
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+            GROUP BY name_key, event_date
+            HAVING COUNT(*) >= 6
+        )
+        SELECT
+            tm.participant_name as employee_name,
+            FORMAT_DATE('%Y-%m-%d', h.holiday_date) as date,
+            tm.team_name,
+            sp.snapshot_count,
+            'holiday_but_present' as conflict_type
+        FROM holidays h
+        INNER JOIN team_members tm ON h.team_id = tm.team_id
+        INNER JOIN snapshot_presence sp
+            ON LOWER(TRIM(tm.participant_name)) = sp.name_key
+            AND h.holiday_date = SAFE.PARSE_DATE('%Y-%m-%d', sp.event_date)
+        ORDER BY h.holiday_date DESC, tm.participant_name
+        """
+        holiday_conflicts = list(client.query(holiday_conflict_query, job_config=job_config).result())
+
+        conflicts = []
+        for r in leave_conflicts:
+            conflicts.append({
+                'employee_name': r.employee_name,
+                'date': r.date,
+                'conflict_type': 'leave_but_present',
+                'leave_type': r.leave_type,
+                'snapshot_count': r.snapshot_count,
+                'approx_mins': r.approx_mins,
+                'suggestion': f'Remove leave or add attendance override',
+            })
+        for r in holiday_conflicts:
+            conflicts.append({
+                'employee_name': r.employee_name,
+                'date': r.date,
+                'conflict_type': 'holiday_but_present',
+                'team_name': r.team_name,
+                'snapshot_count': r.snapshot_count,
+                'suggestion': f'Person worked on team holiday - may need attendance credit',
+            })
+
+        return jsonify({
+            'success': True,
+            'start_date': start_date,
+            'end_date': end_date,
+            'conflicts': conflicts,
+            'total': len(conflicts),
+        })
+    except Exception as e:
+        print(f"[Conflicts] Detection error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/grace-rules', methods=['GET'])
+def get_grace_rules():
+    """Get current grace rules configuration."""
+    return jsonify({
+        'success': True,
+        'rules': DEFAULT_GRACE_RULES,
+        'status_thresholds': {
+            'present': '>= 6 hours (360 mins)',
+            'half_day': '3-6 hours (180-360 mins)',
+            'absent': '< 3 hours (180 mins)',
+        }
+    })
+
+
+@app.route('/admin/teams-leave-summary', methods=['GET'])
+def teams_leave_summary():
+    """Get team-wise leave summary for all teams (box view like TeamView).
+    Shows per-team: total members, on leave today, present today, absent.
+    Query params: ?date=YYYY-MM-DD (defaults to today)
+    """
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        date = request.args.get('date', get_ist_date())
+        if not validate_date_format(date):
+            return jsonify({'success': False, 'error': 'Invalid date format'}), 400
+
+        # Get all teams with member counts
+        teams_query = f"""
+        SELECT
+            t.team_id,
+            t.team_name,
+            t.manager_name,
+            COUNT(DISTINCT tm.participant_name) as total_members
+        FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` t
+        LEFT JOIN `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm ON t.team_id = tm.team_id
+        GROUP BY t.team_id, t.team_name, t.manager_name
+        ORDER BY t.team_name
+        """
+        teams = list(client.query(teams_query).result())
+
+        # Get leave records for this date
+        leave_query = f"""
+        SELECT
+            tm.team_id,
+            el.employee_name,
+            el.leave_type
+        FROM `{dataset_ref}.{BQ_EMPLOYEE_LEAVE_TABLE}` el
+        JOIN `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
+            ON LOWER(TRIM(el.employee_name)) = LOWER(TRIM(tm.participant_name))
+        WHERE el.leave_date = @date
+        """
+        leave_rows = list(client.query(leave_query, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date)]
+        )).result())
+
+        # Group leave by team
+        leave_by_team = {}
+        for r in leave_rows:
+            if r.team_id not in leave_by_team:
+                leave_by_team[r.team_id] = []
+            leave_by_team[r.team_id].append({
+                'name': r.employee_name,
+                'leave_type': r.leave_type,
+            })
+
+        # Get snapshot presence for this date (who is actually present)
+        presence_query = f"""
+        SELECT
+            tm.team_id,
+            tm.participant_name,
+            COUNT(*) as snapshot_count,
+            CEILING(SUM(
+                CASE
+                    WHEN prev_time IS NULL THEN 0.5
+                    WHEN TIMESTAMP_DIFF(s.snapshot_time, prev_time, SECOND) <= 300 THEN
+                        TIMESTAMP_DIFF(s.snapshot_time, prev_time, SECOND) / 60.0
+                    ELSE 0.5
+                END
+            )) as active_mins
+        FROM (
+            SELECT
+                participant_name,
+                snapshot_time,
+                LAG(snapshot_time) OVER (PARTITION BY participant_name ORDER BY snapshot_time) as prev_time
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date = @date
+              AND participant_name IS NOT NULL
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+        ) s
+        JOIN `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
+            ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+        GROUP BY tm.team_id, tm.participant_name
+        """
+        presence_rows = list(client.query(presence_query, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date)]
+        )).result())
+
+        # Group presence by team
+        presence_by_team = {}
+        for r in presence_rows:
+            if r.team_id not in presence_by_team:
+                presence_by_team[r.team_id] = []
+            status = calculate_status_with_grace(r.active_mins or 0)
+            presence_by_team[r.team_id].append({
+                'name': r.participant_name,
+                'active_mins': r.active_mins or 0,
+                'status': status,
+            })
+
+        # Check for team holidays
+        holiday_query = f"""
+        SELECT team_id FROM `{dataset_ref}.{BQ_TEAM_HOLIDAYS_TABLE}`
+        WHERE holiday_date = @date
+        """
+        holiday_rows = list(client.query(holiday_query, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date)]
+        )).result())
+        teams_on_holiday = {r.team_id for r in holiday_rows}
+
+        # Build response
+        result = []
+        for t in teams:
+            tid = t.team_id
+            team_leave = leave_by_team.get(tid, [])
+            team_presence = presence_by_team.get(tid, [])
+            is_holiday = tid in teams_on_holiday
+
+            present_count = len([p for p in team_presence if p['status'] == 'present'])
+            half_day_count = len([p for p in team_presence if p['status'] == 'half_day'])
+            on_leave_count = len(team_leave)
+
+            result.append({
+                'team_id': tid,
+                'team_name': t.team_name,
+                'manager_name': t.manager_name or '',
+                'total_members': t.total_members or 0,
+                'is_holiday': is_holiday,
+                'present': present_count,
+                'half_day': half_day_count,
+                'on_leave': on_leave_count,
+                'absent': max(0, (t.total_members or 0) - present_count - half_day_count - on_leave_count),
+                'leave_details': team_leave,
+                'presence_details': team_presence,
+            })
+
+        return jsonify({
+            'success': True,
+            'date': date,
+            'teams': result,
+            'total_teams': len(result),
+        })
+    except Exception as e:
+        print(f"[Admin] Teams leave summary error: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
