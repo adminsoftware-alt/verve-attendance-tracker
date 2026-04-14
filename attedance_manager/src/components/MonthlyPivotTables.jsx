@@ -118,7 +118,7 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
         <IsolationPivot dates={dates} names={names} lookup={lookup} holidayMap={holidayMap} />
       )}
       {view === 'leaves' && (
-        <LeavesTable weekdays={weekdays} names={names} lookup={lookup} holidayMap={holidayMap} />
+        <LeavesTable dates={dates} weekdays={weekdays} names={names} lookup={lookup} holidayMap={holidayMap} />
       )}
     </div>
   );
@@ -312,88 +312,142 @@ function IsolationPivot({ dates, names, lookup, holidayMap = {} }) {
   );
 }
 
-// ─── Leaves table ────────────────────────────────────
-function LeavesTable({ weekdays, names, lookup, holidayMap = {} }) {
+// ─── Leaves pivot ────────────────────────────────────
+// One cell per (person, weekday) showing P / L / H, matching Hours Pivot.
+function LeavesTable({ dates, weekdays, names, lookup, holidayMap = {} }) {
   const holidayCount = Object.keys(holidayMap).length;
-  const rows = names.map(name => {
+  const workingDays = weekdays.length; // weekdays excludes holidays
+
+  // Per-person leave count (only counts non-holiday weekdays with hours < 1)
+  const leaveCountByName = {};
+  const presentCountByName = {};
+  names.forEach(name => {
+    let leaves = 0;
     let present = 0;
-    const absentDates = [];
     weekdays.forEach(ds => {
       const h = lookup[`${name}|${ds}`]?.hours || 0;
       if (h >= 1) present++;
-      else absentDates.push(ds);
+      else leaves++;
     });
-    const attPct = weekdays.length > 0 ? Math.round((present / weekdays.length) * 100) : 0;
-    return { name, present, leaves: absentDates.length, attPct, absentDates };
+    leaveCountByName[name] = leaves;
+    presentCountByName[name] = present;
   });
 
-  const totalWorking = weekdays.length * names.length;
-  const totalPresent = rows.reduce((s, r) => s + r.present, 0);
-  const totalLeaves = rows.reduce((s, r) => s + r.leaves, 0);
+  // Column totals: how many employees were on leave that day
+  const colLeaveTotals = dates.map(ds => {
+    if (holidayMap[ds]) return null; // holiday column
+    return names.reduce((acc, name) => {
+      const h = lookup[`${name}|${ds}`]?.hours || 0;
+      return acc + (h >= 1 ? 0 : 1);
+    }, 0);
+  });
+
+  const totalLeaves = Object.values(leaveCountByName).reduce((a, b) => a + b, 0);
 
   return (
     <div>
       <div style={s.legendBar}>
-        <LegendItem color="#fef3c7" border="#fcd34d" label="Has leaves" />
-        <LegendItem color="#fee2e2" border="#fca5a5" label="Attendance < 80%" />
-        <LegendItem color="#e0e7ff" border="#a5b4fc" label="Holiday" />
+        <LegendItem color="#dcfce7" border="#86efac" label="Present (P)" />
+        <LegendItem color="#fee2e2" border="#fca5a5" label="Leave (L)" />
+        <LegendItem color="#e0e7ff" border="#a5b4fc" label="Holiday (H)" />
         <span style={s.legendMeta}>
-          Working days: <strong>{weekdays.length}</strong>
+          Working days: <strong>{workingDays}</strong>
           {holidayCount > 0 && <> · Holidays: <strong>{holidayCount}</strong></>}
         </span>
       </div>
 
       <div style={s.tableWrap}>
-        <table style={s.leavesTable}>
+        <table style={s.pivotTable}>
           <thead>
             <tr>
-              <th style={s.th}>Name</th>
-              <th style={s.th}>Working Days</th>
-              <th style={s.th}>Days Present</th>
-              <th style={s.th}>Leave Days</th>
-              <th style={s.th}>Attendance %</th>
-              <th style={s.th}>Leave Dates</th>
+              <th style={s.stickyNameTh}>Name</th>
+              {dates.map(ds => {
+                const isHoliday = !!holidayMap[ds];
+                return (
+                  <th
+                    key={ds}
+                    style={{ ...s.dateTh, ...(isWeekend(ds) ? s.weekendTh : {}), ...(isHoliday ? s.holidayTh : {}) }}
+                    title={isHoliday ? `Holiday: ${holidayMap[ds]}` : ''}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 700 }}>{shortDay(ds)}</div>
+                    <div style={{ fontSize: 9, color: isHoliday ? '#4338ca' : '#94a3b8', fontWeight: 500 }}>
+                      {isHoliday ? 'Holiday' : dayOfWeek(ds)}
+                    </div>
+                  </th>
+                );
+              })}
+              <th style={s.totalTh}>Leaves</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map((r, i) => {
-              const lowAtt = r.attPct < 80;
+            {names.map((name, nIdx) => {
+              const personLeaves = leaveCountByName[name] || 0;
+              const attPct = workingDays > 0
+                ? Math.round((presentCountByName[name] / workingDays) * 100)
+                : 0;
+              const lowAtt = attPct < 80;
               return (
-                <tr key={r.name} style={i % 2 === 0 ? s.trEven : {}}>
-                  <td style={{ ...s.td, fontWeight: 600 }}>{r.name}</td>
-                  <td style={s.td}>{weekdays.length}</td>
-                  <td style={s.td}>{r.present}</td>
-                  <td style={{
-                    ...s.td,
-                    background: r.leaves > 0 ? '#fef3c7' : undefined,
-                    color: r.leaves > 0 ? '#92400e' : undefined,
-                    fontWeight: r.leaves > 0 ? 700 : 400,
-                  }}>
-                    {r.leaves}
+                <tr key={name} style={nIdx % 2 === 0 ? s.trEven : {}}>
+                  <td style={s.stickyNameTd}>
+                    <div style={{ fontWeight: 600 }}>{name}</div>
+                    <div style={{ fontSize: 10, color: lowAtt ? '#b91c1c' : '#94a3b8', fontWeight: 500 }}>
+                      {attPct}% attendance
+                    </div>
                   </td>
+                  {dates.map(ds => {
+                    const isHoliday = !!holidayMap[ds];
+                    if (isHoliday) {
+                      return (
+                        <td
+                          key={ds}
+                          style={{ ...s.cellTd, background: '#e0e7ff', color: '#4338ca', fontWeight: 700 }}
+                          title={holidayMap[ds]}
+                        >H</td>
+                      );
+                    }
+                    const h = lookup[`${name}|${ds}`]?.hours || 0;
+                    if (h >= 1) {
+                      return (
+                        <td
+                          key={ds}
+                          style={{ ...s.cellTd, background: '#dcfce7', color: '#15803d', fontWeight: 700 }}
+                        >P</td>
+                      );
+                    }
+                    return (
+                      <td
+                        key={ds}
+                        style={{ ...s.cellTd, background: '#fee2e2', color: '#b91c1c', fontWeight: 700 }}
+                      >L</td>
+                    );
+                  })}
                   <td style={{
-                    ...s.td,
-                    background: lowAtt ? '#fee2e2' : undefined,
-                    color: lowAtt ? '#b91c1c' : undefined,
-                    fontWeight: lowAtt ? 700 : 500,
+                    ...s.totalTd,
+                    background: personLeaves > 0 ? '#fef3c7' : '#e2e8f0',
+                    color: personLeaves > 0 ? '#92400e' : '#0f172a',
                   }}>
-                    {r.attPct}%
-                  </td>
-                  <td style={{ ...s.td, fontSize: 11, color: '#64748b', maxWidth: 420 }}>
-                    {r.absentDates.length > 0
-                      ? r.absentDates.map(d => d.slice(5)).join(', ')
-                      : '—'}
+                    {personLeaves}
                   </td>
                 </tr>
               );
             })}
             <tr style={s.grandRow}>
-              <td style={{ ...s.td, background: '#e2e8f0', fontWeight: 800 }}>Total</td>
-              <td style={{ ...s.td, background: '#e2e8f0', fontWeight: 700 }}>{totalWorking}</td>
-              <td style={{ ...s.td, background: '#e2e8f0', fontWeight: 700 }}>{totalPresent}</td>
-              <td style={{ ...s.td, background: '#e2e8f0', fontWeight: 700 }}>{totalLeaves}</td>
-              <td style={{ ...s.td, background: '#e2e8f0' }}></td>
-              <td style={{ ...s.td, background: '#e2e8f0' }}></td>
+              <td style={{ ...s.stickyNameTd, background: '#e2e8f0', fontWeight: 800 }}>Total Leaves</td>
+              {dates.map((ds, i) => {
+                const isHoliday = !!holidayMap[ds];
+                const total = colLeaveTotals[i];
+                return (
+                  <td key={ds} style={{
+                    ...s.cellTd,
+                    background: isHoliday ? '#c7d2fe' : '#e2e8f0',
+                    color: isHoliday ? '#3730a3' : '#0f172a',
+                    fontWeight: 700,
+                  }}>
+                    {isHoliday ? 'H' : total}
+                  </td>
+                );
+              })}
+              <td style={{ ...s.totalTd, background: '#cbd5e1', fontWeight: 800 }}>{totalLeaves}</td>
             </tr>
           </tbody>
         </table>
