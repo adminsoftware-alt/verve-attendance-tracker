@@ -74,14 +74,6 @@ export async function getAllData() {
   console.warn('getAllData() is deprecated - use getUploadedDates() + getDayData() for lazy loading');
   // Return empty - data should be loaded on-demand per date
   return {};
-  } catch (err) {
-    console.error('Attendance API error, using fallback:', err);
-    // Fallback: localStorage
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : {};
-    } catch { return {}; }
-  }
 }
 
 export async function getDayData(dateStr) {
