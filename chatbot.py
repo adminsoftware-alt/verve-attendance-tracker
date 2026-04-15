@@ -34,7 +34,7 @@ except Exception:
     _GEMINI_AVAILABLE = False
 
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
-GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-1.5-flash').strip()
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash').strip()
 CHAT_SECRET = os.environ.get('CHAT_SECRET', 'change-me-please').strip()
 
 if _GEMINI_AVAILABLE and GEMINI_API_KEY:
