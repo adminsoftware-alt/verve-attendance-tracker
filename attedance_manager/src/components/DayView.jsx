@@ -107,8 +107,7 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
   return (
     <div>
       <div style={s.dateNav}>
-        <button onClick={() => changeDate(-1)} style={s.arrowBtn}
-          disabled={uploadedDates.indexOf(date) <= 0}>{'\u2190'}</button>
+        <button onClick={() => changeDate(-1)} style={s.arrowBtn}>{'\u2190'}</button>
         <div style={s.dateCenter}>
           <input type="date" value={date}
             onChange={(e) => { setDate(e.target.value); setExpanded(null); }}
@@ -118,7 +117,7 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
           </div>
         </div>
         <button onClick={() => changeDate(1)} style={s.arrowBtn}
-          disabled={uploadedDates.indexOf(date) >= uploadedDates.length - 1}>{'\u2192'}</button>
+          disabled={date >= today}>{'\u2192'}</button>
       </div>
 
       {!employees.length ? (

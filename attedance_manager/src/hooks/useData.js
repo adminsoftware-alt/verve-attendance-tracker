@@ -91,12 +91,38 @@ export function useDayData(dateStr, refreshKey) {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    getDayData(dateStr).then(result => {
+
+    // 1) try uploaded CSV data first; 2) fall back to Zoom summary (SDK snapshots);
+    // 3) then live rooms. This lets users navigate any past date with arrows and
+    // still see room history even if no CSV was uploaded.
+    (async () => {
+      let result = null;
+      try {
+        result = await getDayData(dateStr);
+      } catch (e) { /* ignore, try API */ }
+
+      if (!result || result.length === 0) {
+        try {
+          const summary = await fetchSummary(dateStr);
+          const emps = transformSummaryToEmployees(summary);
+          if (emps.length > 0) result = emps;
+        } catch (e) { /* try live */ }
+      }
+
+      if (!result || result.length === 0) {
+        try {
+          const live = await fetchLiveRooms(dateStr);
+          const emps = transformLiveToEmployees(live);
+          if (emps.length > 0) result = emps;
+        } catch (e) { /* no data */ }
+      }
+
       if (!cancelled) {
         setEmployees(mergeDayEmployees(result || []));
         setLoading(false);
       }
-    });
+    })();
+
     return () => { cancelled = true; };
   }, [dateStr, refreshKey]);
 
