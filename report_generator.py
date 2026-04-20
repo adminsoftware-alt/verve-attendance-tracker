@@ -196,7 +196,11 @@ def generate_daily_report(report_date=None):
     -- ==========================================================
     participant_name_map AS (
       SELECT DISTINCT
-        COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
+        COALESCE(
+          NULLIF(participant_uuid, ''),
+          NULLIF(LOWER(TRIM(participant_email)), ''),
+          LOWER(TRIM(participant_name))
+        ) as participant_key,
         LOWER(TRIM(participant_name)) as name_key
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
       WHERE event_date = '{report_date}'
@@ -230,7 +234,11 @@ def generate_daily_report(report_date=None):
     -- ==========================================================
     snapshot_clean AS (
       SELECT
-        COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
+        COALESCE(
+          NULLIF(participant_uuid, ''),
+          NULLIF(LOWER(TRIM(participant_email)), ''),
+          LOWER(TRIM(participant_name))
+        ) as participant_key,
         participant_name,
         COALESCE(NULLIF(participant_email, ''), '') as participant_email,
         room_name,
@@ -240,7 +248,11 @@ def generate_daily_report(report_date=None):
         AND participant_name IS NOT NULL AND participant_name != ''
         AND room_name IS NOT NULL AND room_name != ''
       QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))),
+        PARTITION BY COALESCE(
+          NULLIF(participant_uuid, ''),
+          NULLIF(LOWER(TRIM(participant_email)), ''),
+          LOWER(TRIM(participant_name))
+        ),
                      snapshot_time
         ORDER BY
           CASE WHEN LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
@@ -290,10 +302,18 @@ def generate_daily_report(report_date=None):
         room_name,
         MIN(snapshot_time) as join_time,
         MAX(snapshot_time) as leave_time,
-        TIMESTAMP_DIFF(MAX(snapshot_time), MIN(snapshot_time), MINUTE) as duration_mins
+        -- Use interval-sum (not span) so gaps within a visit are handled correctly
+        CEILING(SUM(
+          CASE
+            WHEN prev_snapshot_time IS NULL THEN 0
+            WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) <= 300 THEN
+              TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) / 60.0
+            ELSE 0
+          END
+        )) as duration_mins
       FROM visit_groups_raw
       GROUP BY participant_key, room_name, visit_id
-      HAVING TIMESTAMP_DIFF(MAX(snapshot_time), MIN(snapshot_time), MINUTE) > 0
+      HAVING COUNT(*) > 1  -- Need at least 2 snapshots for a meaningful visit
     ),
     -- ==========================================================
     -- STEP 4: Re-merge consecutive same-room visits
@@ -330,7 +350,8 @@ def generate_daily_report(report_date=None):
         MAX(leave_time) as leave_time,
         FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(join_time), INTERVAL 330 MINUTE)) as room_joined_ist,
         FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(leave_time), INTERVAL 330 MINUTE)) as room_left_ist,
-        TIMESTAMP_DIFF(MAX(leave_time), MIN(join_time), MINUTE) as duration_mins
+        -- Sum actual durations from room_visits_raw (already interval-based)
+        SUM(duration_mins) as duration_mins
       FROM remerge_groups
       GROUP BY participant_key, room_name, merge_group
     )

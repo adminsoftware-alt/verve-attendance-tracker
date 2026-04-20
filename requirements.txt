@@ -24,5 +24,8 @@ sendgrid==6.10.0
 # Cloud Functions (for scheduled reports)
 functions-framework==3.5.0
 
-# Chatbot (Gemini intent routing)
+# Chatbot LLM (Groq default; also used for xAI / OpenAI via base_url override)
+openai>=1.40.0
+
+# Chatbot (optional Gemini provider — kept for backwards compat)
 google-generativeai==0.8.3

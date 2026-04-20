@@ -1,7 +1,8 @@
 """
 CHATBOT — natural-language routing for the attendance tracker.
-Uses Gemini 1.5 Flash to classify a user's prompt into an intent + parameters,
-then dispatches to handler functions that reuse existing endpoints.
+Uses an LLM (Groq by default; Gemini / xAI / OpenAI also supported) to classify
+a user's prompt into an intent + parameters, then dispatches to handler
+functions that reuse existing endpoints.
 
 Intents fall into three families:
   - read    → fetch & summarise data (anyone)
@@ -24,25 +25,143 @@ import hashlib
 from datetime import datetime, timedelta
 from calendar import monthrange
 
-# Gemini SDK is optional — if the key is missing we fall back to a regex-only
-# intent classifier so the chatbot still does something useful.
-try:
-    import google.generativeai as genai
-    _GEMINI_AVAILABLE = True
-except Exception:
-    genai = None
-    _GEMINI_AVAILABLE = False
+# ════════════════════════════════════════════════════════════
+# LLM PROVIDER ABSTRACTION
+# ════════════════════════════════════════════════════════════
+# Supports Groq (default — free tier), Gemini, xAI, or any OpenAI-compatible
+# endpoint. Provider is chosen by LLM_PROVIDER env var; the first available key
+# wins if unset. All providers except Gemini go through the OpenAI SDK since
+# Groq/xAI/OpenAI expose the same chat-completions shape.
 
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
-GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash').strip()
+_PROVIDER_DEFAULTS = {
+    'groq':   {'base_url': 'https://api.groq.com/openai/v1',      'model': 'llama-3.3-70b-versatile'},
+    'xai':    {'base_url': 'https://api.x.ai/v1',                 'model': 'grok-2-latest'},
+    'openai': {'base_url': 'https://api.openai.com/v1',           'model': 'gpt-4o-mini'},
+    'gemini': {'base_url': None,                                   'model': 'gemini-2.0-flash'},
+}
+
+def _pick_provider():
+    """Pick provider from env. Priority: LLM_PROVIDER var > first configured key."""
+    explicit = os.environ.get('LLM_PROVIDER', '').strip().lower()
+    if explicit in _PROVIDER_DEFAULTS:
+        return explicit
+    for p, envvar in [('groq', 'GROQ_API_KEY'), ('xai', 'XAI_API_KEY'),
+                      ('openai', 'OPENAI_API_KEY'), ('gemini', 'GEMINI_API_KEY')]:
+        if os.environ.get(envvar, '').strip():
+            return p
+    return 'groq'
+
+LLM_PROVIDER = _pick_provider()
+LLM_API_KEY = (
+    os.environ.get('LLM_API_KEY', '').strip()
+    or os.environ.get(f'{LLM_PROVIDER.upper()}_API_KEY', '').strip()
+)
+LLM_MODEL = (
+    os.environ.get('LLM_MODEL', '').strip()
+    or _PROVIDER_DEFAULTS[LLM_PROVIDER]['model']
+)
+LLM_BASE_URL = (
+    os.environ.get('LLM_BASE_URL', '').strip()
+    or _PROVIDER_DEFAULTS[LLM_PROVIDER]['base_url']
+)
+
 CHAT_SECRET = os.environ.get('CHAT_SECRET', 'change-me-please').strip()
 
-if _GEMINI_AVAILABLE and GEMINI_API_KEY:
+# Backwards-compat: legacy GEMINI_MODEL overrides LLM_MODEL when provider=gemini
+if LLM_PROVIDER == 'gemini':
+    _legacy_gemini_model = os.environ.get('GEMINI_MODEL', '').strip()
+    if _legacy_gemini_model:
+        LLM_MODEL = _legacy_gemini_model
+
+# ── Init the right SDK ────────────────────────────────────────
+_openai_client = None
+_gemini_available = False
+genai = None
+
+if LLM_PROVIDER == 'gemini':
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
+        import google.generativeai as _genai
+        genai = _genai
+        if LLM_API_KEY:
+            genai.configure(api_key=LLM_API_KEY)
+            _gemini_available = True
     except Exception as e:
-        print(f"[Chatbot] Gemini configure failed: {e}")
-        _GEMINI_AVAILABLE = False
+        print(f"[Chatbot] Gemini SDK init failed: {e}")
+else:
+    try:
+        from openai import OpenAI
+        if LLM_API_KEY:
+            _openai_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    except Exception as e:
+        print(f"[Chatbot] OpenAI SDK init failed: {e}")
+
+_LLM_READY = bool(_openai_client or _gemini_available)
+print(f"[Chatbot] Provider={LLM_PROVIDER} model={LLM_MODEL} ready={_LLM_READY}")
+
+
+def llm_generate_json(prompt, max_tokens=256):
+    """Call the LLM and return parsed JSON (dict) or None on failure.
+    Uses JSON-mode when the provider supports it."""
+    if not _LLM_READY:
+        return None
+    try:
+        if LLM_PROVIDER == 'gemini':
+            model = genai.GenerativeModel(LLM_MODEL)
+            resp = model.generate_content(
+                prompt,
+                generation_config={
+                    'temperature': 0.0,
+                    'max_output_tokens': max_tokens,
+                    'response_mime_type': 'application/json',
+                },
+            )
+            text = (resp.text or '').strip()
+        else:
+            resp = _openai_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{'role': 'user', 'content': prompt}],
+                temperature=0.0,
+                max_tokens=max_tokens,
+                response_format={'type': 'json_object'},
+            )
+            text = (resp.choices[0].message.content or '').strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"[Chatbot] llm_generate_json failed: {e}")
+        return None
+
+
+def llm_chat(system_prompt, history, user_prompt, max_tokens=512):
+    """Free-form chat with short history. Returns reply text or raises."""
+    if not _LLM_READY:
+        raise RuntimeError('LLM not configured')
+
+    if LLM_PROVIDER == 'gemini':
+        model = genai.GenerativeModel(LLM_MODEL, system_instruction=system_prompt)
+        history_turns = []
+        for h in (history or [])[-6:]:
+            role = 'user' if h.get('role') == 'user' else 'model'
+            txt = (h.get('message') or '').strip()
+            if txt:
+                history_turns.append({'role': role, 'parts': [txt]})
+        chat = model.start_chat(history=history_turns)
+        resp = chat.send_message(user_prompt, generation_config={
+            'temperature': 0.4, 'max_output_tokens': max_tokens,
+        })
+        return (resp.text or '').strip()
+    else:
+        messages = [{'role': 'system', 'content': system_prompt}]
+        for h in (history or [])[-6:]:
+            role = 'user' if h.get('role') == 'user' else 'assistant'
+            txt = (h.get('message') or '').strip()
+            if txt:
+                messages.append({'role': role, 'content': txt})
+        messages.append({'role': 'user', 'content': user_prompt})
+        resp = _openai_client.chat.completions.create(
+            model=LLM_MODEL, messages=messages,
+            temperature=0.4, max_tokens=max_tokens,
+        )
+        return (resp.choices[0].message.content or '').strip()
 
 
 # ════════════════════════════════════════════════════════════
@@ -120,29 +239,17 @@ User prompt:
 
 
 def classify_intent_with_gemini(prompt, today_iso):
-    """Call Gemini and return {intent, params, confidence}. Falls back to a
-    regex-only classifier if Gemini is unavailable or the response can't be
-    parsed."""
-    if _GEMINI_AVAILABLE and GEMINI_API_KEY:
-        try:
-            full_prompt = INTENT_SPEC.replace('{today}', today_iso) + prompt
-            model = genai.GenerativeModel(GEMINI_MODEL)
-            resp = model.generate_content(
-                full_prompt,
-                generation_config={
-                    'temperature': 0.0,
-                    'max_output_tokens': 256,
-                    'response_mime_type': 'application/json',
-                },
-            )
-            text = (resp.text or '').strip()
-            data = json.loads(text)
-            if isinstance(data, dict) and 'intent' in data:
-                data.setdefault('params', {})
-                data.setdefault('confidence', 0.7)
-                return data
-        except Exception as e:
-            print(f"[Chatbot] Gemini classification failed: {e} — falling back to regex")
+    """Call the LLM and return {intent, params, confidence}. Falls back to a
+    regex-only classifier if the LLM is unavailable or the response can't be
+    parsed. Name kept for backwards compatibility — underlying LLM is
+    configurable via LLM_PROVIDER."""
+    if _LLM_READY:
+        full_prompt = INTENT_SPEC.replace('{today}', today_iso) + prompt
+        data = llm_generate_json(full_prompt, max_tokens=256)
+        if isinstance(data, dict) and 'intent' in data:
+            data.setdefault('params', {})
+            data.setdefault('confidence', 0.7)
+            return data
     return _regex_fallback(prompt, today_iso)
 
 
@@ -659,11 +766,11 @@ def h_general_chat(params, ctx):
     if not prompt:
         return {'message': "Ask me anything about attendance, teams, exports, or overrides."}
 
-    # If Gemini is unavailable, return a fixed help message.
-    if not (_GEMINI_AVAILABLE and GEMINI_API_KEY):
+    # If no LLM is configured, return a fixed help message.
+    if not _LLM_READY:
         return {
             'message': (
-                "I can answer attendance questions when Gemini is configured. "
+                "I can answer attendance questions when an LLM is configured. "
                 "Right now I only handle direct commands — try:\n"
                 "• show Shashank attendance\n"
                 "• team Accurest April summary\n"
@@ -685,24 +792,25 @@ def h_general_chat(params, ctx):
     )
 
     try:
-        model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=primer)
-        # Build short history (last 6) as Gemini chat turns
-        history_turns = []
-        for h in (history or [])[-6:]:
-            role = 'user' if h.get('role') == 'user' else 'model'
-            txt = (h.get('message') or '').strip()
-            if txt:
-                history_turns.append({'role': role, 'parts': [txt]})
-        chat = model.start_chat(history=history_turns)
-        resp = chat.send_message(prompt, generation_config={
-            'temperature': 0.4,
-            'max_output_tokens': 512,
-        })
-        text = (resp.text or '').strip() or "I'm not sure how to answer that."
-        return {'message': text}
+        text = llm_chat(primer, history, prompt, max_tokens=512)
+        return {'message': text or "I'm not sure how to answer that."}
     except Exception as e:
         print(f"[Chatbot] general_chat failed: {e}")
-        return {'message': f"Sorry, I couldn't answer that just now ({e})."}
+        err_str = str(e)
+        if '429' in err_str or 'quota' in err_str.lower() or 'rate' in err_str.lower():
+            msg = "I'm temporarily rate-limited by the AI service. Please retry in a minute, or use direct commands:"
+        elif '404' in err_str or 'not found' in err_str.lower():
+            msg = "The AI model is unavailable right now. You can still use direct commands:"
+        else:
+            msg = "I couldn't reach the AI service. You can still use direct commands:"
+        return {'message': (
+            f"{msg}\n"
+            "• show <name> attendance\n"
+            "• team <team> summary\n"
+            "• attendance for <date>\n"
+            "• download <name> April\n"
+            "• mark <name> present on <date> (admin)"
+        )}
 
 
 INTENTS = {

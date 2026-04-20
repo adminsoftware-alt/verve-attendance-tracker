@@ -94,18 +94,22 @@ def normalize_participant_name(name):
     'CS Shweta Tulsani-KPRC' -> 'CS Shweta Tulsani'
     'Gayatri Dabi - KPRC' -> 'Gayatri Dabi'
     'Ronit 2' -> 'Ronit'
+    Preserves legitimate hyphenated surnames:
+    'Priya Sharma-Gupta' -> 'Priya Sharma-Gupta' (kept)
     """
     if not name:
         return name
     n = name.strip()
-    # Remove trailing " - TEXT" (space dash space suffix)
+    # Remove trailing " - TEXT" (space dash space suffix, always organizational)
     n = _re.sub(r'\s+-\s+\w+$', '', n)
     # Remove trailing "-N" (number suffix like -1, -2, -5)
     n = _re.sub(r'-\d+$', '', n)
     # Remove trailing "_text" (underscore suffix like _accurest, _KPRC)
     n = _re.sub(r'_\w+$', '', n)
-    # Remove trailing "-text" (dash suffix like -Meeting, -KPRC, -Vridam)
-    n = _re.sub(r'-[A-Za-z]\w*$', '', n)
+    # Remove trailing "-TEXT" ONLY if the suffix is ALL-CAPS (2+ chars, like -KPRC)
+    # Preserves legitimate hyphenated surnames like Sharma-Gupta, Mary-Jane.
+    # Mixed-case org tags (e.g. -Meeting, -Vridam) are handled by _strip_team_and_clean().
+    n = _re.sub(r'-[A-Z]{2,}$', '', n)
     # Remove trailing " N" where N is a single digit (like "Ronit 2")
     n = _re.sub(r'\s+\d$', '', n)
     return n.strip()
@@ -5690,10 +5694,27 @@ def attendance_live():
         total_people = sum(r['participant_count'] for r in rooms)
         occupied_count = sum(1 for r in rooms if r['participant_count'] > 0)
 
+        # Staleness check: warn if data is older than 5 minutes
+        data_status = 'NO_DATA'
+        stale_seconds = None
+        if snapshot_time:
+            try:
+                from datetime import datetime
+                st_parsed = datetime.fromisoformat(snapshot_time.replace('Z', '+00:00')) if 'T' in snapshot_time else datetime.strptime(snapshot_time, '%Y-%m-%d %H:%M:%S.%f %Z') if ' ' in snapshot_time else None
+                if st_parsed is None:
+                    st_parsed = datetime.strptime(snapshot_time[:19], '%Y-%m-%d %H:%M:%S')
+                age = (datetime.utcnow() - st_parsed.replace(tzinfo=None)).total_seconds()
+                stale_seconds = int(age)
+                data_status = 'HEALTHY' if age < 300 else 'STALE'
+            except Exception:
+                data_status = 'UNKNOWN'
+
         return jsonify({
             'success': True,
             'date': target_date,
             'snapshot_time': snapshot_time,
+            'data_status': data_status,
+            'stale_seconds': stale_seconds,
             'total_rooms': len(rooms),
             'total_rooms_occupied': occupied_count,
             'total_participants': total_people,
@@ -5867,10 +5888,10 @@ def attendance_summary(date=None):
             -- Calculate actual duration: sum small gaps, not total span
             CEILING(SUM(
               CASE
-                WHEN prev_snapshot_time IS NULL THEN 0.5  -- First snapshot in visit = 30 seconds
+                WHEN prev_snapshot_time IS NULL THEN 0  -- First snapshot is start marker only
                 WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) <= 300 THEN
                   TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) / 60.0
-                ELSE 0.5  -- Should not happen due to visit_id split, but fallback
+                ELSE 0  -- Should not happen due to visit_id split, but fallback
               END
             )) as room_duration_mins,
             visit_id
@@ -5949,6 +5970,8 @@ def attendance_summary(date=None):
           UNION ALL
 
           -- Between breakout rooms (gaps = returns to main room)
+          -- Only count gaps > 2 minutes as Main Room visits; shorter gaps are
+          -- just SDK polling jitter during room transitions.
           SELECT
             bwn.participant_key,
             '0.Main Room' as room_name,
@@ -5957,7 +5980,7 @@ def attendance_summary(date=None):
             TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) as duration_mins
           FROM breakout_with_next bwn
           WHERE bwn.next_join IS NOT NULL
-            AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) > 0
+            AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) > 2
 
           UNION ALL
 
@@ -6848,6 +6871,7 @@ def team_attendance(team_id, date):
             WHERE s.event_date = @report_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
             -- Dedupe: one row per (participant, snapshot_time). Prevents the
             -- SDK-transition case where a user appears in two rooms at once.
             QUALIFY ROW_NUMBER() OVER (
@@ -6857,6 +6881,19 @@ def team_attendance(team_id, date):
                     CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
                     s.room_name
             ) = 1
+        ),
+        -- Break time from BREAK TIME room visits
+        break_room_summary AS (
+            SELECT
+                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                COUNT(*) * 30 as break_room_seconds
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_member_keys tmk
+                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+            WHERE s.event_date = @report_date
+              AND s.participant_name IS NOT NULL AND s.participant_name != ''
+              AND LOWER(s.room_name) LIKE '%break time%'
+            GROUP BY participant_key
         ),
         -- Track gaps between consecutive snapshots
         snapshots_with_gap AS (
@@ -6881,10 +6918,10 @@ def team_attendance(team_id, date):
                 -- Large gaps (>5 mins) indicate person left meeting, don't count that time
                 CEILING(SUM(
                     CASE
-                        WHEN prev_snapshot_time IS NULL THEN 30  -- First snapshot = 30 seconds
+                        WHEN prev_snapshot_time IS NULL THEN 0  -- First snapshot is start marker only
                         WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) <= 300 THEN
                             TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND)
-                        ELSE 30  -- After long gap, just count this snapshot's 30 seconds
+                        ELSE 0  -- After long gap, start marker for new presence period
                     END
                 ) / 60.0) as total_active_mins,
                 COUNT(DISTINCT snapshot_time) as snapshot_count
@@ -6905,13 +6942,13 @@ def team_attendance(team_id, date):
                 TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) as gap_seconds
             FROM participant_snapshots
             WHERE prev_snapshot IS NOT NULL
-              AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60
+              AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
         ),
         break_summary AS (
             SELECT
                 participant_key,
-                SUM(CASE WHEN gap_seconds > 60 THEN gap_seconds - 30 ELSE 0 END) as total_break_seconds,
-                COUNT(CASE WHEN gap_seconds > 60 THEN 1 END) as break_count
+                SUM(CASE WHEN gap_seconds > 300 THEN gap_seconds - 30 ELSE 0 END) as total_break_seconds,
+                COUNT(CASE WHEN gap_seconds > 300 THEN 1 END) as break_count
             FROM break_gaps
             GROUP BY participant_key
         ),
@@ -6973,7 +7010,7 @@ def team_attendance(team_id, date):
             FORMAT_TIMESTAMP('%H:%M', ps.last_seen) as last_seen_ist,
             ps.total_active_mins,
             ps.snapshot_count,
-            COALESCE(bs.total_break_seconds, 0) as break_seconds,
+            COALESCE(bs.total_break_seconds, 0) + COALESCE(brs.break_room_seconds, 0) as break_seconds,
             COALESCE(bs.break_count, 0) as break_count,
             COALESCE(iso.isolation_seconds, 0) as isolation_seconds,
             FORMAT_TIMESTAMP('%H:%M', wt.meeting_joined) as meeting_joined_ist,
@@ -6982,10 +7019,13 @@ def team_attendance(team_id, date):
                  THEN TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE)
                  ELSE 0 END as meeting_duration_mins,
             CASE WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
-                 THEN GREATEST(TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE) - ps.total_active_mins, 0)
+                 THEN GREATEST(TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE)
+                               - ps.total_active_mins
+                               - COALESCE(brs.break_room_seconds, 0) / 60, 0)
                  ELSE 0 END as main_room_mins
         FROM participant_summary ps
         LEFT JOIN break_summary bs ON ps.participant_key = bs.participant_key
+        LEFT JOIN break_room_summary brs ON ps.participant_key = brs.participant_key
         LEFT JOIN isolation_summary iso ON ps.participant_key = iso.participant_key
         LEFT JOIN webhook_times wt ON ps.participant_key = wt.participant_key
         ORDER BY ps.participant_name
@@ -7056,6 +7096,7 @@ def team_attendance(team_id, date):
             FROM with_next
             WHERE event_type IN ('participant_left', 'meeting.participant_left')
               AND next_event_type IN ('participant_joined', 'meeting.participant_joined')
+              AND TIMESTAMP_DIFF(next_event_ts, event_ts, MINUTE) > 5
         ),
         break_totals AS (
             SELECT participant_name, SUM(gap_mins) as break_mins
@@ -7196,17 +7237,22 @@ def team_attendance(team_id, date):
             )).result())
 
             # Build override map (latest override wins for each employee)
+            # Index by both raw and normalized name so merged records match
             override_map = {}
             for ov in override_rows:
                 name_key = ov.employee_name.lower().strip()
                 if name_key not in override_map:
                     override_map[name_key] = ov
+                norm_key = normalize_participant_name(ov.employee_name).lower().strip()
+                if norm_key and norm_key not in override_map:
+                    override_map[norm_key] = ov
 
-            # Apply overrides to participants
+            # Apply overrides to participants - try raw name, then normalized
             for p in participants:
-                name_key = p['name'].lower().strip()
-                if name_key in override_map:
-                    ov = override_map[name_key]
+                raw_key = p['name'].lower().strip()
+                norm_key = normalize_participant_name(p['name']).lower().strip()
+                ov = override_map.get(raw_key) or override_map.get(norm_key)
+                if ov:
                     if ov.first_seen_ist:
                         p['first_seen_ist'] = ov.first_seen_ist
                     if ov.last_seen_ist:
@@ -7335,10 +7381,10 @@ def team_attendance_range(team_id):
                 -- Actual active time: sum consecutive intervals where gap < 5 mins
                 CEILING(SUM(
                     CASE
-                        WHEN prev_snapshot IS NULL THEN 0.5  -- First snapshot = 30 seconds
+                        WHEN prev_snapshot IS NULL THEN 0  -- First snapshot is start marker only
                         WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300 THEN
                             TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                        ELSE 0.5  -- After long gap, just count this snapshot
+                        ELSE 0  -- After long gap, start marker for new presence period
                     END
                 )) as active_mins,
                 COUNT(DISTINCT snapshot_time) as snapshot_count
@@ -7349,9 +7395,9 @@ def team_attendance_range(team_id):
             SELECT
                 event_date,
                 participant_key,
-                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60
+                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
                     THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_seconds,
-                COUNT(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60 THEN 1 END) as break_count
+                COUNT(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300 THEN 1 END) as break_count
             FROM ordered_snaps
             WHERE prev_snapshot IS NOT NULL
             GROUP BY event_date, participant_key
@@ -7621,13 +7667,13 @@ def compare_teams():
                     -- Actual active time: sum consecutive intervals where gap < 5 mins
                     CEILING(SUM(
                         CASE
-                            WHEN prev_snapshot IS NULL THEN 0.5  -- First snapshot = 30 seconds
+                            WHEN prev_snapshot IS NULL THEN 0  -- First snapshot is start marker only
                             WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300 THEN
                                 TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                            ELSE 0.5  -- After long gap, just count this snapshot
+                            ELSE 0  -- After long gap, start marker for new presence period
                         END
                     )) as active_mins,
-                    SUM(CASE WHEN prev_snapshot IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60
+                    SUM(CASE WHEN prev_snapshot IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
                         THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_secs
                 FROM snaps
                 GROUP BY participant_key
@@ -7795,7 +7841,7 @@ def team_monthly_report(team_id):
             SELECT
                 event_date,
                 participant_key,
-                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 60
+                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
                     THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_seconds
             FROM ordered_snaps
             WHERE prev_snapshot IS NOT NULL
@@ -9057,7 +9103,7 @@ def teams_leave_summary():
             COUNT(*) as snapshot_count,
             CEILING(SUM(
                 CASE
-                    WHEN prev_time IS NULL THEN 0.5
+                    WHEN prev_time IS NULL THEN 0
                     WHEN TIMESTAMP_DIFF(s.snapshot_time, prev_time, SECOND) <= 300 THEN
                         TIMESTAMP_DIFF(s.snapshot_time, prev_time, SECOND) / 60.0
                     ELSE 0.5
@@ -10610,6 +10656,7 @@ def list_unrecognized_monthly():
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
               AND LOWER(s.room_name) != 'main room'
               AND LOWER(s.room_name) NOT LIKE '0.main%'
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY s.event_date, LOWER(TRIM(s.participant_name)), s.snapshot_time
                 ORDER BY s.room_name
@@ -10639,7 +10686,7 @@ def list_unrecognized_monthly():
                 MAX(snapshot_ist) as last_seen,
                 CEILING(SUM(
                     CASE
-                        WHEN prev_time IS NULL THEN 0.5
+                        WHEN prev_time IS NULL THEN 0
                         WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
                             TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
                         ELSE 0.5
@@ -10648,11 +10695,24 @@ def list_unrecognized_monthly():
             FROM ordered_snaps
             GROUP BY event_date, name_key
         ),
+        -- Break time from BREAK TIME room visits
+        break_room_time AS (
+            SELECT
+                s.event_date,
+                LOWER(TRIM(s.participant_name)) as name_key,
+                COUNT(*) * 0.5 as break_room_mins
+            FROM `{dataset_ref}.room_snapshots` s
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.participant_name IS NOT NULL AND s.participant_name != ''
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND LOWER(s.room_name) LIKE '%break time%'
+            GROUP BY s.event_date, name_key
+        ),
         daily_breaks AS (
             SELECT
                 event_date,
                 name_key,
-                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 60
+                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 300
                     THEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) - 30 ELSE 0 END) as break_seconds
             FROM ordered_snaps
             WHERE prev_time IS NOT NULL
@@ -10677,6 +10737,7 @@ def list_unrecognized_monthly():
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
               AND ro.cnt = 1
             GROUP BY s.event_date, name_key
         )
@@ -10688,10 +10749,11 @@ def list_unrecognized_monthly():
             FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
             ds.active_mins,
-            COALESCE(ROUND(db.break_seconds / 60), 0) as break_mins,
+            COALESCE(ROUND(db.break_seconds / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins
         FROM daily_stats ds
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.name_key = db.name_key
+        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.name_key = brt.name_key
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.name_key = di.name_key
         ORDER BY ds.name_key, ds.event_date
         """
@@ -11019,6 +11081,7 @@ def list_classified_monthly():
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
               AND LOWER(s.room_name) != 'main room'
               AND LOWER(s.room_name) NOT LIKE '0.main%'
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY s.event_date, LOWER(TRIM(s.participant_name)), s.snapshot_time
                 ORDER BY s.room_name
@@ -11048,7 +11111,7 @@ def list_classified_monthly():
                 MAX(snapshot_ist) as last_seen,
                 CEILING(SUM(
                     CASE
-                        WHEN prev_time IS NULL THEN 0.5
+                        WHEN prev_time IS NULL THEN 0
                         WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
                             TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
                         ELSE 0.5
@@ -11057,11 +11120,24 @@ def list_classified_monthly():
             FROM ordered_snaps
             GROUP BY event_date, name_key
         ),
+        -- Break time from BREAK TIME room visits
+        break_room_time AS (
+            SELECT
+                s.event_date,
+                LOWER(TRIM(s.participant_name)) as name_key,
+                COUNT(*) * 0.5 as break_room_mins
+            FROM `{dataset_ref}.room_snapshots` s
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.participant_name IS NOT NULL AND s.participant_name != ''
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND LOWER(s.room_name) LIKE '%break time%'
+            GROUP BY s.event_date, name_key
+        ),
         daily_breaks AS (
             SELECT
                 event_date,
                 name_key,
-                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 60
+                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 300
                     THEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) - 30 ELSE 0 END) as break_seconds
             FROM ordered_snaps
             WHERE prev_time IS NOT NULL
@@ -11086,6 +11162,7 @@ def list_classified_monthly():
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
               AND ro.cnt = 1
             GROUP BY s.event_date, name_key
         )
@@ -11097,10 +11174,11 @@ def list_classified_monthly():
             FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
             ds.active_mins,
-            COALESCE(ROUND(db.break_seconds / 60), 0) as break_mins,
+            COALESCE(ROUND(db.break_seconds / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins
         FROM daily_stats ds
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.name_key = db.name_key
+        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.name_key = brt.name_key
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.name_key = di.name_key
         ORDER BY ds.name_key, ds.event_date
         """
@@ -11255,12 +11333,25 @@ def employee_attendance_detail(employee_id, date):
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY s.event_date, s.snapshot_time
                 ORDER BY
                     CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
                     s.room_name
             ) = 1
+        ),
+        -- Break time from BREAK TIME room visits
+        break_room_time AS (
+            SELECT
+                s.event_date,
+                COUNT(*) * 0.5 as break_room_mins
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN emp_keys ek
+                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND LOWER(s.room_name) LIKE '%break time%'
+            GROUP BY s.event_date
         ),
         snaps_with_lag AS (
             SELECT
@@ -11278,10 +11369,10 @@ def employee_attendance_detail(employee_id, date):
                 -- Actual active time: sum consecutive intervals where gap < 5 mins
                 CEILING(SUM(
                     CASE
-                        WHEN prev_time IS NULL THEN 0.5  -- First snapshot = 30 seconds
+                        WHEN prev_time IS NULL THEN 0  -- First snapshot is start marker only
                         WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
                             TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
-                        ELSE 0.5  -- After long gap, just count this snapshot
+                        ELSE 0  -- After long gap, start marker for new presence period
                     END
                 )) as active_mins,
                 COUNT(DISTINCT snapshot_time) as snap_count
@@ -11291,7 +11382,7 @@ def employee_attendance_detail(employee_id, date):
         breaks AS (
             SELECT
                 event_date,
-                SUM(CASE WHEN prev_time IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 60
+                SUM(CASE WHEN prev_time IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 300
                     THEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) - 30
                     ELSE 0 END) as break_secs
             FROM snaps_with_lag
@@ -11309,6 +11400,7 @@ def employee_attendance_detail(employee_id, date):
                 WHERE event_date >= @start_date AND event_date <= @end_date
                   AND room_name IS NOT NULL AND room_name != ''
                   AND LOWER(participant_name) NOT LIKE '%scout%'
+                  AND LOWER(room_name) NOT LIKE '%break time%'
                 GROUP BY snapshot_time, room_name
             ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
             WHERE ro.cnt = 1
@@ -11319,10 +11411,11 @@ def employee_attendance_detail(employee_id, date):
             FORMAT_TIMESTAMP('%H:%M', sn.first_seen) as first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', sn.last_seen) as last_seen_ist,
             sn.active_mins,
-            COALESCE(ROUND(b.break_secs / 60), 0) as break_mins,
+            COALESCE(ROUND(b.break_secs / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(i.iso_secs / 60), 0) as isolation_mins
         FROM snaps sn
         LEFT JOIN breaks b ON sn.event_date = b.event_date
+        LEFT JOIN break_room_time brt ON sn.event_date = brt.event_date
         LEFT JOIN isolation i ON sn.event_date = i.event_date
         ORDER BY sn.event_date
         """
@@ -11473,12 +11566,25 @@ def employee_yearly_report(employee_id):
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY s.event_date, s.snapshot_time
                 ORDER BY
                     CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
                     s.room_name
             ) = 1
+        ),
+        -- Break time from BREAK TIME room visits
+        break_room_time AS (
+            SELECT
+                s.event_date,
+                COUNT(*) * 0.5 as break_room_mins
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN emp_keys ek
+                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND LOWER(s.room_name) LIKE '%break time%'
+            GROUP BY s.event_date
         ),
         snaps_with_lag AS (
             SELECT
@@ -11498,10 +11604,10 @@ def employee_yearly_report(employee_id):
                 -- Actual active time: sum consecutive intervals where gap < 5 mins
                 CEILING(SUM(
                     CASE
-                        WHEN prev_time IS NULL THEN 0.5  -- First snapshot = 30 seconds
+                        WHEN prev_time IS NULL THEN 0  -- First snapshot is start marker only
                         WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
                             TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
-                        ELSE 0.5  -- After long gap, just count this snapshot
+                        ELSE 0  -- After long gap, start marker for new presence period
                     END
                 )) as active_mins,
                 COUNT(DISTINCT snapshot_time) as snap_count
@@ -11511,7 +11617,7 @@ def employee_yearly_report(employee_id):
         breaks AS (
             SELECT
                 event_date,
-                SUM(CASE WHEN prev_time IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 60
+                SUM(CASE WHEN prev_time IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 300
                     THEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) - 30
                     ELSE 0 END) as break_secs
             FROM snaps_with_lag
@@ -11529,6 +11635,7 @@ def employee_yearly_report(employee_id):
                 WHERE event_date >= @start_date AND event_date <= @end_date
                   AND room_name IS NOT NULL AND room_name != ''
                   AND LOWER(participant_name) NOT LIKE '%scout%'
+                  AND LOWER(room_name) NOT LIKE '%break time%'
                 GROUP BY snapshot_time, room_name
             ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
             WHERE ro.cnt = 1
@@ -11540,10 +11647,11 @@ def employee_yearly_report(employee_id):
             ds.active_mins,
             EXTRACT(HOUR FROM ds.first_seen) * 60 + EXTRACT(MINUTE FROM ds.first_seen) as login_mins,
             EXTRACT(HOUR FROM ds.last_seen) * 60 + EXTRACT(MINUTE FROM ds.last_seen) as logout_mins,
-            COALESCE(ROUND(b.break_secs / 60), 0) as break_mins,
+            COALESCE(ROUND(b.break_secs / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(i.iso_secs / 60), 0) as isolation_mins
         FROM daily_stats ds
         LEFT JOIN breaks b ON ds.event_date = b.event_date
+        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date
         LEFT JOIN isolation i ON ds.event_date = i.event_date
         ORDER BY ds.event_date
         """
