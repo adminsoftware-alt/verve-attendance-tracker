@@ -7148,10 +7148,9 @@ def team_attendance(team_id, date):
             # Total time = breakout room time + main room time
             main_room = r.main_room_mins if r.main_room_mins else 0
             meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
-            # Use snapshot active time as primary (correctly handles gaps in presence)
-            # Webhook duration is just span (first join to last leave) which is wrong for multiple sessions
-            # Only fall back to webhook duration when NO snapshot data exists
-            total_mins = r.total_active_mins if r.total_active_mins > 0 else meeting_dur
+            # Combine breakout room time (from snapshots) + main room time (from webhooks gap-fill)
+            # This gives the full working time, not just breakout room time
+            total_mins = r.total_active_mins + main_room if r.total_active_mins > 0 else meeting_dur
 
             # Hour-based status: >=5hr=Present, 4-5hr=Half Day, <4hr=Absent
             if total_mins >= 300:
@@ -7498,13 +7497,12 @@ def team_attendance_range(team_id):
         all_member_names = [m.participant_name for m in all_members]
 
         # Build daily_data with hour-based status
-        # Use snapshot active_mins as primary (correctly handles gaps)
-        # Only fall back to webhook duration when NO snapshot data
+        # Combine breakout (snapshot) + main room (webhook gap-fill) for full working time
         daily_data = []
         for r in rows:
             meeting_dur = r.meeting_duration_mins if hasattr(r, 'meeting_duration_mins') and r.meeting_duration_mins else 0
-            total_mins = r.active_mins if r.active_mins > 0 else meeting_dur
             main_room = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
+            total_mins = r.active_mins + main_room if r.active_mins > 0 else meeting_dur
             if total_mins >= 300:
                 status = 'Present'
             elif total_mins >= 240:
@@ -7935,9 +7933,9 @@ def team_monthly_report(team_id):
                              'Total_Minutes', 'Breakout_Minutes', 'Main_Room_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
             for r in rows:
                 meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
-                # Use snapshot active_mins as primary (correctly handles gaps)
-                total = (r.active_mins or 0) if (r.active_mins or 0) > 0 else meeting_dur
                 main_room = r.main_room_mins if r.main_room_mins else 0
+                # Combine breakout + main room for full working time
+                total = (r.active_mins or 0) + main_room if (r.active_mins or 0) > 0 else meeting_dur
                 status = 'Present' if total >= 300 else 'Half Day' if total >= 240 else 'Absent'
                 writer.writerow([r.event_date, r.participant_name, r.participant_email or '',
                                  status, r.first_seen_ist, r.last_seen_ist, total,
@@ -7955,9 +7953,9 @@ def team_monthly_report(team_id):
         data = []
         for r in rows:
             meeting_dur = r.meeting_duration_mins if hasattr(r, 'meeting_duration_mins') and r.meeting_duration_mins else 0
-            # Use snapshot active_mins as primary (correctly handles gaps)
-            total_mins = (r.active_mins or 0) if (r.active_mins or 0) > 0 else meeting_dur
             main_room = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
+            # Combine breakout + main room for full working time
+            total_mins = (r.active_mins or 0) + main_room if (r.active_mins or 0) > 0 else meeting_dur
             status = 'Present' if total_mins >= 300 else 'Half Day' if total_mins >= 240 else 'Absent'
             data.append({
                 'date': str(r.event_date),

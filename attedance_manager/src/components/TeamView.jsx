@@ -52,6 +52,7 @@ export default function TeamView({ user }) {
   const [error, setError] = useState(null);
   const [showHolidayModal, setShowHolidayModal] = useState(false);
   const [editModalMember, setEditModalMember] = useState(null);
+  const [editModalDate, setEditModalDate] = useState(null);
 
   // Manager filtering
   const isManager = user?.role === 'manager';
@@ -240,7 +241,7 @@ export default function TeamView({ user }) {
                     <th style={s.th}>Main Room</th>
                     <th style={s.th}>Break</th>
                     <th style={s.th}>Isolation</th>
-                    <th style={s.th}></th>
+                    {user?.role === 'superadmin' && <th style={s.th}></th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -266,9 +267,11 @@ export default function TeamView({ user }) {
                       <td style={{ ...s.td, color: m.isolation_minutes > 30 ? '#ef4444' : '#64748b' }}>
                         {m.status !== 'absent' ? fmtMins(m.isolation_minutes) : '-'}
                       </td>
-                      <td style={s.td}>
-                        <button onClick={() => setEditModalMember(m)} style={s.editBtn}>Edit</button>
-                      </td>
+                      {user?.role === 'superadmin' && (
+                        <td style={s.td}>
+                          <button onClick={() => { setEditModalMember(m); setEditModalDate(date); }} style={s.editBtn}>Edit</button>
+                        </td>
+                      )}
                     </tr>
                   ))}
                 </tbody>
@@ -373,6 +376,11 @@ export default function TeamView({ user }) {
             year={year}
             month={month}
             holidays={monthlyData?.holidays || []}
+            user={user}
+            onEditCell={(member, cellDate) => {
+              setEditModalMember(member);
+              setEditModalDate(cellDate);
+            }}
           />
         </div>
       )}
@@ -391,8 +399,8 @@ export default function TeamView({ user }) {
       {editModalMember && (
         <AttendanceEditModal
           member={editModalMember}
-          date={date}
-          onClose={() => setEditModalMember(null)}
+          date={editModalDate || date}
+          onClose={() => { setEditModalMember(null); setEditModalDate(null); }}
           onSave={loadAttendance}
         />
       )}

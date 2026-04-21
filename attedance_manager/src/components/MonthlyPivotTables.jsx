@@ -32,7 +32,8 @@ function dayOfWeek(ymd) {
   return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dowOf(ymd)];
 }
 
-export default function MonthlyPivotTables({ monthlyData, year, month, holidays = [] }) {
+export default function MonthlyPivotTables({ monthlyData, year, month, holidays = [], user, onEditCell }) {
+  const canEdit = user?.role === 'superadmin';
   const [view, setView] = useState('hours');
 
   // Index holidays by date string for quick lookup
@@ -112,7 +113,7 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
 
       {/* Active view */}
       {view === 'hours' && (
-        <HoursPivot dates={dates} names={names} lookup={lookup} targetHours={targetHours} workingDays={workingDays} holidayMap={holidayMap} />
+        <HoursPivot dates={dates} names={names} lookup={lookup} targetHours={targetHours} workingDays={workingDays} holidayMap={holidayMap} canEdit={canEdit} onEditCell={onEditCell} dailyData={monthlyData?.daily_data} />
       )}
       {view === 'isolation' && (
         <IsolationPivot dates={dates} names={names} lookup={lookup} holidayMap={holidayMap} />
@@ -125,7 +126,7 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
 }
 
 // ─── Hours pivot ─────────────────────────────────────
-function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap = {} }) {
+function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap = {}, canEdit, onEditCell, dailyData = [] }) {
   const colTotals = new Array(dates.length).fill(0);
   const personTotals = {};
   names.forEach(name => {
@@ -180,6 +181,22 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
                   {dates.map(ds => {
                     const isHoliday = !!holidayMap[ds];
                     const h = lookup[`${name}|${ds}`]?.hours || 0;
+                    const editProps = canEdit && onEditCell ? {
+                      onClick: () => {
+                        const dayRow = dailyData.find(r => r.name === name && r.date === ds);
+                        onEditCell({
+                          name,
+                          first_seen_ist: dayRow?.first_seen_ist || '',
+                          last_seen_ist: dayRow?.last_seen_ist || '',
+                          status: dayRow?.status?.toLowerCase() || (h >= 5 ? 'present' : h >= 4 ? 'half_day' : 'absent'),
+                          total_duration_mins: dayRow?.active_minutes || Math.round(h * 60),
+                          break_minutes: dayRow?.break_minutes || 0,
+                          isolation_minutes: dayRow?.isolation_minutes || 0,
+                        }, ds);
+                      },
+                      style: { cursor: 'pointer' },
+                      title: 'Click to edit',
+                    } : {};
                     if (isHoliday) {
                       return (
                         <td key={ds} style={{ ...s.cellTd, background: '#e0e7ff', color: '#4338ca', fontWeight: 700 }} title={holidayMap[ds]}>
@@ -191,8 +208,8 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
                     if (h > 0 && h < EARLY_LOGOUT_MAX_HOURS) cellStyle = { ...s.cellTd, background: '#ffedd5', color: '#9a3412', fontWeight: 600 };
                     else if (h > OVERTIME_MIN_HOURS) cellStyle = { ...s.cellTd, background: '#fef9c3', color: '#854d0e', fontWeight: 600 };
                     return (
-                      <td key={ds} style={cellStyle}>
-                        {h > 0 ? h.toFixed(2) : ''}
+                      <td key={ds} {...editProps} style={{ ...cellStyle, ...(editProps.style || {}) }}>
+                        {h > 0 ? h.toFixed(2) : canEdit ? <span style={{ color: '#cbd5e1' }}>·</span> : ''}
                       </td>
                     );
                   })}
