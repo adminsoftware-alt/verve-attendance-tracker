@@ -7346,6 +7346,7 @@ def team_attendance_range(team_id):
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND s.participant_name IS NOT NULL
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY s.event_date,
                              COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
@@ -7354,6 +7355,22 @@ def team_attendance_range(team_id):
                     CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
                     s.room_name
             ) = 1
+        ),
+        -- Break time from BREAK TIME room visits
+        break_room_time AS (
+            SELECT
+                s.event_date,
+                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                COUNT(*) * 0.5 as break_room_mins
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_member_keys tmk
+                ON s.event_date = tmk.event_date
+               AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.participant_name IS NOT NULL
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND LOWER(s.room_name) LIKE '%break time%'
+            GROUP BY s.event_date, participant_key
         ),
         -- First get snapshots with previous snapshot time for gap detection
         ordered_snaps AS (
@@ -7457,14 +7474,15 @@ def team_attendance_range(team_id):
             FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
             ds.active_mins,
-            COALESCE(ROUND(db.break_seconds / 60), 0) as break_mins,
+            COALESCE(ROUND(db.break_seconds / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(db.break_count, 0) as break_count,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
             COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
-            GREATEST(COALESCE(dw.meeting_duration_mins, 0) - ds.active_mins, 0) as main_room_mins
+            GREATEST(COALESCE(dw.meeting_duration_mins, 0) - ds.active_mins - COALESCE(ROUND(brt.break_room_mins), 0), 0) as main_room_mins
         FROM daily_stats ds
         LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_key = db.participant_key
+        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.participant_key = brt.participant_key
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
         LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
         ORDER BY ds.event_date, ds.participant_name
@@ -7774,31 +7792,7 @@ def team_monthly_report(team_id):
                 ON LOWER(TRIM(tm.participant_name)) = pnm.name_key
             WHERE pnm.event_date IS NOT NULL
         ),
-        daily_stats AS (
-            SELECT
-                s.event_date,
-                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
-                MAX(s.participant_name) as participant_name,
-                MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as first_seen,
-                MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)) as last_seen,
-                TIMESTAMP_DIFF(
-                    MAX(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)),
-                    MIN(TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE)),
-                    MINUTE
-                ) as active_mins,
-                COUNT(DISTINCT s.snapshot_time) as snapshot_count
-            FROM `{dataset_ref}.room_snapshots` s
-            INNER JOIN team_member_keys tmk
-                ON s.event_date = tmk.event_date
-               AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND s.participant_name IS NOT NULL
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-            GROUP BY s.event_date, participant_key
-        ),
-        -- Break detection per day. Dedupe first so two-room SDK artifacts
-        -- don't register as false breaks.
+        -- Dedupe: one row per (participant, snapshot_time) before windowing
         deduped_snaps AS (
             SELECT
                 s.event_date,
@@ -7814,6 +7808,7 @@ def team_monthly_report(team_id):
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND s.participant_name IS NOT NULL
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY s.event_date,
                              COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
@@ -7823,17 +7818,55 @@ def team_monthly_report(team_id):
                     s.room_name
             ) = 1
         ),
+        -- Break time from BREAK TIME room visits
+        break_room_time AS (
+            SELECT
+                s.event_date,
+                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                COUNT(*) * 0.5 as break_room_mins
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_member_keys tmk
+                ON s.event_date = tmk.event_date
+               AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.participant_name IS NOT NULL
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+              AND LOWER(s.room_name) LIKE '%break time%'
+            GROUP BY s.event_date, participant_key
+        ),
         ordered_snaps AS (
             SELECT
                 event_date,
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
+                participant_name,
                 snapshot_time,
+                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
                 LAG(snapshot_time) OVER (
                     PARTITION BY event_date,
                         COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))
                     ORDER BY snapshot_time
                 ) as prev_snapshot
             FROM deduped_snaps
+        ),
+        -- Use interval-sum for active_mins (not span)
+        daily_stats AS (
+            SELECT
+                event_date,
+                participant_key,
+                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
+                MIN(snapshot_ist) as first_seen,
+                MAX(snapshot_ist) as last_seen,
+                CEILING(SUM(
+                    CASE
+                        WHEN prev_snapshot IS NULL THEN 0
+                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300 THEN
+                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
+                        ELSE 0
+                    END
+                )) as active_mins,
+                COUNT(DISTINCT snapshot_time) as snapshot_count
+            FROM ordered_snaps
+            GROUP BY event_date, participant_key
         ),
         daily_breaks AS (
             SELECT
@@ -7870,6 +7903,7 @@ def team_monthly_report(team_id):
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND ro.occupant_count = 1
               AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND LOWER(s.room_name) NOT LIKE '%break time%'
             GROUP BY s.event_date, participant_key
         ),
         -- Main meeting time from webhooks (bridged to UUID per day)
@@ -7902,13 +7936,14 @@ def team_monthly_report(team_id):
             FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
             ds.active_mins,
-            COALESCE(ROUND(db.break_seconds / 60), 0) as break_mins,
+            COALESCE(ROUND(db.break_seconds / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
             COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
-            GREATEST(COALESCE(dw.meeting_duration_mins, 0) - ds.active_mins, 0) as main_room_mins
+            GREATEST(COALESCE(dw.meeting_duration_mins, 0) - ds.active_mins - COALESCE(ROUND(brt.break_room_mins), 0), 0) as main_room_mins
         FROM daily_stats ds
         LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_key = db.participant_key
+        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.participant_key = brt.participant_key
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
         LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
         ORDER BY ds.participant_name, ds.event_date
