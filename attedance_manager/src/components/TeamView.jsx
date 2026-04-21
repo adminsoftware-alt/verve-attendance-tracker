@@ -5,7 +5,6 @@ import {
 } from '../utils/zoomApi';
 import { downloadTeamPivotExcel } from '../utils/teamPivotExcel';
 import MonthlyPivotTables from './MonthlyPivotTables';
-import HolidayManager from './HolidayManager';
 import AttendanceEditModal from './AttendanceEditModal';
 
 function istDate() {
@@ -50,7 +49,6 @@ export default function TeamView({ user }) {
   const [dataLoading, setDataLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [showHolidayModal, setShowHolidayModal] = useState(false);
   const [editModalMember, setEditModalMember] = useState(null);
   const [editModalDate, setEditModalDate] = useState(null);
 
@@ -196,7 +194,6 @@ export default function TeamView({ user }) {
               ))}
             </select>
             <button onClick={downloadPivotExcel} style={s.pivotXlsxBtn} title="Monthly pivot Excel with hours, isolation, and leaves">Download Excel Report</button>
-            <button onClick={() => setShowHolidayModal(true)} style={s.holidayBtn} title="Manage team holidays" disabled={!selectedTeam}>Manage Holidays</button>
           </div>
         )}
         <button onClick={loadAttendance} disabled={dataLoading} style={s.refreshBtn}>
@@ -383,17 +380,6 @@ export default function TeamView({ user }) {
             }}
           />
         </div>
-      )}
-
-      {showHolidayModal && selectedTeam && (
-        <HolidayManager
-          teamId={selectedTeam}
-          teamName={teams.find(t => t.team_id === selectedTeam)?.team_name || ''}
-          year={year}
-          month={month}
-          onClose={() => setShowHolidayModal(false)}
-          onChange={loadAttendance}
-        />
       )}
 
       {editModalMember && (

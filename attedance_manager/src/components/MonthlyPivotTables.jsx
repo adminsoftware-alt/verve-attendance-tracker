@@ -63,9 +63,11 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
       if (!r?.name || !r?.date) return;
       const mins = Number(r.active_minutes) || 0;
       const isoMins = Number(r.isolation_minutes) || 0;
+      const brkMins = Number(r.break_minutes) || 0;
       lookupMap[`${r.name}|${r.date}`] = {
         hours: mins / 60,
         isolationHours: isoMins / 60,
+        breakHours: brkMins / 60,
       };
     });
 
@@ -98,6 +100,12 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
           Hours Pivot
         </button>
         <button
+          onClick={() => setView('breaks')}
+          style={{ ...s.tab, ...(view === 'breaks' ? s.tabOn : {}) }}
+        >
+          Break Time
+        </button>
+        <button
           onClick={() => setView('isolation')}
           style={{ ...s.tab, ...(view === 'isolation' ? s.tabOn : {}) }}
         >
@@ -114,6 +122,9 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
       {/* Active view */}
       {view === 'hours' && (
         <HoursPivot dates={dates} names={names} lookup={lookup} targetHours={targetHours} workingDays={workingDays} holidayMap={holidayMap} canEdit={canEdit} onEditCell={onEditCell} dailyData={monthlyData?.daily_data} />
+      )}
+      {view === 'breaks' && (
+        <BreakPivot dates={dates} names={names} lookup={lookup} holidayMap={holidayMap} />
       )}
       {view === 'isolation' && (
         <IsolationPivot dates={dates} names={names} lookup={lookup} holidayMap={holidayMap} />
@@ -217,6 +228,100 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
                     ...s.totalTd,
                     background: below ? '#fee2e2' : '#e2e8f0',
                     color: below ? '#b91c1c' : '#0f172a',
+                  }}>
+                    {total.toFixed(2)}
+                  </td>
+                </tr>
+              );
+            })}
+            <tr style={s.grandRow}>
+              <td style={{ ...s.stickyNameTd, background: '#e2e8f0', fontWeight: 800 }}>Grand Total</td>
+              {colTotals.map((t, i) => (
+                <td key={i} style={{ ...s.cellTd, background: '#e2e8f0', fontWeight: 700 }}>{t.toFixed(2)}</td>
+              ))}
+              <td style={{ ...s.totalTd, background: '#cbd5e1', fontWeight: 800 }}>{grandTotal.toFixed(2)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Break Time pivot ───────────────────────────────
+function BreakPivot({ dates, names, lookup, holidayMap = {} }) {
+  const colTotals = new Array(dates.length).fill(0);
+  const personTotals = {};
+  names.forEach(name => {
+    let total = 0;
+    dates.forEach((ds, i) => {
+      const h = lookup[`${name}|${ds}`]?.breakHours || 0;
+      total += h;
+      colTotals[i] += h;
+    });
+    personTotals[name] = total;
+  });
+  const grandTotal = Object.values(personTotals).reduce((a, b) => a + b, 0);
+
+  return (
+    <div>
+      <div style={s.legendBar}>
+        <LegendItem color="#fef9c3" border="#fde047" label="30min – 1h (normal)" />
+        <LegendItem color="#ffedd5" border="#fdba74" label="1h – 2h (watch)" />
+        <LegendItem color="#fee2e2" border="#fca5a5" label="> 2h (excessive)" />
+        <LegendItem color="#e0e7ff" border="#a5b4fc" label="Holiday" />
+        <span style={s.legendMeta}>Break = time away from breakout rooms (gaps {'>'} 5 min)</span>
+      </div>
+
+      <div style={s.tableWrap}>
+        <table style={s.pivotTable}>
+          <thead>
+            <tr>
+              <th style={s.stickyNameTh}>Name</th>
+              {dates.map(ds => {
+                const isHoliday = !!holidayMap[ds];
+                return (
+                  <th key={ds} style={{ ...s.dateTh, ...(isWeekend(ds) ? s.weekendTh : {}), ...(isHoliday ? s.holidayTh : {}) }} title={isHoliday ? `Holiday: ${holidayMap[ds]}` : ''}>
+                    <div style={{ fontSize: 12, fontWeight: 700 }}>{shortDay(ds)}</div>
+                    <div style={{ fontSize: 9, color: isHoliday ? '#4338ca' : '#94a3b8', fontWeight: 500 }}>
+                      {isHoliday ? 'Holiday' : dayOfWeek(ds)}
+                    </div>
+                  </th>
+                );
+              })}
+              <th style={s.totalTh}>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {names.map((name, nIdx) => {
+              const total = personTotals[name];
+              return (
+                <tr key={name} style={nIdx % 2 === 0 ? s.trEven : {}}>
+                  <td style={s.stickyNameTd}>{name}</td>
+                  {dates.map(ds => {
+                    const isHoliday = !!holidayMap[ds];
+                    const h = lookup[`${name}|${ds}`]?.breakHours || 0;
+                    if (isHoliday) {
+                      return (
+                        <td key={ds} style={{ ...s.cellTd, background: '#e0e7ff', color: '#4338ca', fontWeight: 700 }} title={holidayMap[ds]}>
+                          H
+                        </td>
+                      );
+                    }
+                    let cellStyle = s.cellTd;
+                    if (h > 2) cellStyle = { ...s.cellTd, background: '#fee2e2', color: '#b91c1c', fontWeight: 700 };
+                    else if (h > 1) cellStyle = { ...s.cellTd, background: '#ffedd5', color: '#9a3412', fontWeight: 600 };
+                    else if (h > 0.5) cellStyle = { ...s.cellTd, background: '#fef9c3', color: '#854d0e', fontWeight: 600 };
+                    return (
+                      <td key={ds} style={cellStyle}>
+                        {h > 0 ? h.toFixed(2) : ''}
+                      </td>
+                    );
+                  })}
+                  <td style={{
+                    ...s.totalTd,
+                    background: total > 10 ? '#fee2e2' : '#e2e8f0',
+                    color: total > 10 ? '#b91c1c' : '#0f172a',
                   }}>
                     {total.toFixed(2)}
                   </td>
