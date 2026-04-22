@@ -5763,6 +5763,37 @@ def attendance_summary(date=None):
           WHERE event_date = '{date}'
             AND participant_name IS NOT NULL AND participant_name != ''
         ),
+        -- Global SDK monitoring window for the day. NULL if no snapshots exist
+        -- (e.g. VM down all day). Used downstream to cap "Main Room after last
+        -- breakout" so a monitoring outage isn't silently converted into hours
+        -- of phantom main-room attendance.
+        monitoring_window AS (
+          SELECT
+            MIN(snapshot_time) as global_first_snapshot,
+            MAX(snapshot_time) as global_last_snapshot
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          WHERE event_date = '{date}'
+        ),
+        -- Per-participant final breakout state. Tracks the MOST RECENT
+        -- breakout_room_joined/left event. If the last event was _left, the
+        -- user explicitly returned to main room and is really there. If it
+        -- was _joined, the user is still in a breakout we can no longer see
+        -- (SDK dropped them) and MUST NOT be credited Main Room time.
+        -- Without any such event, we have no evidence of a main-room return.
+        last_breakout_transition AS (
+          SELECT
+            COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+            ARRAY_AGG(pe.event_type ORDER BY pe.event_timestamp DESC LIMIT 1)[OFFSET(0)] as last_event_type,
+            MAX(pe.event_timestamp) as last_event_time
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+          LEFT JOIN participant_name_map pnm
+            ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
+          WHERE pe.event_date = '{date}'
+            AND pe.event_type IN ('breakout_room_joined', 'breakout_room_left')
+            AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
+            AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+          GROUP BY COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+        ),
         -- Webhook events: main meeting join/leave. Bridge the webhook name
         -- to the UUID-based participant_key used downstream, so that a
         -- renamer (e.g. "Shashank Channawar" -> "Shashank C", same UUID)
@@ -5929,8 +5960,18 @@ def attendance_summary(date=None):
             ap.participant_email,
             ap.main_joined,
             COALESCE(ap.main_left, ap.last_breakout, ap.main_joined) as main_left,
+            -- effective_main_left: hard stop at the global monitoring window.
+            -- Beyond global_last_snapshot we had no SDK visibility, so we must
+            -- not attribute that span to Main Room. Falls back gracefully when
+            -- global_last_snapshot is NULL (no snapshots for the day).
+            LEAST(
+              COALESCE(ap.main_left, ap.last_breakout, ap.main_joined),
+              COALESCE(mw.global_last_snapshot, ap.main_left, ap.last_breakout, ap.main_joined)
+            ) as effective_main_left,
             ap.first_breakout,
             ap.last_breakout,
+            bt.last_event_type as last_breakout_event_type,
+            bt.last_event_time as last_breakout_event_time,
             -- Main room time BEFORE first breakout
             CASE
               WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NOT NULL
@@ -5939,13 +5980,28 @@ def attendance_summary(date=None):
               THEN GREATEST(0, TIMESTAMP_DIFF(ap.main_left, ap.main_joined, MINUTE))
               ELSE 0
             END as main_room_before_mins,
-            -- Main room time AFTER last breakout
+            -- Main room time AFTER last breakout. Three safeguards apply:
+            --   1. Clamp to global_last_snapshot — don't attribute anything
+            --      past the point where all SDK monitoring stopped.
+            --   2. User's LAST breakout event must be breakout_room_left.
+            --      If it's breakout_room_joined, they're still in a breakout
+            --      we can't see — do NOT credit Main Room time.
+            --   3. That breakout_room_left event must be at or after the last
+            --      breakout snapshot (proves they left the breakout we saw
+            --      them in, not an earlier one).
             CASE
               WHEN ap.last_breakout IS NOT NULL AND ap.main_left IS NOT NULL
-              THEN GREATEST(0, TIMESTAMP_DIFF(ap.main_left, ap.last_breakout, MINUTE))
+                   AND bt.last_event_type = 'breakout_room_left'
+                   AND bt.last_event_time >= ap.last_breakout
+              THEN GREATEST(0, TIMESTAMP_DIFF(
+                LEAST(ap.main_left, COALESCE(mw.global_last_snapshot, ap.main_left)),
+                GREATEST(ap.last_breakout, bt.last_event_time),
+                MINUTE))
               ELSE 0
             END as main_room_after_mins
           FROM all_participants ap
+          CROSS JOIN monitoring_window mw
+          LEFT JOIN last_breakout_transition bt ON ap.participant_key = bt.participant_key
         ),
         -- Detect gaps between consecutive breakout visits (= time in main room)
         breakout_with_next AS (
@@ -5984,12 +6040,15 @@ def attendance_summary(date=None):
 
           UNION ALL
 
-          -- After last breakout room
+          -- After last breakout room. Only reached when main_room_after_mins > 0,
+          -- which already requires the user's last breakout event to be
+          -- breakout_room_left. join_time starts at that webhook timestamp;
+          -- leave_time clamps to the global SDK monitoring window.
           SELECT
             participant_key,
             '0.Main Room' as room_name,
-            last_breakout as join_time,
-            main_left as leave_time,
+            GREATEST(last_breakout, COALESCE(last_breakout_event_time, last_breakout)) as join_time,
+            effective_main_left as leave_time,
             main_room_after_mins as duration_mins
           FROM main_room_time
           WHERE main_room_after_mins > 0 AND last_breakout IS NOT NULL AND main_left IS NOT NULL
