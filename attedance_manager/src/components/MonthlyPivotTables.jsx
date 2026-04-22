@@ -13,6 +13,18 @@ const DAILY_TARGET_HOURS = 8;
 
 function pad2(n) { return String(n).padStart(2, '0'); }
 
+// Format decimal hours (e.g. 3.35) as "3hr 21min" / "3hr" / "21min" / "".
+function fmtHoursDecimal(h) {
+  if (!h || h <= 0) return '';
+  const totalMins = Math.round(h * 60);
+  if (totalMins <= 0) return '';
+  const hr = Math.floor(totalMins / 60);
+  const mn = totalMins % 60;
+  if (hr > 0 && mn > 0) return `${hr}hr ${mn}min`;
+  if (hr > 0) return `${hr}hr`;
+  return `${mn}min`;
+}
+
 function dowOf(ymd) {
   const [y, m, d] = ymd.split('-').map(Number);
   return new Date(y, m - 1, d).getDay();
@@ -211,7 +223,7 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
                     if (isHoliday) {
                       return (
                         <td key={ds} style={{ ...s.cellTd, background: '#e0e7ff', color: '#4338ca', fontWeight: 700 }} title={holidayMap[ds]}>
-                          H{h > 0 ? ` ${h.toFixed(1)}` : ''}
+                          H{h > 0 ? ` ${fmtHoursDecimal(h)}` : ''}
                         </td>
                       );
                     }
@@ -220,7 +232,7 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
                     else if (h > OVERTIME_MIN_HOURS) cellStyle = { ...s.cellTd, background: '#fef9c3', color: '#854d0e', fontWeight: 600 };
                     return (
                       <td key={ds} {...editProps} style={{ ...cellStyle, ...(editProps.style || {}) }}>
-                        {h > 0 ? h.toFixed(2) : canEdit ? <span style={{ color: '#cbd5e1' }}>·</span> : ''}
+                        {h > 0 ? fmtHoursDecimal(h) : canEdit ? <span style={{ color: '#cbd5e1' }}>·</span> : ''}
                       </td>
                     );
                   })}
@@ -229,7 +241,7 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
                     background: below ? '#fee2e2' : '#e2e8f0',
                     color: below ? '#b91c1c' : '#0f172a',
                   }}>
-                    {total.toFixed(2)}
+                    {fmtHoursDecimal(total)}
                   </td>
                 </tr>
               );
@@ -237,9 +249,9 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
             <tr style={s.grandRow}>
               <td style={{ ...s.stickyNameTd, background: '#e2e8f0', fontWeight: 800 }}>Grand Total</td>
               {colTotals.map((t, i) => (
-                <td key={i} style={{ ...s.cellTd, background: '#e2e8f0', fontWeight: 700 }}>{t.toFixed(2)}</td>
+                <td key={i} style={{ ...s.cellTd, background: '#e2e8f0', fontWeight: 700 }}>{fmtHoursDecimal(t)}</td>
               ))}
-              <td style={{ ...s.totalTd, background: '#cbd5e1', fontWeight: 800 }}>{grandTotal.toFixed(2)}</td>
+              <td style={{ ...s.totalTd, background: '#cbd5e1', fontWeight: 800 }}>{fmtHoursDecimal(grandTotal)}</td>
             </tr>
           </tbody>
         </table>
@@ -314,7 +326,7 @@ function BreakPivot({ dates, names, lookup, holidayMap = {} }) {
                     else if (h > 0.5) cellStyle = { ...s.cellTd, background: '#fef9c3', color: '#854d0e', fontWeight: 600 };
                     return (
                       <td key={ds} style={cellStyle}>
-                        {h > 0 ? h.toFixed(2) : ''}
+                        {fmtHoursDecimal(h)}
                       </td>
                     );
                   })}
@@ -323,7 +335,7 @@ function BreakPivot({ dates, names, lookup, holidayMap = {} }) {
                     background: total > 10 ? '#fee2e2' : '#e2e8f0',
                     color: total > 10 ? '#b91c1c' : '#0f172a',
                   }}>
-                    {total.toFixed(2)}
+                    {fmtHoursDecimal(total)}
                   </td>
                 </tr>
               );
@@ -331,9 +343,9 @@ function BreakPivot({ dates, names, lookup, holidayMap = {} }) {
             <tr style={s.grandRow}>
               <td style={{ ...s.stickyNameTd, background: '#e2e8f0', fontWeight: 800 }}>Grand Total</td>
               {colTotals.map((t, i) => (
-                <td key={i} style={{ ...s.cellTd, background: '#e2e8f0', fontWeight: 700 }}>{t.toFixed(2)}</td>
+                <td key={i} style={{ ...s.cellTd, background: '#e2e8f0', fontWeight: 700 }}>{fmtHoursDecimal(t)}</td>
               ))}
-              <td style={{ ...s.totalTd, background: '#cbd5e1', fontWeight: 800 }}>{grandTotal.toFixed(2)}</td>
+              <td style={{ ...s.totalTd, background: '#cbd5e1', fontWeight: 800 }}>{fmtHoursDecimal(grandTotal)}</td>
             </tr>
           </tbody>
         </table>
@@ -406,7 +418,7 @@ function IsolationPivot({ dates, names, lookup, holidayMap = {} }) {
                     else if (h > 1) cellStyle = { ...s.cellTd, background: '#ffedd5', color: '#9a3412', fontWeight: 600 };
                     return (
                       <td key={ds} style={cellStyle}>
-                        {h > 0 ? h.toFixed(2) : ''}
+                        {fmtHoursDecimal(h)}
                       </td>
                     );
                   })}
@@ -415,7 +427,7 @@ function IsolationPivot({ dates, names, lookup, holidayMap = {} }) {
                     background: total > 5 ? '#fee2e2' : '#e2e8f0',
                     color: total > 5 ? '#b91c1c' : '#0f172a',
                   }}>
-                    {total.toFixed(2)}
+                    {fmtHoursDecimal(total)}
                   </td>
                 </tr>
               );
@@ -423,9 +435,9 @@ function IsolationPivot({ dates, names, lookup, holidayMap = {} }) {
             <tr style={s.grandRow}>
               <td style={{ ...s.stickyNameTd, background: '#e2e8f0', fontWeight: 800 }}>Grand Total</td>
               {colTotals.map((t, i) => (
-                <td key={i} style={{ ...s.cellTd, background: '#e2e8f0', fontWeight: 700 }}>{t.toFixed(2)}</td>
+                <td key={i} style={{ ...s.cellTd, background: '#e2e8f0', fontWeight: 700 }}>{fmtHoursDecimal(t)}</td>
               ))}
-              <td style={{ ...s.totalTd, background: '#cbd5e1', fontWeight: 800 }}>{grandTotal.toFixed(2)}</td>
+              <td style={{ ...s.totalTd, background: '#cbd5e1', fontWeight: 800 }}>{fmtHoursDecimal(grandTotal)}</td>
             </tr>
           </tbody>
         </table>

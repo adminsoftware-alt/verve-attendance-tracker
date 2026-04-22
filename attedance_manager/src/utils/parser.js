@@ -278,10 +278,12 @@ export function minToTime(m) {
 }
 
 export function formatDuration(mins) {
-  if (!mins) return '0h 0m';
+  if (!mins) return '0min';
   const h = Math.floor(mins / 60);
   const m = Math.round(mins % 60);
-  return h + 'h ' + m + 'm';
+  if (h > 0 && m > 0) return h + 'hr ' + m + 'min';
+  if (h > 0) return h + 'hr';
+  return m + 'min';
 }
 
 function parseDurationStr(s) {

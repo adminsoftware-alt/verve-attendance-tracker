@@ -8,7 +8,11 @@ function istDate() {
 
 function fmtMins(m) {
   if (!m && m !== 0) return '';
-  return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const min = m % 60;
+  if (h > 0 && min > 0) return `${h}hr ${min}min`;
+  if (h > 0) return `${h}hr`;
+  return `${min}min`;
 }
 
 // All available columns

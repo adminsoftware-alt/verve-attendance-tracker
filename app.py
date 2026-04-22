@@ -5780,11 +5780,15 @@ def attendance_summary(date=None):
         -- was _joined, the user is still in a breakout we can no longer see
         -- (SDK dropped them) and MUST NOT be credited Main Room time.
         -- Without any such event, we have no evidence of a main-room return.
+        -- Also exposes first breakout_room_joined so the BEFORE branch of
+        -- main_room_time can bound users with no SDK snapshots.
         last_breakout_transition AS (
           SELECT
             COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
             ARRAY_AGG(pe.event_type ORDER BY pe.event_timestamp DESC LIMIT 1)[OFFSET(0)] as last_event_type,
-            MAX(pe.event_timestamp) as last_event_time
+            MAX(pe.event_timestamp) as last_event_time,
+            MIN(CASE WHEN pe.event_type = 'breakout_room_joined' THEN pe.event_timestamp END) as first_breakout_joined_time,
+            COUNTIF(pe.event_type = 'breakout_room_joined') as breakout_joined_count
           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
           LEFT JOIN participant_name_map pnm
             ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
@@ -5972,11 +5976,22 @@ def attendance_summary(date=None):
             ap.last_breakout,
             bt.last_event_type as last_breakout_event_type,
             bt.last_event_time as last_breakout_event_time,
-            -- Main room time BEFORE first breakout
+            -- Main room time BEFORE first breakout. Three priority paths:
+            --   1. SDK snapshot found a first breakout — bound by it.
+            --   2. No snapshot but webhook proves user joined a breakout —
+            --      bound by the FIRST breakout_room_joined webhook (catches
+            --      the case where SDK never saw a user who was actually in
+            --      breakouts the whole meeting).
+            --   3. No breakout activity at all — entire meeting is main room.
             CASE
               WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NOT NULL
               THEN GREATEST(0, TIMESTAMP_DIFF(ap.first_breakout, ap.main_joined, MINUTE))
-              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL AND ap.main_left IS NOT NULL
+              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
+                   AND bt.first_breakout_joined_time IS NOT NULL
+              THEN GREATEST(0, TIMESTAMP_DIFF(bt.first_breakout_joined_time, ap.main_joined, MINUTE))
+              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
+                   AND bt.breakout_joined_count IS NULL
+                   AND ap.main_left IS NOT NULL
               THEN GREATEST(0, TIMESTAMP_DIFF(ap.main_left, ap.main_joined, MINUTE))
               ELSE 0
             END as main_room_before_mins,
@@ -7052,6 +7067,22 @@ def team_attendance(team_id, date):
             FROM `{dataset_ref}.room_snapshots`
             WHERE event_date = @report_date
         ),
+        -- Did this participant have ANY breakout_room_joined webhook today?
+        -- Used to detect users who were in breakouts the SDK never saw —
+        -- in that case Main Room time should be 0, not the entire meeting.
+        breakout_webhook_presence AS (
+            SELECT
+                COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                COUNT(*) as breakout_joined_count
+            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+            LEFT JOIN participant_name_map pnm
+                ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
+            WHERE pe.event_date = @report_date
+              AND pe.event_type = 'breakout_room_joined'
+              AND pe.participant_name IS NOT NULL
+              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+            GROUP BY COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+        ),
         -- Main meeting time from webhooks (participant_joined / participant_left)
         -- Webhooks lack UUID, so we bridge via participant_name_map.
         webhook_times AS (
@@ -7085,23 +7116,30 @@ def team_attendance(team_id, date):
             CASE WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
                  THEN TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE)
                  ELSE 0 END as meeting_duration_mins,
-            -- main_room_mins: meeting span minus tracked active minus break room,
-            -- with meeting_left clamped to the last SDK snapshot so a monitoring
-            -- outage doesn't become phantom Main Room attendance.
-            CASE WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
-                 THEN GREATEST(
+            -- main_room_mins: meeting span minus tracked active minus break room.
+            -- Two safeguards:
+            --   (a) meeting_left clamped to last SDK snapshot — outage protection.
+            --   (b) if user has breakout webhooks but ZERO snapshot coverage,
+            --       force main_room_mins = 0 (they were in unmonitored breakouts).
+            CASE
+              WHEN COALESCE(bwp.breakout_joined_count, 0) > 0 AND COALESCE(ps.total_active_mins, 0) = 0
+              THEN 0
+              WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
+              THEN GREATEST(
                      TIMESTAMP_DIFF(
                          LEAST(wt.meeting_left, COALESCE(mw.last_snapshot_ist, wt.meeting_left)),
                          wt.meeting_joined,
                          MINUTE)
                      - ps.total_active_mins
                      - COALESCE(brs.break_room_seconds, 0) / 60, 0)
-                 ELSE 0 END as main_room_mins
+              ELSE 0
+            END as main_room_mins
         FROM participant_summary ps
         LEFT JOIN break_summary bs ON ps.participant_key = bs.participant_key
         LEFT JOIN break_room_summary brs ON ps.participant_key = brs.participant_key
         LEFT JOIN isolation_summary iso ON ps.participant_key = iso.participant_key
         LEFT JOIN webhook_times wt ON ps.participant_key = wt.participant_key
+        LEFT JOIN breakout_webhook_presence bwp ON ps.participant_key = bwp.participant_key
         CROSS JOIN monitoring_window mw
         ORDER BY ps.participant_name
         """
@@ -7529,6 +7567,24 @@ def team_attendance_range(team_id):
             WHERE event_date >= @start_date AND event_date <= @end_date
             GROUP BY event_date
         ),
+        -- Did this participant have ANY breakout_room_joined webhook today?
+        -- Used to detect users who were in breakouts the SDK never saw —
+        -- in that case Main Room time should be 0, not the entire meeting.
+        daily_breakout_webhooks AS (
+            SELECT
+                pe.event_date,
+                COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                COUNT(*) as breakout_joined_count
+            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+            LEFT JOIN participant_name_map pnm
+                ON pe.event_date = pnm.event_date
+               AND LOWER(TRIM(pe.participant_name)) = pnm.name_key
+            WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
+              AND pe.event_type = 'breakout_room_joined'
+              AND pe.participant_name IS NOT NULL
+              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+            GROUP BY pe.event_date, COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+        ),
         -- Main meeting time from webhooks (bridged to UUID via name_map).
         -- Raw timestamps are exposed so main_room_mins can be clamped below.
         daily_webhook AS (
@@ -7567,16 +7623,22 @@ def team_attendance_range(team_id):
             COALESCE(db.break_count, 0) as break_count,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
             COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
-            -- main_room_mins: meeting duration minus tracked breakout minus break,
-            -- but with meeting_left clamped to the day's last SDK snapshot so a
-            -- monitoring outage doesn't become phantom Main Room attendance.
-            GREATEST(
+            -- main_room_mins: meeting duration minus tracked breakout minus break.
+            -- Two safeguards:
+            --   (a) meeting_left clamped to last SDK snapshot — outage protection
+            --   (b) if user has breakout webhooks but ZERO snapshot coverage,
+            --       force main_room_mins = 0 (they were in unmonitored breakouts).
+            CASE
+              WHEN COALESCE(dbw.breakout_joined_count, 0) > 0 AND COALESCE(ds.active_mins, 0) = 0
+              THEN 0
+              ELSE GREATEST(
                 COALESCE(TIMESTAMP_DIFF(
                     LEAST(dw.meeting_left_ts, COALESCE(mw.last_snapshot_ts, dw.meeting_left_ts)),
                     dw.meeting_joined_ts,
                     MINUTE), 0)
                 - ds.active_mins - COALESCE(ROUND(brt.break_room_mins), 0),
-                0) as main_room_mins
+                0)
+            END as main_room_mins
         FROM daily_stats ds
         LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_key = db.participant_key
@@ -7584,6 +7646,7 @@ def team_attendance_range(team_id):
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
         LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
         LEFT JOIN daily_monitoring_window mw ON ds.event_date = mw.event_date
+        LEFT JOIN daily_breakout_webhooks dbw ON ds.event_date = dbw.event_date AND ds.participant_key = dbw.participant_key
         ORDER BY ds.event_date, ds.participant_name
         """
 
@@ -8014,6 +8077,24 @@ def team_monthly_report(team_id):
             WHERE event_date >= @start_date AND event_date <= @end_date
             GROUP BY event_date
         ),
+        -- Did this participant have ANY breakout_room_joined webhook today?
+        -- Used to detect users who were in breakouts the SDK never saw —
+        -- in that case Main Room time should be 0, not the entire meeting.
+        daily_breakout_webhooks AS (
+            SELECT
+                pe.event_date,
+                COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                COUNT(*) as breakout_joined_count
+            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+            LEFT JOIN participant_name_map pnm
+                ON pe.event_date = pnm.event_date
+               AND LOWER(TRIM(pe.participant_name)) = pnm.name_key
+            WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
+              AND pe.event_type = 'breakout_room_joined'
+              AND pe.participant_name IS NOT NULL
+              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+            GROUP BY pe.event_date, COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+        ),
         -- Main meeting time from webhooks (bridged to UUID per day).
         -- Raw timestamps exposed so main_room_mins can clamp to the SDK window.
         daily_webhook AS (
@@ -8052,16 +8133,22 @@ def team_monthly_report(team_id):
             COALESCE(ROUND(db.break_seconds / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
             COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
-            -- main_room_mins: meeting duration minus tracked breakout minus break,
-            -- but with meeting_left clamped to the day's last SDK snapshot so a
-            -- monitoring outage doesn't become phantom Main Room attendance.
-            GREATEST(
+            -- main_room_mins: meeting duration minus tracked breakout minus break.
+            -- Two safeguards:
+            --   (a) meeting_left clamped to last SDK snapshot — outage protection
+            --   (b) if user has breakout webhooks but ZERO snapshot coverage,
+            --       force main_room_mins = 0 (they were in unmonitored breakouts).
+            CASE
+              WHEN COALESCE(dbw.breakout_joined_count, 0) > 0 AND COALESCE(ds.active_mins, 0) = 0
+              THEN 0
+              ELSE GREATEST(
                 COALESCE(TIMESTAMP_DIFF(
                     LEAST(dw.meeting_left_ts, COALESCE(mw.last_snapshot_ts, dw.meeting_left_ts)),
                     dw.meeting_joined_ts,
                     MINUTE), 0)
                 - ds.active_mins - COALESCE(ROUND(brt.break_room_mins), 0),
-                0) as main_room_mins
+                0)
+            END as main_room_mins
         FROM daily_stats ds
         LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_key = db.participant_key
@@ -8069,6 +8156,7 @@ def team_monthly_report(team_id):
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
         LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
         LEFT JOIN daily_monitoring_window mw ON ds.event_date = mw.event_date
+        LEFT JOIN daily_breakout_webhooks dbw ON ds.event_date = dbw.event_date AND ds.participant_key = dbw.participant_key
         ORDER BY ds.participant_name, ds.event_date
         """
 

@@ -53,12 +53,14 @@ function fmtMins(m) {
   if (!m) return '-';
   const h = Math.floor(m / 60);
   const min = m % 60;
-  return h > 0 ? `${h}h ${min}m` : `${min}m`;
+  if (h > 0 && min > 0) return `${h}hr ${min}min`;
+  if (h > 0) return `${h}hr`;
+  return `${min}min`;
 }
 
 function fmtHours(m) {
-  if (!m) return '0.0h';
-  return `${(m / 60).toFixed(1)}h`;
+  if (!m) return '0min';
+  return fmtMins(Math.round(m));
 }
 
 function attendanceStatusStyle(status) {

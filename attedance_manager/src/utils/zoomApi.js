@@ -70,7 +70,7 @@ export function transformSummaryToEmployees(summaryData) {
       joined: p.first_seen_ist || '',
       left: p.last_seen_ist || '',
       totalMinutes: totalMin,
-      duration: h + 'h ' + m + 'm',
+      duration: (h > 0 && m > 0) ? `${h}hr ${m}min` : h > 0 ? `${h}hr` : `${m}min`,
       sessions: 1,
       rooms: rooms.sort((a, b) => (a.start || '').localeCompare(b.start || '')),
     };
