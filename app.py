@@ -7044,6 +7044,14 @@ def team_attendance(team_id, date):
             GROUP BY participant_key
         ),
 
+        -- Last SDK snapshot for the day: hard end of the monitoring window.
+        -- Beyond it we had no visibility; any Main Room time inferred past this
+        -- point would be phantom attendance from a monitoring outage.
+        monitoring_window AS (
+            SELECT MAX(TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE)) as last_snapshot_ist
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date = @report_date
+        ),
         -- Main meeting time from webhooks (participant_joined / participant_left)
         -- Webhooks lack UUID, so we bridge via participant_name_map.
         webhook_times AS (
@@ -7077,16 +7085,24 @@ def team_attendance(team_id, date):
             CASE WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
                  THEN TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE)
                  ELSE 0 END as meeting_duration_mins,
+            -- main_room_mins: meeting span minus tracked active minus break room,
+            -- with meeting_left clamped to the last SDK snapshot so a monitoring
+            -- outage doesn't become phantom Main Room attendance.
             CASE WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
-                 THEN GREATEST(TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE)
-                               - ps.total_active_mins
-                               - COALESCE(brs.break_room_seconds, 0) / 60, 0)
+                 THEN GREATEST(
+                     TIMESTAMP_DIFF(
+                         LEAST(wt.meeting_left, COALESCE(mw.last_snapshot_ist, wt.meeting_left)),
+                         wt.meeting_joined,
+                         MINUTE)
+                     - ps.total_active_mins
+                     - COALESCE(brs.break_room_seconds, 0) / 60, 0)
                  ELSE 0 END as main_room_mins
         FROM participant_summary ps
         LEFT JOIN break_summary bs ON ps.participant_key = bs.participant_key
         LEFT JOIN break_room_summary brs ON ps.participant_key = brs.participant_key
         LEFT JOIN isolation_summary iso ON ps.participant_key = iso.participant_key
         LEFT JOIN webhook_times wt ON ps.participant_key = wt.participant_key
+        CROSS JOIN monitoring_window mw
         ORDER BY ps.participant_name
         """
 
@@ -7504,11 +7520,25 @@ def team_attendance_range(team_id):
               AND s.room_name IS NOT NULL AND s.room_name != ''
             GROUP BY s.event_date, participant_key
         ),
+        -- Last SDK snapshot per day: hard end of the monitoring window. Beyond
+        -- it we had no visibility, so any Main Room time inferred past this
+        -- point would be phantom attendance from a monitoring outage.
+        daily_monitoring_window AS (
+            SELECT event_date, MAX(snapshot_time) as last_snapshot_ts
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date >= @start_date AND event_date <= @end_date
+            GROUP BY event_date
+        ),
         -- Main meeting time from webhooks (bridged to UUID via name_map).
+        -- Raw timestamps are exposed so main_room_mins can be clamped below.
         daily_webhook AS (
             SELECT
                 pe.event_date,
                 COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
+                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_joined_ts,
+                MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
+                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_left_ts,
                 TIMESTAMP_DIFF(
                     MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
                         THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
@@ -7537,13 +7567,23 @@ def team_attendance_range(team_id):
             COALESCE(db.break_count, 0) as break_count,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
             COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
-            GREATEST(COALESCE(dw.meeting_duration_mins, 0) - ds.active_mins - COALESCE(ROUND(brt.break_room_mins), 0), 0) as main_room_mins
+            -- main_room_mins: meeting duration minus tracked breakout minus break,
+            -- but with meeting_left clamped to the day's last SDK snapshot so a
+            -- monitoring outage doesn't become phantom Main Room attendance.
+            GREATEST(
+                COALESCE(TIMESTAMP_DIFF(
+                    LEAST(dw.meeting_left_ts, COALESCE(mw.last_snapshot_ts, dw.meeting_left_ts)),
+                    dw.meeting_joined_ts,
+                    MINUTE), 0)
+                - ds.active_mins - COALESCE(ROUND(brt.break_room_mins), 0),
+                0) as main_room_mins
         FROM daily_stats ds
         LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_key = db.participant_key
         LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.participant_key = brt.participant_key
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
         LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
+        LEFT JOIN daily_monitoring_window mw ON ds.event_date = mw.event_date
         ORDER BY ds.event_date, ds.participant_name
         """
 
@@ -7965,11 +8005,25 @@ def team_monthly_report(team_id):
               AND LOWER(s.room_name) NOT LIKE '%break time%'
             GROUP BY s.event_date, participant_key
         ),
-        -- Main meeting time from webhooks (bridged to UUID per day)
+        -- Last SDK snapshot per day: hard end of the monitoring window. Beyond
+        -- it we had no visibility, so any Main Room time inferred past this
+        -- point would be phantom attendance from a monitoring outage.
+        daily_monitoring_window AS (
+            SELECT event_date, MAX(snapshot_time) as last_snapshot_ts
+            FROM `{dataset_ref}.room_snapshots`
+            WHERE event_date >= @start_date AND event_date <= @end_date
+            GROUP BY event_date
+        ),
+        -- Main meeting time from webhooks (bridged to UUID per day).
+        -- Raw timestamps exposed so main_room_mins can clamp to the SDK window.
         daily_webhook AS (
             SELECT
                 pe.event_date,
                 COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
+                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_joined_ts,
+                MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
+                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_left_ts,
                 TIMESTAMP_DIFF(
                     MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
                         THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
@@ -7998,13 +8052,23 @@ def team_monthly_report(team_id):
             COALESCE(ROUND(db.break_seconds / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
             COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
-            GREATEST(COALESCE(dw.meeting_duration_mins, 0) - ds.active_mins - COALESCE(ROUND(brt.break_room_mins), 0), 0) as main_room_mins
+            -- main_room_mins: meeting duration minus tracked breakout minus break,
+            -- but with meeting_left clamped to the day's last SDK snapshot so a
+            -- monitoring outage doesn't become phantom Main Room attendance.
+            GREATEST(
+                COALESCE(TIMESTAMP_DIFF(
+                    LEAST(dw.meeting_left_ts, COALESCE(mw.last_snapshot_ts, dw.meeting_left_ts)),
+                    dw.meeting_joined_ts,
+                    MINUTE), 0)
+                - ds.active_mins - COALESCE(ROUND(brt.break_room_mins), 0),
+                0) as main_room_mins
         FROM daily_stats ds
         LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
         LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_key = db.participant_key
         LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.participant_key = brt.participant_key
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
         LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
+        LEFT JOIN daily_monitoring_window mw ON ds.event_date = mw.event_date
         ORDER BY ds.participant_name, ds.event_date
         """
 
