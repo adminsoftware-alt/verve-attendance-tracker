@@ -8360,6 +8360,11 @@ def team_attendance_range(team_id):
         ),
         -- Main meeting time from webhooks (bridged to UUID via separate lookups).
         -- Raw timestamps are exposed so main_room_mins can be clamped below.
+        -- NOTE: do NOT INNER JOIN team_members here. Zoom display names in
+        -- webhook events frequently drift from the canonical name stored in
+        -- team_members (e.g. "Sayli S" vs "Sayli Sonone"), which would
+        -- silently drop the webhook row and zero out main_fill. The final
+        -- LEFT JOIN against daily_stats already restricts to team members.
         daily_webhook AS (
             SELECT
                 pe.event_date,
@@ -8375,8 +8380,6 @@ def team_attendance_range(team_id):
                         THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
                     MINUTE) as meeting_duration_mins
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            INNER JOIN team_members tm
-                ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
             LEFT JOIN email_to_key etk
                 ON pe.event_date = etk.event_date
                AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
