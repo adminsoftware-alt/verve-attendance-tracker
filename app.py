@@ -1757,8 +1757,17 @@ class ZoomAPI:
                     max_pages = 50  # Safety limit
                     auth_retries = 0  # Track 401 retries to prevent infinite loop
                     max_auth_retries = 3
+                    method_started = time.time()
+                    max_wall_secs = 120  # Bail out if a single method drags on
 
                     while page_count < max_pages:
+                        # Wall-clock guard: a slow Zoom API shouldn't pin
+                        # Cloud Run indefinitely. Bail with partial data.
+                        if time.time() - method_started > max_wall_secs:
+                            print(f"[ZoomAPI] {method_name} wall-clock cap hit "
+                                  f"({max_wall_secs}s) after {page_count} pages — bailing")
+                            break
+
                         # Build URL with pagination params
                         params = {'page_size': page_size}
                         if next_page_token:
@@ -1833,7 +1842,7 @@ class ZoomAPI:
             traceback.print_exc()
             return []
 
-    def get_meeting_participants_qos(self, meeting_id, max_pages=200):
+    def get_meeting_participants_qos(self, meeting_id, max_pages=200, max_wall_secs=300):
         """
         Get QoS data for meeting participants using Dashboard Metrics API.
         This includes video_output data which indicates camera status.
@@ -1845,12 +1854,18 @@ class ZoomAPI:
             meeting_id: The meeting ID
             max_pages: Maximum pages to fetch (default 200 = 2000 participants)
                        Use smaller value for quick searches
+            max_wall_secs: Hard wall-clock cap on the whole pagination loop.
+                           Without this a slow Dashboard API could keep
+                           Cloud Run busy past its request timeout (default 1
+                           hour for Cloud Run, but we want to fail fast).
+                           Returns partial results when exceeded.
 
         Returns list of participants with video_output stats.
         When camera is ON: video_output has bitrate, resolution, etc.
         When camera is OFF: video_output is empty/null
         """
         all_participants = []
+        loop_started = time.time()
 
         try:
             token = self.get_access_token()
@@ -1870,6 +1885,13 @@ class ZoomAPI:
             max_auth_retries = 3
 
             while page_count < max_pages:
+                # Wall-clock guard: bail out with whatever we have rather
+                # than blocking the Cloud Run instance indefinitely.
+                if time.time() - loop_started > max_wall_secs:
+                    print(f"[ZoomAPI] QoS pagination wall-clock cap hit "
+                          f"({max_wall_secs}s) after {page_count} pages, "
+                          f"{len(all_participants)} participants — returning partial")
+                    break
                 params = {'page_size': 10}  # Max 10 per page for QoS API
                 if next_page_token:
                     params['next_page_token'] = next_page_token
@@ -2770,6 +2792,45 @@ def chat_endpoint():
 # No UUID mapping needed. React app polls every 30s and sends snapshots here.
 # ==============================================================================
 
+# Cross-request snapshot dedup. When the MonitorPanel is open on >1 device
+# (HR client + Scout Bot VM), each polls every 30s and writes its own row.
+# Downstream queries already bucket-dedup, so reports are correct — but
+# room_snapshots itself silently inflates, costing storage. Here we drop
+# any row whose (meeting_id, participant_key, room_name, 30s_bucket) was
+# already inserted by a previous request from this same instance within the
+# last few minutes. Conservative on purpose: only identical (room, bucket)
+# is treated as duplicate, so legitimate room transitions are never lost.
+_snapshot_seen = {}            # key -> insert_ts
+_SNAPSHOT_SEEN_TTL_SECS = 180  # 3 minutes
+_snapshot_seen_last_clean = 0
+
+
+def _snapshot_cleanup():
+    global _snapshot_seen_last_clean
+    now = time.time()
+    if now - _snapshot_seen_last_clean < 60:
+        return
+    _snapshot_seen_last_clean = now
+    cutoff = now - _SNAPSHOT_SEEN_TTL_SECS
+    stale = [k for k, ts in _snapshot_seen.items() if ts < cutoff]
+    for k in stale:
+        _snapshot_seen.pop(k, None)
+
+
+def _snapshot_bucket(ts):
+    """Convert an ISO timestamp to its 30-second bucket (matches the
+    DIV(UNIX_SECONDS(snapshot_time), 30) bucketing used in all downstream
+    queries)."""
+    try:
+        if hasattr(ts, 'timestamp'):
+            unix_s = int(ts.timestamp())
+        else:
+            unix_s = int(datetime.fromisoformat(str(ts)).timestamp())
+    except Exception:
+        unix_s = int(time.time())
+    return unix_s // 30
+
+
 @app.route('/monitor/snapshot', methods=['POST'])
 def monitor_snapshot():
     """
@@ -2787,6 +2848,8 @@ def monitor_snapshot():
     now = datetime.utcnow()
     today = get_ist_date()
     snapshot_time = now.isoformat()
+    bucket = _snapshot_bucket(now)
+    _snapshot_cleanup()
 
     # Dedupe: one row per participant per snapshot. During room transitions
     # the SDK may briefly list a participant in two rooms; storing both rows
@@ -2835,7 +2898,23 @@ def monitor_snapshot():
                 'participant_uuid': p_uuid,
             }
 
-    rows = list(by_participant.values())
+    # Cross-request dedup: drop rows whose (meeting, participant, room,
+    # 30s-bucket) signature was already written by an earlier POST within
+    # the TTL window. This kills duplicates from multiple MonitorPanel
+    # instances at the source without affecting room-transition rows
+    # (transitions have a different room_name → different key).
+    deduped_rows = []
+    skipped_dups = 0
+    for r in by_participant.values():
+        seen_key = (r['meeting_id'], r['participant_uuid'] or r['participant_name'].lower().strip(),
+                    r['room_name'], bucket)
+        if seen_key in _snapshot_seen:
+            skipped_dups += 1
+            continue
+        _snapshot_seen[seen_key] = time.time()
+        deduped_rows.append(r)
+
+    rows = deduped_rows
     total_participants = len(rows)
 
     if rows:
@@ -2846,15 +2925,19 @@ def monitor_snapshot():
             if errors:
                 print(f"[Monitor] BigQuery insert errors: {errors[:3]}")
                 return jsonify({'success': False, 'error': str(errors[:3])}), 500
-            print(f"[Monitor] Saved snapshot: {len(rooms)} rooms, {total_participants} participants")
+            extra = f" (skipped {skipped_dups} dup)" if skipped_dups else ""
+            print(f"[Monitor] Saved snapshot: {len(rooms)} rooms, {total_participants} participants{extra}")
         except Exception as e:
             print(f"[Monitor] BigQuery error: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
+    elif skipped_dups:
+        print(f"[Monitor] Snapshot fully deduplicated (skipped {skipped_dups} rows from concurrent polling source)")
 
     return jsonify({
         'success': True,
         'rooms': len(rooms),
         'participants': total_participants,
+        'deduplicated': skipped_dups,
         'snapshot_time': snapshot_time
     })
 
@@ -10754,6 +10837,51 @@ def list_teams_by_tag():
 # AUTH ENDPOINTS (BigQuery-based)
 # ==============================================================================
 
+# In-memory rate limiter for /auth/login. Per-instance only (Cloud Run with
+# min-instances=1 makes this effective enough for the threat model: human
+# credential-stuffing on a small admin app). Sliding 60-second window.
+_login_attempts = {}   # key: (ip, username) -> list[unix_ts]
+_login_lockouts = {}   # key: (ip, username) -> unlock_ts
+_LOGIN_MAX_ATTEMPTS = 5
+_LOGIN_WINDOW_SECS = 60
+_LOGIN_LOCKOUT_SECS = 300  # 5 minutes after 5 failures
+
+
+def _login_rate_limit_check(ip, username):
+    """Return (allowed, retry_after_secs).
+    Tracks per-(ip, username) failed attempts in a 60s sliding window;
+    after 5 failures locks the pair out for 5 minutes."""
+    now = time.time()
+    key = (ip, (username or '').lower().strip())
+
+    # Active lockout?
+    unlock = _login_lockouts.get(key)
+    if unlock and now < unlock:
+        return False, int(unlock - now)
+    if unlock:
+        _login_lockouts.pop(key, None)
+
+    # Trim window
+    attempts = [t for t in _login_attempts.get(key, []) if t > now - _LOGIN_WINDOW_SECS]
+    _login_attempts[key] = attempts
+    if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
+        _login_lockouts[key] = now + _LOGIN_LOCKOUT_SECS
+        return False, _LOGIN_LOCKOUT_SECS
+    return True, 0
+
+
+def _login_record_failure(ip, username):
+    key = (ip, (username or '').lower().strip())
+    _login_attempts.setdefault(key, []).append(time.time())
+
+
+def _login_record_success(ip, username):
+    # Successful login clears any counter for this pair
+    key = (ip, (username or '').lower().strip())
+    _login_attempts.pop(key, None)
+    _login_lockouts.pop(key, None)
+
+
 @app.route('/auth/login', methods=['POST'])
 def auth_login():
     """Login endpoint - validates username/password against BigQuery users table"""
@@ -10764,6 +10892,21 @@ def auth_login():
 
         if not username or not password:
             return jsonify({'success': False, 'error': 'Username and password required'}), 400
+
+        # Use the original client IP from the proxy (Cloud Run sets X-Forwarded-For).
+        # Fall back to remote_addr for local dev.
+        ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+              or request.remote_addr or 'unknown')
+
+        allowed, retry_after = _login_rate_limit_check(ip, username)
+        if not allowed:
+            resp = jsonify({
+                'success': False,
+                'error': f'Too many login attempts. Try again in {retry_after} seconds.',
+            })
+            resp.status_code = 429
+            resp.headers['Retry-After'] = str(retry_after)
+            return resp
 
         client = bigquery.Client(project=GCP_PROJECT_ID)
         # Case-insensitive username match, trim whitespace
@@ -10784,9 +10927,11 @@ def auth_login():
         results = list(client.query(query, job_config=job_config).result())
 
         if not results:
+            _login_record_failure(ip, username)
             return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
 
         user = results[0]
+        _login_record_success(ip, username)
         return jsonify({
             'success': True,
             'user': {

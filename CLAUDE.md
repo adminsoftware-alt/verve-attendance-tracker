@@ -379,11 +379,26 @@ src/
 
 ## Version History
 
+- **2026-05-11** (post-audit cleanup): Replaced gap-based break detection with "Break Time room presence only" across every team / employee endpoint. Capture Main Room participants in SDK snapshots. 30-second bucket dedup for break/isolation counts so multi-source polling (HR client + VM) doesn't double-count. Match team members by name OR email (Zoom display-name drift no longer drops users). Auto-start the SDK monitor without manual click. Day View Duration now includes Break Time. Server-side dedup on `/monitor/snapshot` insert. Per-IP `/auth/login` rate limit (5 tries per 60s, 5-min lockout). Wall-clock cap on Zoom API pagination.
 - **Revision 78** (2026-03-27): Enhanced calibration UI with delay selector, live room view, recalibration, reset
 - **Revision 77** (2026-03-05): Security & performance fixes
 - **Revision 76**: Source='webhook_calibration' fix
 - **Revision 75**: SDK verification before BQ save
 - Earlier: Camera tracking, QoS pagination, calibration timing fixes
+
+## Known Issues (audited 2026-05-11, **not yet fixed** — needs discussion)
+
+These are tracked from a project-wide audit. Each touches surface area that affects production data or auth flow, so they were not changed without explicit approval.
+
+- **Plaintext passwords in `app_users` BigQuery table.** Login query does `WHERE TRIM(password) = @password` (app.py:10827). Needs bcrypt/argon2 migration.
+- **`DEFAULT_USERS` fallback in the JS bundle** (`attedance_manager/src/utils/storage.js:14-32`). Plaintext credentials shipped to every browser. Should be deleted.
+- **Webhook signature can be bypassed** by omitting `x-zm-signature` / `x-zm-request-timestamp` (app.py:3583). Should only allow the no-signature path for `endpoint.url_validation` events.
+- **`/chat` accepts client-supplied `role`** (app.py:2757-2758). Pulls role from request JSON instead of server-side session.
+- **All POST/PUT/DELETE endpoints unauthenticated.** `/teams`, `/employees`, `/qos/*`, `/calibration/*`, `/report/generate`, `/auth/users` GET — no auth checks. Needs a `require_auth` decorator pass.
+- **Session in `sessionStorage`** instead of httpOnly cookie. XSS = account takeover.
+- **Test/debug endpoints exposed in prod** (`/debug/reset`, `/test/webhook-insert`, `/test/qos-insert`).
+- **IST midnight timezone drift** on multi-meeting day boundaries (deferred — touches date math used by every report query).
+- **Scout Bot detection is substring match** (`app.py:2047`). "Real Person Scout Bot" bypasses tracking. Should be exact match.
 
 ## graphify
 
