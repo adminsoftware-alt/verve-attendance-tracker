@@ -8160,7 +8160,11 @@ def team_attendance_range(team_id):
             SELECT
                 s.event_date,
                 COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
-                COUNT(*) * 0.5 as break_room_mins
+                -- Dedup multi-source duplicates: if the MonitorPanel is open
+                -- on >1 device (HR client + VM), each polls every 30s and
+                -- writes its own row. Bucketing to 30-second windows keeps
+                -- one count per polling cycle regardless of source.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
@@ -8244,7 +8248,8 @@ def team_attendance_range(team_id):
             SELECT
                 s.event_date,
                 COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
-                COUNT(*) * 30 as isolation_seconds
+                -- Bucket to 30-second windows to dedup multi-source polls.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
@@ -8755,7 +8760,9 @@ def team_monthly_report(team_id):
               NULLIF(LOWER(TRIM(rs.participant_email)), ''),
               LOWER(TRIM(rs.participant_name))
             ) as participant_key,
-            COUNT(*) * 0.5 as break_room_mins
+            -- Dedup multi-source duplicates: bucket to 30-second windows
+            -- so polls from multiple devices count once per cycle.
+            COUNT(DISTINCT DIV(UNIX_SECONDS(rs.snapshot_time), 30)) * 0.5 as break_room_mins
           FROM `{dataset_ref}.room_snapshots` rs
           LEFT JOIN name_to_key ntk ON rs.event_date = ntk.event_date AND LOWER(TRIM(rs.participant_name)) = ntk.name_key
           WHERE rs.event_date >= @start_date AND rs.event_date <= @end_date
@@ -11736,7 +11743,11 @@ def list_unrecognized_monthly():
             SELECT
                 s.event_date,
                 LOWER(TRIM(s.participant_name)) as name_key,
-                COUNT(*) * 0.5 as break_room_mins
+                -- Dedup multi-source duplicates: if the MonitorPanel is open
+                -- on >1 device (HR client + VM), each polls every 30s and
+                -- writes its own row. Bucketing to 30-second windows keeps
+                -- one count per polling cycle regardless of source.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
             FROM `{dataset_ref}.room_snapshots` s
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
@@ -11760,7 +11771,8 @@ def list_unrecognized_monthly():
             SELECT
                 s.event_date,
                 LOWER(TRIM(s.participant_name)) as name_key,
-                COUNT(*) * 30 as isolation_seconds
+                -- Bucket to 30-second windows to dedup multi-source polls.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN room_occupancy ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
@@ -12156,7 +12168,11 @@ def list_classified_monthly():
             SELECT
                 s.event_date,
                 LOWER(TRIM(s.participant_name)) as name_key,
-                COUNT(*) * 0.5 as break_room_mins
+                -- Dedup multi-source duplicates: if the MonitorPanel is open
+                -- on >1 device (HR client + VM), each polls every 30s and
+                -- writes its own row. Bucketing to 30-second windows keeps
+                -- one count per polling cycle regardless of source.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
             FROM `{dataset_ref}.room_snapshots` s
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
@@ -12180,7 +12196,8 @@ def list_classified_monthly():
             SELECT
                 s.event_date,
                 LOWER(TRIM(s.participant_name)) as name_key,
-                COUNT(*) * 30 as isolation_seconds
+                -- Bucket to 30-second windows to dedup multi-source polls.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN room_occupancy ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
@@ -12371,7 +12388,11 @@ def employee_attendance_detail(employee_id, date):
         break_room_time AS (
             SELECT
                 s.event_date,
-                COUNT(*) * 0.5 as break_room_mins
+                -- Dedup multi-source duplicates: if the MonitorPanel is open
+                -- on >1 device (HR client + VM), each polls every 30s and
+                -- writes its own row. Bucketing to 30-second windows keeps
+                -- one count per polling cycle regardless of source.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN emp_keys ek
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
@@ -12604,7 +12625,11 @@ def employee_yearly_report(employee_id):
         break_room_time AS (
             SELECT
                 s.event_date,
-                COUNT(*) * 0.5 as break_room_mins
+                -- Dedup multi-source duplicates: if the MonitorPanel is open
+                -- on >1 device (HR client + VM), each polls every 30s and
+                -- writes its own row. Bucketing to 30-second windows keeps
+                -- one count per polling cycle regardless of source.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN emp_keys ek
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
