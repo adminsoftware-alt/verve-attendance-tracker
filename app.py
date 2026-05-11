@@ -8594,16 +8594,17 @@ def compare_teams():
                                 TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
                             ELSE 0  -- After long gap, start marker for new presence period
                         END
-                    )) as active_mins,
-                    SUM(CASE WHEN prev_snapshot IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
-                        THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_secs
+                    )) as active_mins
+                    -- break_secs removed: gap-based detection treated session
+                    -- boundaries (left and rejoined) as breaks. Break metrics
+                    -- now derive from Break Time room presence elsewhere.
                 FROM snaps
                 GROUP BY participant_key
             )
             SELECT
                 COUNT(*) as present,
                 ROUND(AVG(active_mins), 0) as avg_active,
-                ROUND(AVG(break_secs / 60), 0) as avg_break,
+                0 as avg_break,
                 FORMAT_TIMESTAMP('%H:%M', MIN(first_seen)) as earliest_arrival,
                 FORMAT_TIMESTAMP('%H:%M', MAX(last_seen)) as latest_departure
             FROM per_person
@@ -12361,6 +12362,7 @@ def employee_attendance_detail(employee_id, date):
 
         emp = emp_rows[0]
         emp_name = emp.participant_name
+        emp_email = (getattr(emp, 'participant_email', '') or '').strip().lower()
 
         # Parse year-month
         parts = date.split('-')
@@ -12377,12 +12379,19 @@ def employee_attendance_detail(employee_id, date):
         # "Shashank-1") still count toward this employee's attendance.
         query = f"""
         WITH emp_keys AS (
+            -- Match by name OR email. Zoom display names drift from the
+            -- canonical employee_registry name (e.g. "Sayli S" vs "Sayli
+            -- Sonone"), and a name-only match would silently drop all
+            -- that user's data.
             SELECT DISTINCT
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key
             FROM `{dataset_ref}.room_snapshots`
             WHERE event_date >= @start_date AND event_date <= @end_date
-              AND LOWER(TRIM(participant_name)) = LOWER(TRIM(@emp_name))
               AND participant_name IS NOT NULL AND participant_name != ''
+              AND (
+                LOWER(TRIM(participant_name)) = LOWER(TRIM(@emp_name))
+                OR (@emp_email != '' AND LOWER(TRIM(participant_email)) = @emp_email)
+              )
         ),
         -- Dedupe before windowing so SDK transition artifacts (two rooms
         -- at the same snapshot) don't inflate breaks or active intervals.
@@ -12448,15 +12457,10 @@ def employee_attendance_detail(employee_id, date):
             FROM snaps_with_lag
             GROUP BY event_date
         ),
-        breaks AS (
-            SELECT
-                event_date,
-                SUM(CASE WHEN prev_time IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 300
-                    THEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) - 30
-                    ELSE 0 END) as break_secs
-            FROM snaps_with_lag
-            GROUP BY event_date
-        ),
+        -- Break time = time in "Break Time" room only (break_room_time above).
+        -- Gap-based break detection was removed because long absences (left
+        -- meeting / SDK outage / leave day) couldn't be distinguished from
+        -- real breaks and inflated the number wildly.
         isolation AS (
             SELECT
                 event_date,
@@ -12484,10 +12488,9 @@ def employee_attendance_detail(employee_id, date):
             FORMAT_TIMESTAMP('%H:%M', sn.first_seen) as first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', sn.last_seen) as last_seen_ist,
             sn.active_mins,
-            COALESCE(ROUND(b.break_secs / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
+            COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(i.iso_secs / 60), 0) as isolation_mins
         FROM snaps sn
-        LEFT JOIN breaks b ON sn.event_date = b.event_date
         LEFT JOIN break_room_time brt ON sn.event_date = brt.event_date
         LEFT JOIN isolation i ON sn.event_date = i.event_date
         ORDER BY sn.event_date
@@ -12497,6 +12500,7 @@ def employee_attendance_detail(employee_id, date):
             bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
             bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
             bigquery.ScalarQueryParameter("emp_name", "STRING", emp_name),
+            bigquery.ScalarQueryParameter("emp_email", "STRING", emp_email),
         ])
         rows = list(client.query(query, job_config=job_config).result())
 
@@ -12590,6 +12594,7 @@ def employee_yearly_report(employee_id):
 
         emp = emp_rows[0]
         emp_name = emp.participant_name
+        emp_email = (getattr(emp, 'participant_email', '') or '').strip().lower()
 
         # Get year parameter (default to current year)
         year = int(request.args.get('year', get_ist_now().year))
@@ -12618,12 +12623,19 @@ def employee_yearly_report(employee_id):
 
         query = f"""
         WITH emp_keys AS (
+            -- Match by name OR email. Zoom display names drift from the
+            -- canonical employee_registry name (e.g. "Sayli S" vs "Sayli
+            -- Sonone"), and a name-only match would silently drop all
+            -- that user's data.
             SELECT DISTINCT
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key
             FROM `{dataset_ref}.room_snapshots`
             WHERE event_date >= @start_date AND event_date <= @end_date
-              AND LOWER(TRIM(participant_name)) = LOWER(TRIM(@emp_name))
               AND participant_name IS NOT NULL AND participant_name != ''
+              AND (
+                LOWER(TRIM(participant_name)) = LOWER(TRIM(@emp_name))
+                OR (@emp_email != '' AND LOWER(TRIM(participant_email)) = @emp_email)
+              )
         ),
         -- Dedupe first: if the SDK briefly listed this person in two rooms
         -- at the same snapshot_time, collapse to one row.
@@ -12691,15 +12703,10 @@ def employee_yearly_report(employee_id):
             FROM snaps_with_lag
             GROUP BY event_date, month_num
         ),
-        breaks AS (
-            SELECT
-                event_date,
-                SUM(CASE WHEN prev_time IS NOT NULL AND TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) > 300
-                    THEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) - 30
-                    ELSE 0 END) as break_secs
-            FROM snaps_with_lag
-            GROUP BY event_date
-        ),
+        -- Break time = time in "Break Time" room only (break_room_time above).
+        -- Gap-based break detection was removed because long absences (left
+        -- meeting / SDK outage / leave day) couldn't be distinguished from
+        -- real breaks and inflated the number wildly.
         isolation AS (
             SELECT
                 event_date,
@@ -12728,10 +12735,9 @@ def employee_yearly_report(employee_id):
             ds.active_mins,
             EXTRACT(HOUR FROM ds.first_seen) * 60 + EXTRACT(MINUTE FROM ds.first_seen) as login_mins,
             EXTRACT(HOUR FROM ds.last_seen) * 60 + EXTRACT(MINUTE FROM ds.last_seen) as logout_mins,
-            COALESCE(ROUND(b.break_secs / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
+            COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(i.iso_secs / 60), 0) as isolation_mins
         FROM daily_stats ds
-        LEFT JOIN breaks b ON ds.event_date = b.event_date
         LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date
         LEFT JOIN isolation i ON ds.event_date = i.event_date
         ORDER BY ds.event_date
@@ -12741,6 +12747,7 @@ def employee_yearly_report(employee_id):
             bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
             bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
             bigquery.ScalarQueryParameter("emp_name", "STRING", emp_name),
+            bigquery.ScalarQueryParameter("emp_email", "STRING", emp_email),
         ])
         rows = list(client.query(query, job_config=job_config).result())
 
