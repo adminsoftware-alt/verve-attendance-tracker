@@ -7699,7 +7699,10 @@ def team_attendance(team_id, date):
         isolation_summary AS (
             SELECT
                 participant_key,
-                COUNT(*) * 30 as isolation_seconds
+                -- Bucket to 30s windows: multi-source polls (HR client + VM)
+                -- write rows with millisecond-different timestamps, so the
+                -- per-timestamp dedup in clean_snapshots doesn't catch them.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(snapshot_time), 30)) * 30 as isolation_seconds
             FROM isolation_snapshots
             GROUP BY participant_key
         ),
@@ -8819,7 +8822,11 @@ def team_monthly_report(team_id):
           SELECT
             sc.event_date,
             sc.participant_key,
-            COUNT(*) * 0.5 as isolation_mins
+            -- Bucket to 30s windows: multi-source polls (HR client + VM)
+            -- have millisecond-different timestamps, so snapshot_clean's
+            -- per-timestamp QUALIFY dedup doesn't catch them. Without this
+            -- bucketing, the same minute of solitude can count 2x.
+            COUNT(DISTINCT DIV(UNIX_SECONDS(sc.snapshot_time), 30)) * 0.5 as isolation_mins
           FROM snapshot_clean sc
           INNER JOIN room_occupancy ro
             ON sc.event_date = ro.event_date AND sc.snapshot_time = ro.snapshot_time AND sc.room_name = ro.room_name
