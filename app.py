@@ -7860,7 +7860,12 @@ def team_attendance(team_id, date):
                 LEAD(event_type) OVER (PARTITION BY participant_name ORDER BY rn) as next_event_type
             FROM participant_events
         ),
-        breaks AS (
+        -- "Absence" gaps between leave/rejoin webhooks. We do NOT report
+        -- these as break time (break = Break Time room presence only,
+        -- matching the rest of the app). We DO subtract them from
+        -- duration_mins below so a user who left at 11 AM and rejoined at
+        -- 5 PM isn't credited with 6h of attendance.
+        absence_gaps AS (
             SELECT participant_name,
                    TIMESTAMP_DIFF(next_event_ts, event_ts, MINUTE) as gap_mins
             FROM with_next
@@ -7868,9 +7873,9 @@ def team_attendance(team_id, date):
               AND next_event_type IN ('participant_joined', 'meeting.participant_joined')
               AND TIMESTAMP_DIFF(next_event_ts, event_ts, MINUTE) > 5
         ),
-        break_totals AS (
-            SELECT participant_name, SUM(gap_mins) as break_mins
-            FROM breaks
+        absence_totals AS (
+            SELECT participant_name, SUM(gap_mins) as absence_mins
+            FROM absence_gaps
             GROUP BY participant_name
         ),
         summary AS (
@@ -7893,10 +7898,15 @@ def team_attendance(team_id, date):
             GROUP BY pe.participant_name, pe.participant_email
         )
         SELECT s.participant_name, s.participant_email, s.joined_ist, s.left_ist,
-               COALESCE(s.total_span_mins, 0) - COALESCE(b.break_mins, 0) as duration_mins,
-               COALESCE(b.break_mins, 0) as break_mins
+               -- Actual time in meeting = total span minus the gaps when
+               -- they had left and not yet rejoined.
+               COALESCE(s.total_span_mins, 0) - COALESCE(b.absence_mins, 0) as duration_mins,
+               -- Break time stays 0 for webhook-only users: by definition
+               -- they never entered a breakout room (so no Break Time room
+               -- presence). Gaps above are absence, not break.
+               0 as break_mins
         FROM summary s
-        LEFT JOIN break_totals b ON s.participant_name = b.participant_name
+        LEFT JOIN absence_totals b ON s.participant_name = b.participant_name
         """
         # Normalize webhook_rows keys so renamers (e.g. "Shashank" + "Shashank-1")
         # collide into one bucket — otherwise we'd double-count webhook duration
@@ -7967,7 +7977,7 @@ def team_attendance(team_id, date):
             if key not in snapshot_names and key in webhook_rows:
                 wr = webhook_rows[key]
                 dur = wr.duration_mins or 0
-                wb_break = getattr(wr, 'break_mins', 0) or 0  # Break time from leave→rejoin gaps
+                wb_break = 0  # Webhook-only users have no Break Time room presence
                 if dur >= 300:
                     status = 'present'
                 elif dur >= 240:
