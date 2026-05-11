@@ -7933,9 +7933,15 @@ def team_attendance(team_id, date):
             meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
 
             # Cap main_fill to prevent phantom time from webhook span inflation.
-            # Use 120-minute cap (same as attendance_summary endpoint).
+            # Day view caps each Main Room slice (before / between / after) at
+            # 120 mins individually, so it can legitimately credit up to 360
+            # mins of Main Room across a day. Use 360 here so historical days
+            # (where SDK snapshots never recorded Main Room) match day view.
+            # Phantom inflation is still bounded by (a) meeting_left clamped to
+            # last snapshot timestamp and (b) main_fill = 0 when user had
+            # breakout webhooks but zero snapshot coverage.
             if r.total_active_mins > 0:
-                main_fill = min(main_fill, 120)
+                main_fill = min(main_fill, 360)
 
             main_room = main_fill + main_snapshot
             # Combine tracked active time with webhook gap-fill for untracked main room.
@@ -8408,10 +8414,15 @@ def team_attendance_range(team_id):
             breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else r.active_mins
 
             # Cap main_fill to prevent phantom time from webhook span inflation.
-            # Use 120-minute cap (same as attendance_summary endpoint) instead of
-            # percentage-based cap which was too restrictive.
+            # Day view caps each Main Room slice (before / between / after) at
+            # 120 mins individually, so it can legitimately credit up to 360
+            # mins of Main Room across a day. Use 360 here so historical days
+            # (where SDK snapshots never recorded Main Room) match day view.
+            # Phantom inflation is still bounded by (a) meeting_left clamped to
+            # last snapshot timestamp and (b) main_fill = 0 when user had
+            # breakout webhooks but zero snapshot coverage.
             if r.active_mins > 0:
-                main_fill = min(main_fill, 120)
+                main_fill = min(main_fill, 360)
 
             main_room = main_fill + main_snapshot
             total_mins = r.active_mins + main_fill if r.active_mins > 0 else meeting_dur
@@ -8715,6 +8726,12 @@ def team_monthly_report(team_id):
           FROM participant_name_map
           GROUP BY event_date, name_key
         ),
+        email_to_key AS (
+          SELECT event_date, email_key, MIN(participant_key) as participant_key
+          FROM participant_name_map
+          WHERE email_key IS NOT NULL
+          GROUP BY event_date, email_key
+        ),
         snapshot_clean AS (
           SELECT
             rs.event_date,
@@ -8817,6 +8834,59 @@ def team_monthly_report(team_id):
             ON sc.event_date = ro.event_date AND sc.snapshot_time = ro.snapshot_time AND sc.room_name = ro.room_name
           WHERE ro.occupant_count = 1
           GROUP BY sc.event_date, sc.participant_key
+        ),
+        -- Last SDK snapshot per day: hard end of the monitoring window.
+        -- Beyond it we had no visibility; any Main Room time inferred past
+        -- this point would be phantom attendance from a monitoring outage.
+        daily_monitoring_window AS (
+          SELECT event_date, MAX(snapshot_time) as last_snapshot_ts
+          FROM `{dataset_ref}.room_snapshots`
+          WHERE event_date >= @start_date AND event_date <= @end_date
+          GROUP BY event_date
+        ),
+        -- Did this participant have ANY breakout_room_joined webhook today?
+        -- Used to detect users who were in breakouts the SDK never saw —
+        -- in that case Main Room time should be 0, not the entire meeting.
+        daily_breakout_webhooks AS (
+          SELECT
+            pe.event_date,
+            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+            COUNT(*) as breakout_joined_count
+          FROM `{dataset_ref}.participant_events` pe
+          LEFT JOIN email_to_key etk
+            ON pe.event_date = etk.event_date
+           AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+          LEFT JOIN name_to_key ntk
+            ON pe.event_date = ntk.event_date
+           AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
+          WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
+            AND pe.event_type = 'breakout_room_joined'
+            AND pe.participant_name IS NOT NULL
+            AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+          GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
+        ),
+        -- Main meeting time from webhooks for gap-filling Main Room time
+        -- that SDK snapshots didn't capture. Bridges to UUID via separate
+        -- name/email lookups against the snapshot-derived key.
+        daily_webhook AS (
+          SELECT
+            pe.event_date,
+            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+            MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
+                THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_joined_ts,
+            MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
+                THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_left_ts
+          FROM `{dataset_ref}.participant_events` pe
+          LEFT JOIN email_to_key etk
+            ON pe.event_date = etk.event_date
+           AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+          LEFT JOIN name_to_key ntk
+            ON pe.event_date = ntk.event_date
+           AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
+          WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
+            AND pe.participant_name IS NOT NULL
+            AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+          GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
         )
         SELECT
           ds.event_date,
@@ -8827,10 +8897,28 @@ def team_monthly_report(team_id):
           ds.total_mins,
           ds.breakout_mins,
           COALESCE(brt.break_room_mins, 0) as break_mins,
-          COALESCE(di.isolation_mins, 0) as isolation_mins
+          COALESCE(di.isolation_mins, 0) as isolation_mins,
+          -- Webhook-derived Main Room time NOT captured by snapshots.
+          -- Same safeguards as team_attendance_range:
+          --   (a) meeting_left clamped to last SDK snapshot of the day
+          --   (b) force 0 if user had breakout webhooks but zero snapshot coverage
+          CASE
+            WHEN COALESCE(dbw.breakout_joined_count, 0) > 0 AND COALESCE(ds.total_mins, 0) = 0
+            THEN 0
+            ELSE GREATEST(
+              COALESCE(TIMESTAMP_DIFF(
+                  LEAST(dw.meeting_left_ts, COALESCE(mw.last_snapshot_ts, dw.meeting_left_ts)),
+                  dw.meeting_joined_ts,
+                  MINUTE), 0)
+              - ds.total_mins - COALESCE(ROUND(brt.break_room_mins), 0),
+              0)
+          END as main_room_fill_mins
         FROM daily_stats ds
         LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.participant_key = brt.participant_key
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
+        LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
+        LEFT JOIN daily_monitoring_window mw ON ds.event_date = mw.event_date
+        LEFT JOIN daily_breakout_webhooks dbw ON ds.event_date = dbw.event_date AND ds.participant_key = dbw.participant_key
         ORDER BY ds.participant_name, ds.event_date
         """
 
@@ -8853,10 +8941,19 @@ def team_monthly_report(team_id):
             date_str = str(r.event_date)
             key = (name_key, date_str)
 
-            total_mins = int(r.total_mins or 0)
+            snap_total_mins = int(r.total_mins or 0)
             breakout_mins = int(r.breakout_mins or 0)
             break_mins = int(r.break_mins or 0)
             isolation_mins = int(r.isolation_mins or 0)
+            # Webhook-derived Main Room time NOT captured by SDK snapshots.
+            # Capped at 360 mins to match day view's per-slice cap (3 slices ×
+            # 120) — keeps historical days (no Main Room snapshots in BQ)
+            # consistent with the day view total. Going forward, SDK now
+            # records Main Room participants so this fill will be ~0.
+            main_room_fill = int(r.main_room_fill_mins or 0) if hasattr(r, 'main_room_fill_mins') else 0
+            if snap_total_mins > 0:
+                main_room_fill = min(main_room_fill, 360)
+            total_mins = snap_total_mins + main_room_fill
 
             if key not in aggregated:
                 display_name, member_email = team_member_info.get(name_key, (r.participant_name, r.participant_email or ''))
@@ -8873,10 +8970,10 @@ def team_monthly_report(team_id):
                     'isolation_minutes': 0
                 }
 
-            # Sum up the values (total_mins = breakout + main room from interval-sum)
+            # Sum up the values (total_mins = snapshot interval-sum + webhook-derived Main Room fill)
             aggregated[key]['active_minutes'] += total_mins
             aggregated[key]['breakout_minutes'] += breakout_mins
-            # Main room = total - breakout (what's left after breakout time)
+            # Main room = total - breakout (snapshot main room + webhook fill)
             aggregated[key]['main_room_minutes'] += max(0, total_mins - breakout_mins)
             aggregated[key]['break_minutes'] += break_mins
             aggregated[key]['isolation_minutes'] += isolation_mins

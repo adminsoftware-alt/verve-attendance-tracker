@@ -100,8 +100,13 @@ function MonitorPanel() {
 
       // Approach 1: Use participants with breakoutRoomUUID
       if (allParticipants.length > 0) {
-        // Group participants by their breakout room
+        // Group participants by their breakout room. Participants with no
+        // breakoutRoomUUID (or one that doesn't match any known breakout) are
+        // in the Main Room — record them under "Main Room" so reports can
+        // credit Main Room time from snapshots instead of inferring it from
+        // webhook gaps (which under-counts when SDK has full coverage).
         const participantsByRoom = {};
+        const mainRoomParticipants = [];
         allParticipants.forEach(p => {
           const roomUUID = p.breakoutRoomUUID || p.boRoomUUID || '';
           const pName = getParticipantName(p);
@@ -112,15 +117,21 @@ function MonitorPanel() {
             return;
           }
 
+          if (!pName) return;
+
+          const personEntry = {
+            name: pName,
+            email: pEmail,
+            uuid: p.participantUUID || p.uuid || p.id || ''
+          };
+
           if (roomUUID && roomMap[roomUUID]) {
             if (!participantsByRoom[roomUUID]) {
               participantsByRoom[roomUUID] = { room_name: roomMap[roomUUID], participants: [] };
             }
-            participantsByRoom[roomUUID].participants.push({
-              name: pName,
-              email: pEmail,
-              uuid: p.participantUUID || p.uuid || p.id || ''
-            });
+            participantsByRoom[roomUUID].participants.push(personEntry);
+          } else {
+            mainRoomParticipants.push(personEntry);
           }
         });
 
@@ -129,6 +140,10 @@ function MonitorPanel() {
             roomData.push(room);
           }
         });
+
+        if (mainRoomParticipants.length > 0) {
+          roomData.push({ room_name: 'Main Room', participants: mainRoomParticipants });
+        }
       }
 
       // Approach 2: Fall back to room.participants if no participants from getMeetingParticipants
