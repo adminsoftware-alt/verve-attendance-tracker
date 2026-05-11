@@ -39,13 +39,10 @@ function MonitorPanel() {
     isConfigured,
     error: sdkError,
     meetingContext,
-    userContext,
-    isHost,
     getBreakoutRooms,
     getParticipants,
     getMeetingUUID,
-    refreshUserRole,
-    forceHostMode
+    refreshUserRole
   } = useZoomSdk();
 
   const [isMonitoring, setIsMonitoring] = useState(false);
@@ -267,33 +264,45 @@ function MonitorPanel() {
     };
   }, []);
 
-  // AUTO-RETRY: If not host, try refreshing role a few times
+  // Background role refresh for logging only - does NOT gate monitoring.
+  // Auto-start fires on SDK config regardless of detected role.
   const [retryCount, setRetryCount] = useState(0);
   useEffect(() => {
-    if (isConfigured && !isHost && retryCount < 3) {
+    if (isConfigured && retryCount < 3) {
       const timer = setTimeout(async () => {
-        console.log(`Auto-retry role check ${retryCount + 1}/3`);
         await refreshUserRole();
         setRetryCount(prev => prev + 1);
-      }, 2000);  // Retry every 2 seconds
+      }, 2000);
       return () => clearTimeout(timer);
     }
-  }, [isConfigured, isHost, retryCount, refreshUserRole]);
+  }, [isConfigured, retryCount, refreshUserRole]);
 
-  // AUTO-START: Begin monitoring as soon as SDK is ready.
-  // Zoom's user role can be delayed or inconsistent, so after a few role refreshes
-  // we start optimistically and let the SDK calls prove whether access is allowed.
+  // AUTO-START: Begin monitoring as soon as SDK is ready. No role gate.
+  // SDK calls will surface a permission error if the bot truly isn't host/co-host.
   useEffect(() => {
-    const roleRetriesDone = retryCount >= 3;
-    const shouldStart = isConfigured && (isHost || roleRetriesDone) && !isMonitoringRef.current && !isStartingRef.current;
+    const shouldStart = isConfigured && !isMonitoringRef.current && !isStartingRef.current;
 
     if (shouldStart && !autoStarted) {
       setAutoStarted(true);
-      addLog(isHost ? 'Auto-starting monitor (host/co-host detected)' : 'Auto-starting monitor after role retries');
-      const timer = setTimeout(() => startMonitoring(), 2000);
+      addLog('Auto-starting monitor');
+      const timer = setTimeout(() => startMonitoring(), 1000);
       return () => clearTimeout(timer);
     }
-  }, [isConfigured, isHost, retryCount, autoStarted, startMonitoring, addLog]);
+  }, [isConfigured, autoStarted, startMonitoring, addLog]);
+
+  // KEEP-ALIVE: warn user before closing the panel while monitoring is active.
+  // Won't fully block close in every webview, but adds friction for accidental clicks.
+  useEffect(() => {
+    const handler = (e) => {
+      if (isMonitoringRef.current) {
+        e.preventDefault();
+        e.returnValue = 'Monitoring is active. Closing this panel will stop attendance tracking.';
+        return e.returnValue;
+      }
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, []);
 
   // WATCHDOG: keep monitoring alive while the Zoom App panel is loaded.
   useEffect(() => {
@@ -341,47 +350,6 @@ function MonitorPanel() {
             <span style={styles.statusText}>{sdkError || 'Connecting to Zoom...'}</span>
           </div>
         </div>
-      </div>
-    );
-  }
-
-  // Not host - show debug info and retry options
-  if (!isHost) {
-    const detectedRole = userContext?.role || userContext?.userRole || 'unknown';
-    return (
-      <div style={styles.container}>
-        <h2 style={styles.title}>Room Monitor</h2>
-        <div style={styles.errorBox}>
-          <p style={styles.errorText}>Requires host or co-host role</p>
-          <p style={{ color: '#888', fontSize: '10px', margin: '8px 0' }}>
-            Detected role: "{String(detectedRole)}"
-          </p>
-          <p style={{ color: '#666', fontSize: '9px', margin: '4px 0' }}>
-            User context: {JSON.stringify(userContext || {}).substring(0, 100)}...
-          </p>
-        </div>
-        <div style={styles.actions}>
-          <button
-            style={styles.startButton}
-            onClick={async () => {
-              const result = await refreshUserRole();
-              console.log('Role refresh result:', result);
-            }}
-          >
-            Refresh Role
-          </button>
-          <button
-            style={{ ...styles.stopButton, backgroundColor: '#FF9800' }}
-            onClick={() => {
-              forceHostMode();
-            }}
-          >
-            Force Start
-          </button>
-        </div>
-        <p style={{ color: '#666', fontSize: '9px', textAlign: 'center' }}>
-          If you ARE a co-host, click "Force Start" to bypass this check
-        </p>
       </div>
     );
   }

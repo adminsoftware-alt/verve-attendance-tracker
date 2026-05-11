@@ -17,7 +17,9 @@ export function useZoomSdk() {
   const [error, setError] = useState(null);
   const [meetingContext, setMeetingContext] = useState(null);
   const [userContext, setUserContext] = useState(null);
-  const [isHost, setIsHost] = useState(false);
+  // Default to true so monitoring proceeds without manual click.
+  // SDK calls will surface a permission error if the user truly isn't host/co-host.
+  const [isHost, setIsHost] = useState(true);
   const [roleCheckCount, setRoleCheckCount] = useState(0);
 
   // Initialize SDK
@@ -69,11 +71,11 @@ export function useZoomSdk() {
             user.userRole === 1 ||
             user.userRole === 2;
 
-          setIsHost(isHostOrCohost);
-          console.log('Detected role:', role, '-> isHost:', isHostOrCohost);
+          // Stay optimistic: never flip isHost to false here. Let SDK calls prove access.
+          if (isHostOrCohost) setIsHost(true);
+          console.log('Detected role:', role, '-> isHostOrCohost:', isHostOrCohost, '(isHost stays true regardless)');
         } catch (e) {
           console.log('Could not get user context:', e.message);
-          // If we can't get user context, try to proceed anyway (will fail on SDK calls if not host)
           setIsHost(true);  // Optimistically allow, SDK will reject if no permission
           console.log('Setting isHost=true optimistically');
         }
@@ -248,8 +250,9 @@ export function useZoomSdk() {
         user.userRole === 1 ||
         user.userRole === 2;
 
-      setIsHost(isHostOrCohost);
-      console.log('Refresh - Detected role:', role, '-> isHost:', isHostOrCohost);
+      // Only ever raise isHost to true; never lower it (keeps auto-start sticky).
+      if (isHostOrCohost) setIsHost(true);
+      console.log('Refresh - Detected role:', role, '-> isHostOrCohost:', isHostOrCohost);
       return { role, isHost: isHostOrCohost, user };
     } catch (e) {
       console.error('Failed to refresh user role:', e);
