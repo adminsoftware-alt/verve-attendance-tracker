@@ -7661,13 +7661,28 @@ def team_attendance(team_id, date):
             FROM snapshots_with_gap
             GROUP BY participant_key
         ),
-        -- Break detection: find gaps where participant was NOT seen
+        -- Break detection: find gaps where participant was NOT seen.
+        -- Use a presence set that INCLUDES Break Time, otherwise time spent
+        -- in the "Break Time" room shows up as a missing-snapshot gap AND
+        -- is also added separately via break_room_summary -> double count.
+        all_team_presence AS (
+            SELECT DISTINCT
+                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                s.snapshot_time
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_member_keys tmk
+                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+            WHERE s.event_date = @report_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND s.participant_name IS NOT NULL AND s.participant_name != ''
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+        ),
         participant_snapshots AS (
             SELECT
-                cs.participant_key,
-                cs.snapshot_time,
-                LAG(cs.snapshot_time) OVER (PARTITION BY cs.participant_key ORDER BY cs.snapshot_time) as prev_snapshot
-            FROM clean_snapshots cs
+                participant_key,
+                snapshot_time,
+                LAG(snapshot_time) OVER (PARTITION BY participant_key ORDER BY snapshot_time) as prev_snapshot
+            FROM all_team_presence
         ),
         break_gaps AS (
             SELECT
@@ -7709,6 +7724,10 @@ def team_attendance(team_id, date):
             INNER JOIN room_occupancy ro
                 ON cs.snapshot_time = ro.snapshot_time AND cs.room_name = ro.room_name
             WHERE ro.occupant_count = 1
+              -- Alone in Main Room (e.g. first to join) isn't isolation in
+              -- the work sense; only count solitude in breakout rooms.
+              AND LOWER(cs.room_name) != 'main room'
+              AND LOWER(cs.room_name) NOT LIKE '0.main%'
         ),
         isolation_summary AS (
             SELECT
@@ -8240,6 +8259,33 @@ def team_attendance_range(team_id):
             FROM ordered_snaps
             GROUP BY event_date, participant_key
         ),
+        -- Build a presence set for break-gap detection that INCLUDES Break
+        -- Time. ordered_snaps excludes Break Time (it's used for active
+        -- time), so reusing it here would treat time in the "Break Time"
+        -- room as a missing-snapshot gap AND add break_room_mins on top,
+        -- double-counting that time as break.
+        all_team_presence AS (
+            SELECT DISTINCT
+                s.event_date,
+                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                s.snapshot_time
+            FROM `{dataset_ref}.room_snapshots` s
+            INNER JOIN team_member_keys tmk
+                ON s.event_date = tmk.event_date
+               AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND s.participant_name IS NOT NULL
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+        ),
+        gap_ordered AS (
+            SELECT
+                event_date,
+                participant_key,
+                snapshot_time,
+                LAG(snapshot_time) OVER (PARTITION BY event_date, participant_key ORDER BY snapshot_time) as prev_snapshot
+            FROM all_team_presence
+        ),
         daily_breaks AS (
             SELECT
                 event_date,
@@ -8247,7 +8293,7 @@ def team_attendance_range(team_id):
                 SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
                     THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_seconds,
                 COUNT(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300 THEN 1 END) as break_count
-            FROM ordered_snaps
+            FROM gap_ordered
             WHERE prev_snapshot IS NOT NULL
             GROUP BY event_date, participant_key
         ),
@@ -8276,6 +8322,10 @@ def team_attendance_range(team_id):
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND ro.occupant_count = 1
               AND s.room_name IS NOT NULL AND s.room_name != ''
+              -- Alone in Main Room isn't isolation in the work sense; only
+              -- count breakout-room solitude.
+              AND LOWER(s.room_name) != 'main room'
+              AND LOWER(s.room_name) NOT LIKE '0.main%'
             GROUP BY s.event_date, participant_key
         ),
         -- Last SDK snapshot per day: hard end of the monitoring window. Beyond
@@ -8833,7 +8883,49 @@ def team_monthly_report(team_id):
           INNER JOIN room_occupancy ro
             ON sc.event_date = ro.event_date AND sc.snapshot_time = ro.snapshot_time AND sc.room_name = ro.room_name
           WHERE ro.occupant_count = 1
+            -- Being alone in Main Room (e.g. first to join the meeting) isn't
+            -- isolation in the work sense; only count breakout-room solitude.
+            AND LOWER(sc.room_name) != 'main room'
+            AND LOWER(sc.room_name) NOT LIKE '0.main%'
           GROUP BY sc.event_date, sc.participant_key
+        ),
+        -- Per-day break gaps. Uses a presence set that INCLUDES Break Time so
+        -- a stretch in the "Break Time" room doesn't show up as a disconnect
+        -- gap (which would double-count with break_room_mins below).
+        all_team_presence AS (
+          SELECT DISTINCT
+            rs.event_date,
+            COALESCE(
+              ntk.participant_key,
+              NULLIF(rs.participant_uuid, ''),
+              NULLIF(LOWER(TRIM(rs.participant_email)), ''),
+              LOWER(TRIM(rs.participant_name))
+            ) as participant_key,
+            rs.snapshot_time
+          FROM `{dataset_ref}.room_snapshots` rs
+          LEFT JOIN name_to_key ntk ON rs.event_date = ntk.event_date AND LOWER(TRIM(rs.participant_name)) = ntk.name_key
+          WHERE rs.event_date >= @start_date AND rs.event_date <= @end_date
+            AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
+            AND rs.room_name IS NOT NULL AND rs.room_name != ''
+            AND LOWER(rs.participant_name) NOT LIKE '%scout%'
+        ),
+        gap_ordered AS (
+          SELECT
+            event_date,
+            participant_key,
+            snapshot_time,
+            LAG(snapshot_time) OVER (PARTITION BY event_date, participant_key ORDER BY snapshot_time) as prev_snapshot
+          FROM all_team_presence
+        ),
+        daily_breaks AS (
+          SELECT
+            event_date,
+            participant_key,
+            SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
+                THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_seconds
+          FROM gap_ordered
+          WHERE prev_snapshot IS NOT NULL
+          GROUP BY event_date, participant_key
         ),
         -- Last SDK snapshot per day: hard end of the monitoring window.
         -- Beyond it we had no visibility; any Main Room time inferred past
@@ -8896,7 +8988,8 @@ def team_monthly_report(team_id):
           FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
           ds.total_mins,
           ds.breakout_mins,
-          COALESCE(brt.break_room_mins, 0) as break_mins,
+          -- Combined break: time away (gaps > 5 min) + time in "Break Time" room
+          COALESCE(ROUND(db.break_seconds / 60), 0) + COALESCE(brt.break_room_mins, 0) as break_mins,
           COALESCE(di.isolation_mins, 0) as isolation_mins,
           -- Webhook-derived Main Room time NOT captured by snapshots.
           -- Same safeguards as team_attendance_range:
@@ -8915,6 +9008,7 @@ def team_monthly_report(team_id):
           END as main_room_fill_mins
         FROM daily_stats ds
         LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.participant_key = brt.participant_key
+        LEFT JOIN daily_breaks db ON ds.event_date = db.event_date AND ds.participant_key = db.participant_key
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
         LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
         LEFT JOIN daily_monitoring_window mw ON ds.event_date = mw.event_date
