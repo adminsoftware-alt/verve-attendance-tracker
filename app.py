@@ -7600,7 +7600,8 @@ def team_attendance(team_id, date):
         break_room_summary AS (
             SELECT
                 COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
-                COUNT(*) * 30 as break_room_seconds
+                -- Bucket to 30s windows to dedup multi-source polls.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as break_room_seconds
             FROM `{dataset_ref}.room_snapshots` s
             INNER JOIN team_member_keys tmk
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
@@ -8540,7 +8541,8 @@ def compare_teams():
             )
             stats_query = f"""
             WITH team_members AS (
-                SELECT participant_name FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
+                SELECT participant_name, participant_email
+                FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
             ),
             deduped AS (
                 SELECT
@@ -8549,7 +8551,12 @@ def compare_teams():
                     s.room_name,
                     s.snapshot_time
                 FROM `{dataset_ref}.room_snapshots` s
-                INNER JOIN team_members tm ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+                -- Match on name OR email; Zoom display names drift from
+                -- team_members.participant_name and would otherwise drop users.
+                INNER JOIN team_members tm
+                    ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+                    OR (NULLIF(LOWER(TRIM(s.participant_email)), '') IS NOT NULL
+                        AND NULLIF(LOWER(TRIM(s.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), ''))
                 WHERE s.event_date = @report_date
                   AND s.room_name IS NOT NULL AND s.room_name != ''
                   AND s.participant_name IS NOT NULL
@@ -9974,14 +9981,15 @@ def detect_attendance_conflicts():
             SELECT
                 LOWER(TRIM(participant_name)) as name_key,
                 event_date,
-                COUNT(*) as snapshot_count,
-                CEILING(COUNT(*) * 0.5) as approx_mins
+                -- Bucket to 30s windows so multi-source polls don't double-count.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(snapshot_time), 30)) as snapshot_count,
+                CEILING(COUNT(DISTINCT DIV(UNIX_SECONDS(snapshot_time), 30)) * 0.5) as approx_mins
             FROM `{dataset_ref}.room_snapshots`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
               AND LOWER(participant_name) NOT LIKE '%scout%'
             GROUP BY name_key, event_date
-            HAVING COUNT(*) >= 6  -- At least 3 minutes of snapshots
+            HAVING COUNT(DISTINCT DIV(UNIX_SECONDS(snapshot_time), 30)) >= 6  -- At least 3 minutes of snapshots
         )
         SELECT
             lr.employee_name,
@@ -10150,13 +10158,13 @@ def teams_leave_summary():
         SELECT
             tm.team_id,
             tm.participant_name,
-            COUNT(*) as snapshot_count,
+            COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) as snapshot_count,
             CEILING(SUM(
                 CASE
                     WHEN prev_time IS NULL THEN 0
                     WHEN TIMESTAMP_DIFF(s.snapshot_time, prev_time, SECOND) <= 300 THEN
                         TIMESTAMP_DIFF(s.snapshot_time, prev_time, SECOND) / 60.0
-                    ELSE 0.5
+                    ELSE 0  -- Long gap = session boundary, not active time
                 END
             )) as active_mins
         FROM (
@@ -10271,16 +10279,23 @@ def team_historical_trends(team_id):
         # counted as multiple unique members within a month.
         query = f"""
         WITH team_members AS (
-            SELECT participant_name FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
+            SELECT participant_name, participant_email
+            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
         ),
         monthly_data AS (
             SELECT
                 FORMAT_DATE('%Y-%m', SAFE.PARSE_DATE('%Y-%m-%d', s.event_date)) as month,
                 COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
                 COUNT(DISTINCT s.event_date) as days_present,
-                SUM(30) / 60.0 as total_hours  -- Each snapshot = 30s
+                -- Bucket to 30s windows so multi-source polls don't double hours.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 / 3600.0 as total_hours
             FROM `{dataset_ref}.room_snapshots` s
-            INNER JOIN team_members tm ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+            -- Match on name OR email; Zoom display names drift from the
+            -- canonical name in team_members and would otherwise drop users.
+            INNER JOIN team_members tm
+                ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
+                OR (NULLIF(LOWER(TRIM(s.participant_email)), '') IS NOT NULL
+                    AND NULLIF(LOWER(TRIM(s.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), ''))
             WHERE SAFE.PARSE_DATE('%Y-%m-%d', s.event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL @months MONTH)
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
@@ -12445,7 +12460,8 @@ def employee_attendance_detail(employee_id, date):
         isolation AS (
             SELECT
                 event_date,
-                COUNT(*) * 30 as iso_secs
+                -- Bucket to 30s windows to dedup multi-source polls.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as iso_secs
             FROM deduped s
             INNER JOIN (
                 SELECT snapshot_time, room_name,
@@ -12458,6 +12474,9 @@ def employee_attendance_detail(employee_id, date):
                 GROUP BY snapshot_time, room_name
             ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
             WHERE ro.cnt = 1
+              -- Exclude Main Room from isolation (matches team-view convention).
+              AND LOWER(s.room_name) != 'main room'
+              AND LOWER(s.room_name) NOT LIKE '0.main%'
             GROUP BY event_date
         )
         SELECT
@@ -12684,7 +12703,8 @@ def employee_yearly_report(employee_id):
         isolation AS (
             SELECT
                 event_date,
-                COUNT(*) * 30 as iso_secs
+                -- Bucket to 30s windows to dedup multi-source polls.
+                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as iso_secs
             FROM deduped s
             INNER JOIN (
                 SELECT snapshot_time, room_name,
@@ -12697,6 +12717,9 @@ def employee_yearly_report(employee_id):
                 GROUP BY snapshot_time, room_name
             ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
             WHERE ro.cnt = 1
+              -- Exclude Main Room from isolation (matches team-view convention).
+              AND LOWER(s.room_name) != 'main room'
+              AND LOWER(s.room_name) NOT LIKE '0.main%'
             GROUP BY event_date
         )
         SELECT
