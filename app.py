@@ -7690,13 +7690,18 @@ def team_attendance(team_id, date):
                 TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) as gap_seconds
             FROM participant_snapshots
             WHERE prev_snapshot IS NOT NULL
+              -- 5 min < gap <= 120 min: counts as break (coffee, lunch, away).
+              -- Anything longer means the user left the meeting and rejoined
+              -- later — that's a session boundary, NOT a break, so exclude it
+              -- to avoid e.g. an 8-hour holiday gap showing up as 8hr break.
               AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
+              AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 7200
         ),
         break_summary AS (
             SELECT
                 participant_key,
-                SUM(CASE WHEN gap_seconds > 300 THEN gap_seconds - 30 ELSE 0 END) as total_break_seconds,
-                COUNT(CASE WHEN gap_seconds > 300 THEN 1 END) as break_count
+                SUM(gap_seconds - 30) as total_break_seconds,
+                COUNT(*) as break_count
             FROM break_gaps
             GROUP BY participant_key
         ),
@@ -8290,9 +8295,20 @@ def team_attendance_range(team_id):
             SELECT
                 event_date,
                 participant_key,
-                SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
-                    THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_seconds,
-                COUNT(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300 THEN 1 END) as break_count
+                -- Only count gaps 5 min < gap <= 120 min as breaks. Larger
+                -- gaps = user left the meeting (session boundary) and would
+                -- otherwise produce absurd "12hr break" entries.
+                SUM(CASE
+                    WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
+                     AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 7200
+                    THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30
+                    ELSE 0
+                  END) as break_seconds,
+                COUNT(CASE
+                    WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
+                     AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 7200
+                    THEN 1
+                  END) as break_count
             FROM gap_ordered
             WHERE prev_snapshot IS NOT NULL
             GROUP BY event_date, participant_key
@@ -8924,8 +8940,15 @@ def team_monthly_report(team_id):
           SELECT
             event_date,
             participant_key,
-            SUM(CASE WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
-                THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30 ELSE 0 END) as break_seconds
+            -- Only count gaps 5 min < gap <= 120 min as breaks. Larger gaps
+            -- = user left the meeting (session boundary) and would otherwise
+            -- produce absurd "17hr break" entries in long-range reports.
+            SUM(CASE
+                WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) > 300
+                 AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 7200
+                THEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) - 30
+                ELSE 0
+              END) as break_seconds
           FROM gap_ordered
           WHERE prev_snapshot IS NOT NULL
           GROUP BY event_date, participant_key
