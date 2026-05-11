@@ -137,10 +137,15 @@ export default function Employees({ user }) {
             })
           ),
         ]);
+        // Key by email when present (stable identifier across teams),
+        // else fall back to name. Prevents same person on two teams from
+        // being treated as two people when display names differ.
         const mergedByKey = {};
         monthlyResults.forEach(res => {
           (res?.member_summary || []).forEach(m => {
-            const key = (m.name || '').toLowerCase().trim();
+            const emailKey = (m.email || '').toLowerCase().trim();
+            const nameKey = (m.name || '').toLowerCase().trim();
+            const key = emailKey || nameKey;
             if (!key) return;
             if (!mergedByKey[key]) {
               mergedByKey[key] = { ...m };
@@ -175,13 +180,20 @@ export default function Employees({ user }) {
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  // Merge registry rows with monthly attendance summary by name
+  // Merge registry rows with monthly attendance summary.
+  // Index by BOTH name and email so a registry vs snapshot name mismatch
+  // (e.g. "Shashank C" in registry vs "Shashank Channawar" / "Shashank-1"
+  // normalized in member_summary) doesn't silently zero out the row.
   const rows = useMemo(() => {
     if (!registryEmployees.length) return [];
 
     const summaryByName = {};
+    const summaryByEmail = {};
     (monthlyData?.member_summary || []).forEach(m => {
-      summaryByName[(m.name || '').toLowerCase().trim()] = m;
+      const nameKey = (m.name || '').toLowerCase().trim();
+      const emailKey = (m.email || '').toLowerCase().trim();
+      if (nameKey) summaryByName[nameKey] = m;
+      if (emailKey) summaryByEmail[emailKey] = m;
     });
 
     return registryEmployees
@@ -195,8 +207,12 @@ export default function Employees({ user }) {
         return true;
       })
       .map(e => {
-        const key = (e.participant_name || '').toLowerCase().trim();
-        const summary = summaryByName[key] || {};
+        const nameKey = (e.participant_name || '').toLowerCase().trim();
+        const emailKey = (e.participant_email || '').toLowerCase().trim();
+        // Prefer email match (stable) over name match (drifts).
+        const summary = (emailKey && summaryByEmail[emailKey])
+          || summaryByName[nameKey]
+          || {};
         return {
           ...e,
           days_present: summary.days_present || 0,

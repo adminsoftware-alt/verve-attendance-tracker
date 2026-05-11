@@ -11765,7 +11765,7 @@ def list_unrecognized_monthly():
                         WHEN prev_time IS NULL THEN 0
                         WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
                             TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
-                        ELSE 0.5
+                        ELSE 0  -- Long gap = session boundary, not active time
                     END
                 )) as active_mins
             FROM ordered_snaps
@@ -12190,7 +12190,7 @@ def list_classified_monthly():
                         WHEN prev_time IS NULL THEN 0
                         WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
                             TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
-                        ELSE 0.5
+                        ELSE 0  -- Long gap = session boundary, not active time
                     END
                 )) as active_mins
             FROM ordered_snaps
