@@ -557,7 +557,7 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
     font: { bold: true, color: { rgb: 'FF64748B' }, sz: 10 },
     alignment: { horizontal: 'left' },
   });
-  writeCell(breakWs, 1, 1, '(gaps > 5 min)', {
+  writeCell(breakWs, 1, 1, '(Break Time room only)', {
     font: { italic: true, color: { rgb: 'FF94A3B8' }, sz: 9 },
     alignment: { horizontal: 'left' },
   });
@@ -628,7 +628,7 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   // Legend
   const breakNoteStart = breakGrandRow + 2;
   writeCell(breakWs, breakNoteStart,     0, 'Note:', NOTE_LABEL_STYLE);
-  writeCell(breakWs, breakNoteStart,     1, 'Break = gaps > 5 min between snapshots', NOTE_VALUE_STYLE);
+  writeCell(breakWs, breakNoteStart,     1, 'Break = time spent in the "Break Time" room', NOTE_VALUE_STYLE);
   writeCell(breakWs, breakNoteStart + 1, 1, 'Orange', LEGEND_ORANGE_STYLE);
   writeCell(breakWs, breakNoteStart + 1, 2, '1 – 2 hours break (watch list)', NOTE_VALUE_STYLE);
   writeCell(breakWs, breakNoteStart + 2, 1, 'Red', LEGEND_RED_STYLE);

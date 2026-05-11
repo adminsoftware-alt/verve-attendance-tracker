@@ -283,7 +283,7 @@ function BreakPivot({ dates, names, lookup, holidayMap = {} }) {
         <LegendItem color="#ffedd5" border="#fdba74" label="1h – 2h (watch)" />
         <LegendItem color="#fee2e2" border="#fca5a5" label="> 2h (excessive)" />
         <LegendItem color="#e0e7ff" border="#a5b4fc" label="Holiday" />
-        <span style={s.legendMeta}>Break = time away from breakout rooms (gaps {'>'} 5 min)</span>
+        <span style={s.legendMeta}>Break = time spent in the "Break Time" room</span>
       </div>
 
       <div style={s.tableWrap}>
