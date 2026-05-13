@@ -67,14 +67,37 @@ function MonitorPanel() {
     setLogs(prev => [...prev.slice(-50), `[${time}] ${msg}`]);
   }, []);
 
+  // Retry helper for SDK calls that may timeout
+  const withRetry = useCallback(async (fn, name, maxRetries = 2) => {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        const isTimeout = err.message?.includes('10000ms') || err.message?.includes('timeout');
+        if (attempt < maxRetries && isTimeout) {
+          addLog(`${name} timeout, retrying (${attempt}/${maxRetries})...`);
+          await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+        } else {
+          throw err;
+        }
+      }
+    }
+  }, [addLog]);
+
   // Single poll: get all rooms + participants, send to backend
   const doPoll = useCallback(async () => {
     try {
-      // Get breakout rooms (for room names and UUIDs)
-      const rooms = await getBreakoutRooms();
+      // Get breakout rooms (for room names and UUIDs) with retry
+      let rooms = [];
+      try {
+        rooms = await withRetry(getBreakoutRooms, 'getBreakoutRoomList', 2);
+      } catch (roomErr) {
+        addLog(`getBreakoutRoomList failed: ${roomErr.message}`);
+        // Continue anyway - we'll capture Main Room participants
+      }
+
       if (!rooms || rooms.length === 0) {
-        addLog('No breakout rooms found');
-        return;
+        addLog('No breakout rooms found - capturing Main Room only');
       }
 
       // Build room UUID -> name mapping
@@ -85,14 +108,20 @@ function MonitorPanel() {
         if (uuid) roomMap[uuid] = name;
       });
 
-      // Get all participants (includes their current room)
+      // Get all participants (includes their current room) with retry
       let allParticipants = [];
       try {
-        allParticipants = await getParticipants();
+        allParticipants = await withRetry(getParticipants, 'getMeetingParticipants', 2);
         addLog(`Got ${allParticipants.length} participants from SDK`);
       } catch (pErr) {
         addLog(`getMeetingParticipants failed: ${pErr.message}`);
         // Fall back to room.participants if available
+      }
+
+      // If both SDK calls failed, skip this poll cycle
+      if (rooms.length === 0 && allParticipants.length === 0) {
+        addLog('Both SDK calls failed - skipping this poll');
+        return;
       }
 
       // Build snapshot data - try both approaches
