@@ -6,6 +6,7 @@ const POLL_INTERVAL_MS = 30000; // 30 seconds
 const START_RETRY_MS = 10000;
 const WATCHDOG_INTERVAL_MS = 15000;
 const STALE_AFTER_MS = POLL_INTERVAL_MS * 3;
+const ROOM_CACHE_TTL_MS = 300000; // 5 minutes - room names rarely change
 
 const getBackendUrl = () => {
   if (process.env.REACT_APP_BACKEND_URL) return process.env.REACT_APP_BACKEND_URL;
@@ -62,6 +63,9 @@ function MonitorPanel() {
   const isStartingRef = useRef(false);
   const lastSuccessRef = useRef(null);
 
+  // Room cache - room names rarely change during a meeting
+  const roomCacheRef = useRef({ rooms: [], roomMap: {}, timestamp: 0 });
+
   const addLog = useCallback((msg) => {
     const time = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
     setLogs(prev => [...prev.slice(-50), `[${time}] ${msg}`]);
@@ -87,26 +91,51 @@ function MonitorPanel() {
   // Single poll: get all rooms + participants, send to backend
   const doPoll = useCallback(async () => {
     try {
-      // Get breakout rooms (for room names and UUIDs) with retry
+      const now = Date.now();
+      const cache = roomCacheRef.current;
+      const cacheAge = now - cache.timestamp;
+      const cacheValid = cache.rooms.length > 0 && cacheAge < ROOM_CACHE_TTL_MS;
+
       let rooms = [];
-      try {
-        rooms = await withRetry(getBreakoutRooms, 'getBreakoutRoomList', 2);
-      } catch (roomErr) {
-        addLog(`getBreakoutRoomList failed: ${roomErr.message}`);
-        // Continue anyway - we'll capture Main Room participants
+      let roomMap = {};
+
+      // Use cached room list if still valid (room names rarely change)
+      if (cacheValid) {
+        rooms = cache.rooms;
+        roomMap = cache.roomMap;
+        // Only log occasionally to avoid spam
+        if (cacheAge < 60000) {
+          addLog(`Using cached room list (${rooms.length} rooms)`);
+        }
+      } else {
+        // Cache expired or empty - fetch fresh room list
+        try {
+          rooms = await withRetry(getBreakoutRooms, 'getBreakoutRoomList', 2);
+
+          // Build room UUID -> name mapping
+          rooms.forEach(room => {
+            const uuid = room.breakoutRoomUUID || room.uuid || room.id || '';
+            const name = room.breakoutRoomName || room.name || 'Unknown';
+            if (uuid) roomMap[uuid] = name;
+          });
+
+          // Update cache
+          roomCacheRef.current = { rooms, roomMap, timestamp: now };
+          addLog(`Refreshed room list: ${rooms.length} rooms`);
+        } catch (roomErr) {
+          addLog(`getBreakoutRoomList failed: ${roomErr.message}`);
+          // Use stale cache if available
+          if (cache.rooms.length > 0) {
+            rooms = cache.rooms;
+            roomMap = cache.roomMap;
+            addLog(`Using stale cache (${rooms.length} rooms)`);
+          }
+        }
       }
 
       if (!rooms || rooms.length === 0) {
-        addLog('No breakout rooms found - capturing Main Room only');
+        addLog('No breakout rooms - capturing Main Room only');
       }
-
-      // Build room UUID -> name mapping
-      const roomMap = {};
-      rooms.forEach(room => {
-        const uuid = room.breakoutRoomUUID || room.uuid || room.id || '';
-        const name = room.breakoutRoomName || room.name || 'Unknown';
-        if (uuid) roomMap[uuid] = name;
-      });
 
       // Get all participants (includes their current room) with retry
       let allParticipants = [];
@@ -272,6 +301,9 @@ function MonitorPanel() {
       isMonitoringRef.current = true;
       setIsMonitoring(true);
       setErrors([]);
+
+      // Clear room cache to get fresh data on start
+      roomCacheRef.current = { rooms: [], roomMap: {}, timestamp: 0 };
 
       // First poll immediately
       await doPoll();
