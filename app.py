@@ -6574,46 +6574,71 @@ def attendance_summary(date=None):
         -- These people have no webhook events AND no breakout room snapshots, so
         -- they would otherwise be dropped entirely. We use their Main Room snapshot
         -- times as synthetic join/leave times.
+        -- Filter out anyone already in webhook_times or participant_breakout_times.
         main_room_only_participants AS (
           SELECT
-            COALESCE(
+            pk.participant_key,
+            pk.participant_name,
+            pk.participant_email,
+            pk.first_seen,
+            pk.last_seen
+          FROM (
+            SELECT
+              COALESCE(
+                ntk.participant_key,
+                NULLIF(rs.participant_uuid, ''),
+                NULLIF(LOWER(TRIM(rs.participant_email)), ''),
+                LOWER(TRIM(rs.participant_name))
+              ) as participant_key,
+              ARRAY_AGG(rs.participant_name ORDER BY rs.snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
+              MAX(COALESCE(NULLIF(rs.participant_email, ''), '')) as participant_email,
+              MIN(rs.snapshot_time) as first_seen,
+              MAX(rs.snapshot_time) as last_seen
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` rs
+            LEFT JOIN name_to_key ntk ON LOWER(TRIM(rs.participant_name)) = ntk.name_key
+            WHERE rs.event_date = '{date}'
+              AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
+              AND rs.room_name IS NOT NULL AND rs.room_name != ''
+              AND LOWER(rs.participant_name) NOT LIKE '%scout%'
+              AND (LOWER(rs.room_name) = 'main room' OR LOWER(rs.room_name) LIKE '0.main%')
+            GROUP BY COALESCE(
               ntk.participant_key,
               NULLIF(rs.participant_uuid, ''),
               NULLIF(LOWER(TRIM(rs.participant_email)), ''),
               LOWER(TRIM(rs.participant_name))
-            ) as participant_key,
-            ARRAY_AGG(rs.participant_name ORDER BY rs.snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
-            MAX(COALESCE(NULLIF(rs.participant_email, ''), '')) as participant_email,
-            MIN(rs.snapshot_time) as first_seen,
-            MAX(rs.snapshot_time) as last_seen
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` rs
-          LEFT JOIN name_to_key ntk ON LOWER(TRIM(rs.participant_name)) = ntk.name_key
-          WHERE rs.event_date = '{date}'
-            AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
-            AND rs.room_name IS NOT NULL AND rs.room_name != ''
-            AND LOWER(rs.participant_name) NOT LIKE '%scout%'
-            AND (LOWER(rs.room_name) = 'main room' OR LOWER(rs.room_name) LIKE '0.main%')
-          GROUP BY COALESCE(
-            ntk.participant_key,
-            NULLIF(rs.participant_uuid, ''),
-            NULLIF(LOWER(TRIM(rs.participant_email)), ''),
-            LOWER(TRIM(rs.participant_name))
+            )
+          ) pk
+          WHERE pk.participant_key NOT IN (
+            SELECT participant_key FROM webhook_times WHERE participant_key IS NOT NULL
+          )
+          AND pk.participant_key NOT IN (
+            SELECT participant_key FROM participant_breakout_times WHERE participant_key IS NOT NULL
           )
         ),
-        -- Combine webhook, breakout snapshot, and main-room-only participants
+        -- Combine webhook + breakout participants, then UNION main-room-only
         all_participants AS (
           SELECT
-            COALESCE(w.participant_key, s.participant_key, m.participant_key) as participant_key,
-            COALESCE(w.participant_name, s.participant_name, m.participant_name) as participant_name,
-            COALESCE(NULLIF(w.participant_email, ''), s.participant_email, m.participant_email, '') as participant_email,
-            COALESCE(w.main_joined, m.first_seen) as main_joined,
-            COALESCE(w.main_left, m.last_seen) as main_left,
+            COALESCE(w.participant_key, s.participant_key) as participant_key,
+            COALESCE(w.participant_name, s.participant_name) as participant_name,
+            COALESCE(NULLIF(w.participant_email, ''), s.participant_email, '') as participant_email,
+            w.main_joined,
+            w.main_left,
             s.first_breakout,
             s.last_breakout
           FROM webhook_times w
           FULL OUTER JOIN participant_breakout_times s ON w.participant_key = s.participant_key
-          FULL OUTER JOIN main_room_only_participants m
-            ON COALESCE(w.participant_key, s.participant_key) = m.participant_key
+
+          UNION ALL
+
+          SELECT
+            m.participant_key,
+            m.participant_name,
+            m.participant_email,
+            m.first_seen as main_joined,
+            m.last_seen as main_left,
+            CAST(NULL AS TIMESTAMP) as first_breakout,
+            CAST(NULL AS TIMESTAMP) as last_breakout
+          FROM main_room_only_participants m
         ),
         -- Detect room transitions AND time gaps
         snapshot_transitions AS (
