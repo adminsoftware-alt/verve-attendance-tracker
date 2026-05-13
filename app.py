@@ -6742,6 +6742,15 @@ def attendance_summary(date=None):
                 -- Also cap by monitoring window duration if available
                 COALESCE(TIMESTAMP_DIFF(mw.global_last_snapshot, mw.global_first_snapshot, MINUTE), 600)
               ))
+              -- Fallback: main_left is NULL but we have monitoring window - use it as end time
+              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
+                   AND bt.breakout_joined_count IS NULL
+                   AND ap.main_left IS NULL
+                   AND mw.global_last_snapshot IS NOT NULL
+              THEN GREATEST(0, LEAST(
+                TIMESTAMP_DIFF(mw.global_last_snapshot, ap.main_joined, MINUTE),
+                COALESCE(TIMESTAMP_DIFF(mw.global_last_snapshot, mw.global_first_snapshot, MINUTE), 600)
+              ))
               ELSE 0
             END) as main_room_before_mins,
             -- Main room time AFTER last breakout. Capped at 600 mins (10 hours).
@@ -6792,7 +6801,7 @@ def attendance_summary(date=None):
             participant_key,
             '0.Main Room' as room_name,
             main_joined as join_time,
-            COALESCE(first_breakout, main_left) as leave_time,
+            COALESCE(first_breakout, effective_main_left) as leave_time,
             main_room_before_mins as duration_mins
           FROM main_room_time
           WHERE main_room_before_mins > 0 AND main_joined IS NOT NULL
