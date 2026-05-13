@@ -6881,8 +6881,17 @@ def attendance_summary(date=None):
           mrt.participant_name as name,
           mrt.participant_email as email,
           FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(COALESCE(mrt.main_joined, mrt.first_breakout), INTERVAL 330 MINUTE)) as first_seen_ist,
-          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(COALESCE(mrt.main_left, mrt.last_breakout), INTERVAL 330 MINUTE)) as last_seen_ist,
-          COALESCE(rva.total_duration_mins, 0) as total_duration_mins,
+          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(COALESCE(mrt.effective_main_left, mrt.main_left, mrt.last_breakout), INTERVAL 330 MINUTE)) as last_seen_ist,
+          -- Fallback: if no room visits captured but we have timestamps, use the span
+          -- capped by monitoring window duration (max 600 mins)
+          COALESCE(
+            NULLIF(rva.total_duration_mins, 0),
+            LEAST(600, GREATEST(0, TIMESTAMP_DIFF(
+              COALESCE(mrt.effective_main_left, mrt.main_left, mrt.last_breakout),
+              COALESCE(mrt.main_joined, mrt.first_breakout),
+              MINUTE
+            )))
+          ) as total_duration_mins,
           COALESCE(rva.room_visits, []) as room_visits
         FROM main_room_time mrt
         LEFT JOIN room_visits_agg rva ON mrt.participant_key = rva.participant_key
