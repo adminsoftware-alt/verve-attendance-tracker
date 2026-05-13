@@ -6729,22 +6729,24 @@ def attendance_summary(date=None):
             -- Capped by the monitoring window (global_last_snapshot - global_first_snapshot)
             -- to prevent overnight gaps, but allows full workday (up to 600 mins = 10 hours).
             LEAST(600, CASE
+              -- Case 1: Has breakout snapshots - use first_breakout
               WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NOT NULL
               THEN GREATEST(0, TIMESTAMP_DIFF(ap.first_breakout, ap.main_joined, MINUTE))
+              -- Case 2: No breakout snapshots but has breakout webhook - use webhook time
               WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
                    AND bt.first_breakout_joined_time IS NOT NULL
               THEN GREATEST(0, TIMESTAMP_DIFF(bt.first_breakout_joined_time, ap.main_joined, MINUTE))
+              -- Case 3: No breakouts at all, has main_left - use full span
               WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
-                   AND bt.breakout_joined_count IS NULL
+                   AND bt.first_breakout_joined_time IS NULL
                    AND ap.main_left IS NOT NULL
               THEN GREATEST(0, LEAST(
                 TIMESTAMP_DIFF(ap.main_left, ap.main_joined, MINUTE),
-                -- Also cap by monitoring window duration if available
                 COALESCE(TIMESTAMP_DIFF(mw.global_last_snapshot, mw.global_first_snapshot, MINUTE), 600)
               ))
-              -- Fallback: main_left is NULL but we have monitoring window - use it as end time
+              -- Case 4: No breakouts, no main_left, but has monitoring window - use it
               WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
-                   AND bt.breakout_joined_count IS NULL
+                   AND bt.first_breakout_joined_time IS NULL
                    AND ap.main_left IS NULL
                    AND mw.global_last_snapshot IS NOT NULL
               THEN GREATEST(0, LEAST(
