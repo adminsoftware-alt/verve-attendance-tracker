@@ -13594,12 +13594,11 @@ def build_presence_intervals(date_str):
     dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
     # ----- Step 1: bucketed snapshot data ----------------------------------
-    # CANONICAL participant_key = email if present, else normalized name.
-    # This merges Zoom rejoin variants (same person with multiple UUIDs)
-    # into one key so synthesis sees their full timeline instead of a
-    # disjoint per-UUID view. Without this, a participant who rejoined
-    # 4 times gets 4 separate "phantom Main Room" intervals because each
-    # UUID-keyed timeline only sees its own subset of breakouts.
+    # CANONICAL participant_key = normalized name (Zoom rejoin suffixes
+    # stripped). Same person across rejoin variants gets one key, all
+    # their intervals merge before synthesis. Edge case: two real people
+    # with identical normalized names would collide — acceptable trade-off
+    # for the simplicity (Zoom snapshots often lack email anyway).
     norm_sn = _sql_normalize_name('s.participant_name')
     bucket_q = f"""
     WITH normalized AS (
@@ -13610,10 +13609,7 @@ def build_presence_intervals(date_str):
         s.participant_email,
         s.participant_uuid,
         s.room_name,
-        COALESCE(
-          NULLIF(LOWER(TRIM(s.participant_email)), ''),
-          {norm_sn}
-        ) AS participant_key,
+        {norm_sn} AS participant_key,
         DIV(UNIX_SECONDS(s.snapshot_time), {BUCKET_SECONDS}) AS bucket30
       FROM `{dataset_ref}.room_snapshots` s
       WHERE s.event_date = @date
@@ -13666,16 +13662,12 @@ def build_presence_intervals(date_str):
         monitoring_end = max(b.bucket_end for b in buckets)
 
     # ----- Step 2: webhook timestamps per participant ----------------------
-    # Use the SAME canonical key formula as snapshots (email -> normalized
-    # name fallback) so webhook data merges correctly with snapshot data
-    # in Python regardless of rejoin/UUID drift.
+    # Use the SAME canonical key formula as snapshots (normalized name)
+    # so webhook data merges correctly with snapshot data in Python.
     norm_pn = _sql_normalize_name('pe.participant_name')
     webhook_q = f"""
     SELECT
-      COALESCE(
-        NULLIF(LOWER(TRIM(pe.participant_email)), ''),
-        {norm_pn}
-      ) AS participant_key,
+      {norm_pn} AS participant_key,
       ANY_VALUE(pe.participant_name) AS participant_name,
       ANY_VALUE(pe.participant_email) AS participant_email,
       ANY_VALUE(pe.meeting_id) AS meeting_id,
