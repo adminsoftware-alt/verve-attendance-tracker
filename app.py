@@ -13467,6 +13467,770 @@ def admin_delete_events():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+# ==============================================================================
+# PRESENCE INTERVALS - v2 report rebuild (Phase 1)
+# ==============================================================================
+# Single source of truth for duration aggregation. Built once per IST date from
+# room_snapshots + participant_events, then all team/attendance reports become
+# trivial GROUP BY SUM queries against this table.
+#
+# Categories per row: 'main' | 'breakout' | 'break' (exclusive — every minute
+# belongs to exactly one). Isolation is tracked as alone_seconds per interval,
+# NOT as a separate category — Total = main + breakout + break with no double
+# counting.
+#
+# Sources: 'snapshot' (real SDK data), 'synthesized_main' (Main Room time
+# inferred between/around breakouts), 'webhook_fill' (when SDK missed but
+# Zoom webhooks confirmed presence).
+# ==============================================================================
+
+PRESENCE_INTERVALS_TABLE = 'presence_intervals'
+GAP_THRESHOLD_SECONDS = 300          # >5min gap between snapshots = new interval
+BUCKET_SECONDS = 30                  # 30s dedup bucket (multi-source polling)
+MAIN_ROOM_SYNTH_CAP_MINUTES = 600    # Cap any single synthesized Main Room interval
+MAIN_ROOM_SYNTH_MIN_SECONDS = 120    # Don't synthesize gaps smaller than 2min
+
+
+def _classify_room(room_name):
+    """Return 'main' | 'breakout' | 'break' for a room name.
+    Matches v1 conventions at app.py:7753, 7760, 7775."""
+    if not room_name:
+        return 'breakout'
+    n = room_name.strip().lower()
+    if 'break time' in n:
+        return 'break'
+    if n == 'main room' or n.startswith('0.main'):
+        return 'main'
+    return 'breakout'
+
+
+def _ensure_presence_intervals_table():
+    """Create presence_intervals table if it does not yet exist.
+    Partitioned by event_date, clustered by meeting_id, participant_key."""
+    client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` (
+        interval_id        STRING NOT NULL,
+        event_date         DATE   NOT NULL,
+        meeting_id         STRING,
+        meeting_uuid       STRING,
+        participant_key    STRING NOT NULL,
+        participant_name   STRING,
+        participant_email  STRING,
+        room_name          STRING,
+        room_category      STRING,
+        start_ts           TIMESTAMP NOT NULL,
+        end_ts             TIMESTAMP NOT NULL,
+        duration_seconds   INT64,
+        alone_seconds      INT64,
+        snapshot_count     INT64,
+        source             STRING,
+        confidence         FLOAT64,
+        built_at           TIMESTAMP
+    )
+    PARTITION BY event_date
+    CLUSTER BY meeting_id, participant_key
+    """
+    client.query(ddl).result()
+
+
+def build_presence_intervals(date_str):
+    """Materialize presence_intervals for one IST date.
+
+    Steps:
+      1. Pull bucketed snapshot data (per participant+room+30s bucket).
+      2. Pull webhook timestamps (meeting_joined, meeting_left, breakout flag).
+      3. Compute real intervals from snapshots, with alone_seconds.
+      4. Synthesize Main Room intervals for gaps between/around breakouts.
+      5. Webhook-fill: participants with webhook presence but no snapshots
+         (only if they have NO breakout webhooks — otherwise they were in
+         unmonitored breakouts and we don't credit them Main Room time).
+      6. DELETE existing rows for the date, INSERT new rows.
+
+    Returns dict with counts and timing.
+    """
+    started = time.time()
+    _ensure_presence_intervals_table()
+    client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+    # ----- Step 1: bucketed snapshot data ----------------------------------
+    bucket_q = f"""
+    WITH dedup AS (
+      SELECT
+        s.snapshot_time,
+        s.meeting_id,
+        s.participant_name,
+        s.participant_email,
+        s.participant_uuid,
+        s.room_name,
+        COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) AS participant_key,
+        DIV(UNIX_SECONDS(s.snapshot_time), {BUCKET_SECONDS}) AS bucket30
+      FROM `{dataset_ref}.room_snapshots` s
+      WHERE s.event_date = @date
+        AND s.room_name IS NOT NULL AND s.room_name != ''
+        AND s.participant_name IS NOT NULL AND s.participant_name != ''
+        AND LOWER(s.participant_name) NOT LIKE '%scout%'
+      -- Collapse SDK-transition artifacts (same participant in two rooms at
+      -- the exact same timestamp): prefer breakout over Main Room.
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
+                     s.snapshot_time
+        ORDER BY
+          CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+          s.room_name
+      ) = 1
+    ),
+    occupancy AS (
+      SELECT room_name, bucket30, COUNT(DISTINCT participant_key) AS occupant_count
+      FROM dedup
+      GROUP BY room_name, bucket30
+    )
+    SELECT
+      d.participant_key,
+      ANY_VALUE(d.participant_name) AS participant_name,
+      MAX(d.participant_email) AS participant_email,
+      ANY_VALUE(d.meeting_id) AS meeting_id,
+      d.room_name,
+      d.bucket30,
+      MIN(d.snapshot_time) AS bucket_start,
+      MAX(d.snapshot_time) AS bucket_end,
+      MAX(o.occupant_count) AS occupant_count
+    FROM dedup d
+    JOIN occupancy o USING (room_name, bucket30)
+    GROUP BY d.participant_key, d.room_name, d.bucket30
+    ORDER BY d.participant_key, d.bucket30
+    """
+    job = client.query(bucket_q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
+    ))
+    buckets = list(job.result())
+
+    # Last snapshot anywhere = monitoring window end (cap for synthesis)
+    monitoring_end = None
+    if buckets:
+        monitoring_end = max(b.bucket_end for b in buckets)
+
+    # ----- Step 2: webhook timestamps per participant ----------------------
+    webhook_q = f"""
+    WITH name_email_map AS (
+      SELECT DISTINCT
+        COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) AS participant_key,
+        LOWER(TRIM(participant_name)) AS name_key,
+        NULLIF(LOWER(TRIM(participant_email)), '') AS email_key
+      FROM `{dataset_ref}.room_snapshots`
+      WHERE event_date = @date
+        AND participant_name IS NOT NULL AND participant_name != ''
+    ),
+    name_to_key AS (
+      SELECT name_key, MIN(participant_key) AS participant_key
+      FROM name_email_map GROUP BY name_key
+    ),
+    email_to_key AS (
+      SELECT email_key, MIN(participant_key) AS participant_key
+      FROM name_email_map WHERE email_key IS NOT NULL GROUP BY email_key
+    )
+    SELECT
+      COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) AS participant_key,
+      ANY_VALUE(pe.participant_name) AS participant_name,
+      ANY_VALUE(pe.participant_email) AS participant_email,
+      ANY_VALUE(pe.meeting_id) AS meeting_id,
+      MIN(CASE WHEN pe.event_type IN ('participant_joined','meeting.participant_joined')
+          THEN CAST(pe.event_timestamp AS TIMESTAMP) END) AS meeting_joined,
+      MAX(CASE WHEN pe.event_type IN ('participant_left','meeting.participant_left')
+          THEN CAST(pe.event_timestamp AS TIMESTAMP) END) AS meeting_left,
+      COUNTIF(pe.event_type = 'breakout_room_joined') AS breakout_webhook_count
+    FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+    LEFT JOIN email_to_key etk ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+    LEFT JOIN name_to_key  ntk ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
+    WHERE pe.event_date = @date
+      AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
+      AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+    GROUP BY participant_key
+    """
+    webhook_rows = list(client.query(webhook_q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
+    )).result())
+    webhook_by_key = {r.participant_key: r for r in webhook_rows}
+
+    # ----- Step 3: build real intervals from buckets -----------------------
+    # Group buckets by (participant_key, room_name), sorted by bucket30.
+    # Consecutive buckets (diff == 1, i.e. 30s apart) belong to the same
+    # interval. A gap > GAP_THRESHOLD_SECONDS / BUCKET_SECONDS = 10 buckets
+    # starts a new interval.
+    from collections import defaultdict
+    by_key_room = defaultdict(list)
+    name_by_key = {}
+    email_by_key = {}
+    meeting_by_key = {}
+    for b in buckets:
+        by_key_room[(b.participant_key, b.room_name)].append(b)
+        # Track latest seen identity per key (snapshot is authoritative for name)
+        name_by_key[b.participant_key] = b.participant_name
+        if b.participant_email:
+            email_by_key[b.participant_key] = b.participant_email
+        if b.meeting_id:
+            meeting_by_key[b.participant_key] = b.meeting_id
+
+    gap_buckets = GAP_THRESHOLD_SECONDS // BUCKET_SECONDS  # 10
+
+    intervals = []  # list of dicts ready for BQ insert
+    intervals_by_participant = defaultdict(list)  # key -> [interval dict, ...]
+
+    now_ts = datetime.utcnow()
+    built_at_iso = now_ts.replace(microsecond=0).isoformat() + 'Z'
+
+    for (pkey, room), brows in by_key_room.items():
+        category = _classify_room(room)
+        # Sort by bucket30
+        brows.sort(key=lambda x: x.bucket30)
+        # Gap-group
+        groups = []
+        current = [brows[0]]
+        for prev, curr in zip(brows, brows[1:]):
+            if (curr.bucket30 - prev.bucket30) > gap_buckets:
+                groups.append(current)
+                current = [curr]
+            else:
+                current.append(curr)
+        groups.append(current)
+
+        for grp in groups:
+            start_ts = grp[0].bucket_start
+            # End = last bucket end + BUCKET_SECONDS (the bucket covers up to its end)
+            end_ts = grp[-1].bucket_end + timedelta(seconds=BUCKET_SECONDS)
+            distinct_buckets = len({g.bucket30 for g in grp})
+            duration = distinct_buckets * BUCKET_SECONDS
+            # Alone seconds: 30 per bucket where occupant_count==1, excluding Main
+            alone = 0
+            if category != 'main':
+                alone = sum(
+                    BUCKET_SECONDS for g in grp if (g.occupant_count or 0) == 1
+                )
+            iv = {
+                'interval_id': str(uuid_lib.uuid4()),
+                'event_date': date_str,
+                'meeting_id': meeting_by_key.get(pkey),
+                'meeting_uuid': None,
+                'participant_key': pkey,
+                'participant_name': name_by_key.get(pkey),
+                'participant_email': email_by_key.get(pkey),
+                'room_name': room,
+                'room_category': category,
+                'start_ts': start_ts.isoformat(),
+                'end_ts': end_ts.isoformat(),
+                'duration_seconds': duration,
+                'alone_seconds': alone,
+                'snapshot_count': len(grp),
+                'source': 'snapshot',
+                'confidence': 1.0,
+                'built_at': built_at_iso,
+            }
+            intervals.append(iv)
+            intervals_by_participant[pkey].append(iv)
+
+    # ----- Step 4: synthesize Main Room between/around breakouts -----------
+    def _parse_ts(s):
+        # ISO string -> naive UTC datetime
+        if isinstance(s, str):
+            return datetime.fromisoformat(s.replace('Z', ''))
+        return s
+
+    for pkey, plist in list(intervals_by_participant.items()):
+        plist.sort(key=lambda x: x['start_ts'])
+        wh = webhook_by_key.get(pkey)
+        meeting_joined = wh.meeting_joined if wh else None
+        meeting_left = wh.meeting_left if wh else None
+        # Cap meeting_left at monitoring window end (no phantom attendance
+        # after monitoring stopped).
+        if meeting_left and monitoring_end and meeting_left > monitoring_end:
+            meeting_left = monitoring_end
+
+        synthesized = []
+
+        # 4a. Before first interval (if first is breakout and we have a join time)
+        first = plist[0]
+        first_start = _parse_ts(first['start_ts'])
+        if first['room_category'] == 'breakout' and meeting_joined:
+            gap_s = (first_start - meeting_joined).total_seconds()
+            if gap_s >= MAIN_ROOM_SYNTH_MIN_SECONDS:
+                gap_s = min(gap_s, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
+                synthesized.append({
+                    'interval_id': str(uuid_lib.uuid4()),
+                    'event_date': date_str,
+                    'meeting_id': meeting_by_key.get(pkey),
+                    'meeting_uuid': None,
+                    'participant_key': pkey,
+                    'participant_name': name_by_key.get(pkey),
+                    'participant_email': email_by_key.get(pkey),
+                    'room_name': '0.Main Room',
+                    'room_category': 'main',
+                    'start_ts': meeting_joined.isoformat(),
+                    'end_ts': (meeting_joined + timedelta(seconds=gap_s)).isoformat(),
+                    'duration_seconds': int(gap_s),
+                    'alone_seconds': 0,
+                    'snapshot_count': 0,
+                    'source': 'synthesized_main',
+                    'confidence': 0.6,
+                    'built_at': built_at_iso,
+                })
+
+        # 4b. Between consecutive intervals (both breakouts → Main Room gap)
+        for prev, nxt in zip(plist, plist[1:]):
+            if prev['room_category'] != 'breakout' or nxt['room_category'] != 'breakout':
+                continue
+            gap_start = _parse_ts(prev['end_ts'])
+            gap_end = _parse_ts(nxt['start_ts'])
+            gap_s = (gap_end - gap_start).total_seconds()
+            if gap_s < MAIN_ROOM_SYNTH_MIN_SECONDS:
+                continue
+            gap_s = min(gap_s, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
+            synthesized.append({
+                'interval_id': str(uuid_lib.uuid4()),
+                'event_date': date_str,
+                'meeting_id': meeting_by_key.get(pkey),
+                'meeting_uuid': None,
+                'participant_key': pkey,
+                'participant_name': name_by_key.get(pkey),
+                'participant_email': email_by_key.get(pkey),
+                'room_name': '0.Main Room',
+                'room_category': 'main',
+                'start_ts': gap_start.isoformat(),
+                'end_ts': (gap_start + timedelta(seconds=gap_s)).isoformat(),
+                'duration_seconds': int(gap_s),
+                'alone_seconds': 0,
+                'snapshot_count': 0,
+                'source': 'synthesized_main',
+                'confidence': 0.7,
+                'built_at': built_at_iso,
+            })
+
+        # 4c. After last interval (if last is breakout and we have a leave time)
+        last = plist[-1]
+        last_end = _parse_ts(last['end_ts'])
+        if last['room_category'] == 'breakout' and meeting_left:
+            gap_s = (meeting_left - last_end).total_seconds()
+            if gap_s >= MAIN_ROOM_SYNTH_MIN_SECONDS:
+                gap_s = min(gap_s, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
+                synthesized.append({
+                    'interval_id': str(uuid_lib.uuid4()),
+                    'event_date': date_str,
+                    'meeting_id': meeting_by_key.get(pkey),
+                    'meeting_uuid': None,
+                    'participant_key': pkey,
+                    'participant_name': name_by_key.get(pkey),
+                    'participant_email': email_by_key.get(pkey),
+                    'room_name': '0.Main Room',
+                    'room_category': 'main',
+                    'start_ts': last_end.isoformat(),
+                    'end_ts': (last_end + timedelta(seconds=gap_s)).isoformat(),
+                    'duration_seconds': int(gap_s),
+                    'alone_seconds': 0,
+                    'snapshot_count': 0,
+                    'source': 'synthesized_main',
+                    'confidence': 0.6,
+                    'built_at': built_at_iso,
+                })
+
+        intervals.extend(synthesized)
+        intervals_by_participant[pkey].extend(synthesized)
+
+    # ----- Step 5: webhook-fill for participants with NO snapshots ---------
+    snapshot_keys = set(intervals_by_participant.keys())
+    for pkey, wh in webhook_by_key.items():
+        if pkey in snapshot_keys:
+            continue  # already has snapshot intervals
+        # Skip if they had breakout webhooks but no snapshots — unmonitored
+        # breakouts; we can't tell where they were, so don't credit anything.
+        if (wh.breakout_webhook_count or 0) > 0:
+            continue
+        if not wh.meeting_joined or not wh.meeting_left:
+            continue
+        meeting_left = wh.meeting_left
+        if monitoring_end and meeting_left > monitoring_end:
+            meeting_left = monitoring_end
+        duration = (meeting_left - wh.meeting_joined).total_seconds()
+        if duration <= 0:
+            continue
+        duration = min(duration, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
+        intervals.append({
+            'interval_id': str(uuid_lib.uuid4()),
+            'event_date': date_str,
+            'meeting_id': wh.meeting_id,
+            'meeting_uuid': None,
+            'participant_key': pkey,
+            'participant_name': wh.participant_name,
+            'participant_email': wh.participant_email,
+            'room_name': '0.Main Room',
+            'room_category': 'main',
+            'start_ts': wh.meeting_joined.isoformat(),
+            'end_ts': (wh.meeting_joined + timedelta(seconds=duration)).isoformat(),
+            'duration_seconds': int(duration),
+            'alone_seconds': 0,
+            'snapshot_count': 0,
+            'source': 'webhook_fill',
+            'confidence': 0.5,
+            'built_at': built_at_iso,
+        })
+
+    # ----- Step 6: DELETE existing rows for date, then INSERT --------------
+    del_q = f"""
+    DELETE FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+    WHERE event_date = @date
+    """
+    client.query(del_q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
+    )).result()
+
+    inserted = 0
+    if intervals:
+        table_id = f"{dataset_ref}.{PRESENCE_INTERVALS_TABLE}"
+        # Insert in batches of 500 to stay well under BQ streaming limits
+        for i in range(0, len(intervals), 500):
+            batch = intervals[i:i+500]
+            errors = client.insert_rows_json(table_id, batch)
+            if errors:
+                raise RuntimeError(f"BigQuery insert errors: {errors[:3]}")
+            inserted += len(batch)
+
+    # ----- Summary stats ---------------------------------------------------
+    by_source = defaultdict(int)
+    by_category = defaultdict(int)
+    duration_total = 0
+    participants = set()
+    for iv in intervals:
+        by_source[iv['source']] += 1
+        by_category[iv['room_category']] += 1
+        duration_total += iv['duration_seconds']
+        participants.add(iv['participant_key'])
+
+    return {
+        'date': date_str,
+        'intervals_built': inserted,
+        'by_source': dict(by_source),
+        'by_category': dict(by_category),
+        'participants': len(participants),
+        'duration_seconds_total': duration_total,
+        'monitoring_window_end_utc': monitoring_end.isoformat() if monitoring_end else None,
+        'elapsed_seconds': round(time.time() - started, 2),
+    }
+
+
+@app.route('/intervals/rebuild', methods=['POST'])
+def intervals_rebuild():
+    """Build (or rebuild) presence_intervals for one IST date.
+
+    Body: {"date": "YYYY-MM-DD"}
+    Idempotent — deletes existing rows for the date first.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        date_str = validate_date_format(data.get('date'))
+        result = build_presence_intervals(date_str)
+        return jsonify({'success': True, **result})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[Intervals] Build error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/intervals/status', methods=['GET'])
+def intervals_status():
+    """Visibility into materialized intervals for a date.
+
+    Query: ?date=YYYY-MM-DD (defaults to today IST)
+    """
+    try:
+        date_str = validate_date_format(request.args.get('date'))
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        q = f"""
+        SELECT
+          COUNT(*) AS interval_count,
+          COUNT(DISTINCT participant_key) AS participant_count,
+          COUNTIF(source = 'snapshot')         AS source_snapshot,
+          COUNTIF(source = 'synthesized_main') AS source_synthesized,
+          COUNTIF(source = 'webhook_fill')     AS source_webhook_fill,
+          COUNTIF(room_category = 'main')      AS cat_main,
+          COUNTIF(room_category = 'breakout')  AS cat_breakout,
+          COUNTIF(room_category = 'break')     AS cat_break,
+          SUM(duration_seconds)                AS total_seconds,
+          SUM(alone_seconds)                   AS total_alone_seconds,
+          MIN(start_ts) AS first_start_ts,
+          MAX(end_ts)   AS last_end_ts,
+          MAX(built_at) AS last_built_at
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+        WHERE event_date = @date
+        """
+        rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
+        )).result())
+        r = rows[0] if rows else None
+        if not r or (r.interval_count or 0) == 0:
+            return jsonify({
+                'success': True,
+                'date': date_str,
+                'built': False,
+                'message': 'No intervals materialized for this date. POST /intervals/rebuild to build.'
+            })
+        return jsonify({
+            'success': True,
+            'date': date_str,
+            'built': True,
+            'interval_count': r.interval_count,
+            'participant_count': r.participant_count,
+            'by_source': {
+                'snapshot': r.source_snapshot,
+                'synthesized_main': r.source_synthesized,
+                'webhook_fill': r.source_webhook_fill,
+            },
+            'by_category': {
+                'main': r.cat_main,
+                'breakout': r.cat_breakout,
+                'break': r.cat_break,
+            },
+            'total_minutes': round((r.total_seconds or 0) / 60.0, 1),
+            'total_alone_minutes': round((r.total_alone_seconds or 0) / 60.0, 1),
+            'first_start_utc': r.first_start_ts.isoformat() if r.first_start_ts else None,
+            'last_end_utc':   r.last_end_ts.isoformat() if r.last_end_ts else None,
+            'last_built_at_utc': r.last_built_at.isoformat() if r.last_built_at else None,
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[Intervals] Status error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/attendance_v2/<date>', methods=['GET'])
+def team_attendance_v2(team_id, date):
+    """v2 team attendance — reads from presence_intervals.
+
+    Same JSON shape as /teams/<team_id>/attendance/<date> for diff parity.
+    """
+    try:
+        report_date = validate_date_format(date)
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Resolve team members → participant_keys via name/email bridge built
+        # from THIS date's snapshots+intervals (matches v1 behaviour).
+        # Then aggregate intervals per participant_key.
+        q = f"""
+        WITH team_members AS (
+            SELECT participant_name, participant_email
+            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+            WHERE team_id = @team_id
+        ),
+        identity_map AS (
+            SELECT DISTINCT
+                participant_key,
+                LOWER(TRIM(participant_name)) AS name_key,
+                NULLIF(LOWER(TRIM(participant_email)), '') AS email_key
+            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+            WHERE event_date = @date
+              AND participant_name IS NOT NULL AND participant_name != ''
+        ),
+        name_to_key AS (
+            SELECT name_key, MIN(participant_key) AS participant_key
+            FROM identity_map GROUP BY name_key
+        ),
+        email_to_key AS (
+            SELECT email_key, MIN(participant_key) AS participant_key
+            FROM identity_map WHERE email_key IS NOT NULL GROUP BY email_key
+        ),
+        team_keys AS (
+            SELECT DISTINCT
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(tm.participant_name))) AS participant_key,
+                tm.participant_name AS member_name,
+                tm.participant_email AS member_email
+            FROM team_members tm
+            LEFT JOIN email_to_key etk ON NULLIF(LOWER(TRIM(tm.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key  ntk ON LOWER(TRIM(tm.participant_name)) = ntk.name_key
+        ),
+        per_participant AS (
+            SELECT
+                pi.participant_key,
+                ANY_VALUE(pi.participant_name) AS participant_name,
+                MAX(pi.participant_email)      AS participant_email,
+                SUM(IF(pi.room_category='main',     pi.duration_seconds, 0)) AS main_seconds,
+                SUM(IF(pi.room_category='breakout', pi.duration_seconds, 0)) AS breakout_seconds,
+                SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
+                SUM(pi.alone_seconds) AS isolation_seconds,
+                SUM(pi.duration_seconds) AS total_seconds,
+                MIN(pi.start_ts) AS first_seen_utc,
+                MAX(pi.end_ts)   AS last_seen_utc
+            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+            WHERE pi.event_date = @date
+            GROUP BY pi.participant_key
+        )
+        SELECT
+            tk.member_name,
+            tk.member_email,
+            pp.participant_name,
+            pp.participant_email,
+            CEILING(COALESCE(pp.main_seconds,0)     / 60.0) AS main_room_mins,
+            CEILING(COALESCE(pp.breakout_seconds,0) / 60.0) AS breakout_mins,
+            CEILING(COALESCE(pp.break_seconds,0)    / 60.0) AS break_minutes,
+            CEILING(COALESCE(pp.isolation_seconds,0)/ 60.0) AS isolation_minutes,
+            CEILING(COALESCE(pp.total_seconds,0)    / 60.0) AS total_duration_mins,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pp.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pp.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
+        FROM team_keys tk
+        LEFT JOIN per_participant pp USING (participant_key)
+        ORDER BY tk.member_name
+        """
+        rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("date", "DATE", report_date),
+            ]
+        )).result())
+
+        # Get team info (name/manager) — same shape as v1
+        team_q = f"""
+        SELECT team_name, manager_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id
+        """
+        team_rows = list(client.query(team_q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )).result())
+        team_name = team_rows[0].team_name if team_rows else 'Unknown'
+        manager_name = team_rows[0].manager_name if team_rows else ''
+
+        def _status(total):
+            if total >= 300:
+                return 'present'
+            if total >= 240:
+                return 'half_day'
+            return 'absent'
+
+        participants = []
+        for r in rows:
+            display_name = r.participant_name or r.member_name
+            display_email = r.participant_email or r.member_email or ''
+            total = int(r.total_duration_mins or 0)
+            participants.append({
+                'name': display_name,
+                'email': display_email,
+                'first_seen_ist': r.first_seen_ist,
+                'last_seen_ist': r.last_seen_ist,
+                'total_duration_mins': total,
+                'breakout_mins': int(r.breakout_mins or 0),
+                'main_room_mins': int(r.main_room_mins or 0),
+                'break_minutes': int(r.break_minutes or 0),
+                'isolation_minutes': int(r.isolation_minutes or 0),
+                'status': _status(total),
+            })
+
+        return jsonify({
+            'success': True,
+            'team_id': team_id,
+            'team_name': team_name,
+            'manager_name': manager_name,
+            'date': report_date,
+            'source': 'presence_intervals_v2',
+            'participants': participants,
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[TeamV2] error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/report/compare', methods=['GET'])
+def report_compare():
+    """Diff v1 (inline-CTE) vs v2 (presence_intervals) for a team+date.
+
+    Query: ?date=YYYY-MM-DD&team_id=<id>
+    Calls the existing /teams/<id>/attendance/<date> AND /teams/<id>/attendance_v2/<date>
+    internally via Flask's test client, then returns per-participant deltas
+    for the metrics that matter: total/main/breakout/break/isolation.
+    """
+    try:
+        date_str = validate_date_format(request.args.get('date'))
+        team_id = request.args.get('team_id')
+        if not team_id:
+            return jsonify({'success': False, 'error': 'team_id required'}), 400
+
+        # Use Flask's test_client to invoke internal routes — same process,
+        # no network hop, no auth wrangling.
+        tc = app.test_client()
+        v1_resp = tc.get(f'/teams/{team_id}/attendance/{date_str}')
+        v2_resp = tc.get(f'/teams/{team_id}/attendance_v2/{date_str}')
+
+        v1 = v1_resp.get_json() or {}
+        v2 = v2_resp.get_json() or {}
+
+        v1_parts = {(p.get('name') or '').strip().lower(): p for p in (v1.get('participants') or [])}
+        v2_parts = {(p.get('name') or '').strip().lower(): p for p in (v2.get('participants') or [])}
+
+        all_keys = sorted(set(v1_parts.keys()) | set(v2_parts.keys()))
+        rows = []
+        max_total_delta = 0
+        for k in all_keys:
+            v1p = v1_parts.get(k, {})
+            v2p = v2_parts.get(k, {})
+
+            def _g(p, field):
+                return int(p.get(field) or 0)
+
+            row = {
+                'name': v2p.get('name') or v1p.get('name') or k,
+                'email': v2p.get('email') or v1p.get('email') or '',
+                'in_v1': k in v1_parts,
+                'in_v2': k in v2_parts,
+                'v1': {
+                    'total': _g(v1p, 'total_duration_mins'),
+                    'main':  _g(v1p, 'main_room_mins'),
+                    'breakout': _g(v1p, 'breakout_mins'),
+                    'break': _g(v1p, 'break_minutes'),
+                    'isolation': _g(v1p, 'isolation_minutes'),
+                },
+                'v2': {
+                    'total': _g(v2p, 'total_duration_mins'),
+                    'main':  _g(v2p, 'main_room_mins'),
+                    'breakout': _g(v2p, 'breakout_mins'),
+                    'break': _g(v2p, 'break_minutes'),
+                    'isolation': _g(v2p, 'isolation_minutes'),
+                },
+            }
+            row['delta'] = {
+                k2: row['v2'][k2] - row['v1'][k2]
+                for k2 in ('total','main','breakout','break','isolation')
+            }
+            row['significant'] = any(abs(v) > 1 for v in row['delta'].values())
+            max_total_delta = max(max_total_delta, abs(row['delta']['total']))
+            rows.append(row)
+
+        # Summary: rows with significant delta
+        n_significant = sum(1 for r in rows if r['significant'])
+        return jsonify({
+            'success': True,
+            'date': date_str,
+            'team_id': team_id,
+            'v1_status': v1_resp.status_code,
+            'v2_status': v2_resp.status_code,
+            'participants_v1': len(v1_parts),
+            'participants_v2': len(v2_parts),
+            'rows_total': len(rows),
+            'rows_significant_diff': n_significant,
+            'max_total_delta_mins': max_total_delta,
+            'diff': rows,
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[Compare] error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
 
