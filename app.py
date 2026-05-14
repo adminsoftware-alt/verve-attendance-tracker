@@ -14032,6 +14032,27 @@ def team_attendance_v2(team_id, date):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
+        # Auto-build intervals on-demand if not yet materialized for this date.
+        # Lets the frontend hit any historical date without operator intervention.
+        # Cheap pre-check: COUNT(*) on a partitioned table scans only the
+        # partition for @date.
+        _ensure_presence_intervals_table()
+        check_q = f"""
+        SELECT COUNT(*) AS n FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+        WHERE event_date = @date
+        """
+        check_rows = list(client.query(check_q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
+        )).result())
+        if check_rows and (check_rows[0].n or 0) == 0:
+            print(f"[TeamV2] No intervals for {report_date} — auto-building")
+            try:
+                build_presence_intervals(report_date)
+            except Exception as e:
+                print(f"[TeamV2] Auto-build failed for {report_date}: {e}")
+                # Continue with empty intervals — endpoint still returns the
+                # team roster with zeros instead of erroring.
+
         # Team-member -> presence_intervals bridge uses NORMALIZED names so
         # Zoom rejoin variants ("Kajal Yadav-1") link to the "Kajal Yadav"
         # roster row. Also matches by email when present. One member may

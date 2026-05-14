@@ -202,7 +202,9 @@ export async function fetchParticipants() {
 }
 
 export async function fetchTeamAttendance(teamId, date) {
-  return apiFetch(`/teams/${teamId}/attendance/${date}`);
+  // v2: reads from presence_intervals (materialized single source of truth).
+  // Backend auto-builds intervals on-demand if they don't exist for the date.
+  return apiFetch(`/teams/${teamId}/attendance_v2/${date}`);
 }
 
 export async function fetchTeamAttendanceRange(teamId, startDate, endDate) {
