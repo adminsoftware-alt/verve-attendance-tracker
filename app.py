@@ -6309,7 +6309,26 @@ def attendance_live():
           WHERE event_date = '{target_date}'
             AND room_name IS NOT NULL AND room_name != ''
         ),
-        -- Who is in each room at the latest snapshot
+        -- Per-room latest snapshot WITHIN A 60s WINDOW of the global max.
+        -- Different polling sources (e.g. Zoom App SDK sitting in Main Room
+        -- vs the broader monitor that sees all breakouts) can each push at
+        -- slightly different cadences. If we just take rows where
+        -- snapshot_time = global_max, the room set whose source polled
+        -- last "wins" and every other room appears empty. Window-based
+        -- per-room latest lets ALL recently-active rooms contribute.
+        recent_per_room AS (
+          SELECT s.room_name, MAX(s.snapshot_time) as room_latest
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` s
+          CROSS JOIN latest_snapshot ls
+          WHERE s.event_date = '{target_date}'
+            AND s.snapshot_time > TIMESTAMP_SUB(ls.max_time, INTERVAL 60 SECOND)
+            AND s.room_name IS NOT NULL AND s.room_name != ''
+          GROUP BY s.room_name
+        ),
+        -- Who is in each room at THAT room's latest snapshot in the window.
+        -- If a participant appears in two rooms' latest snapshots (they
+        -- moved within the 60s window), keep only their most recent room
+        -- so they don't ghost in both places.
         current_state AS (
           SELECT
             s.room_name,
@@ -6318,10 +6337,14 @@ def attendance_live():
             s.participant_uuid,
             s.snapshot_time
           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` s
-          CROSS JOIN latest_snapshot ls
+          INNER JOIN recent_per_room rpr
+            ON s.room_name = rpr.room_name AND s.snapshot_time = rpr.room_latest
           WHERE s.event_date = '{target_date}'
-            AND s.snapshot_time = ls.max_time
             AND s.participant_name NOT LIKE '%Scout%'
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name)))
+            ORDER BY s.snapshot_time DESC
+          ) = 1
         )
         SELECT
           ar.room_name,
