@@ -13978,12 +13978,22 @@ def build_presence_intervals(date_str):
 def intervals_rebuild():
     """Build (or rebuild) presence_intervals for one IST date.
 
-    Body: {"date": "YYYY-MM-DD"}
-    Idempotent — deletes existing rows for the date first.
+    Body options (pick one):
+      {"date":     "YYYY-MM-DD"}   explicit date
+      {"days_ago": N}              N days before today IST (1 = yesterday)
+      {}                           defaults to today IST
+
+    The days_ago form lets Cloud Scheduler post a static body every night
+    to rebuild yesterday (since Scheduler can't compute dynamic dates).
     """
     try:
         data = request.get_json(silent=True) or {}
-        date_str = validate_date_format(data.get('date'))
+        if 'days_ago' in data:
+            days_ago = int(data['days_ago'])
+            target = datetime.strptime(get_ist_date(), '%Y-%m-%d').date() - timedelta(days=days_ago)
+            date_str = target.isoformat()
+        else:
+            date_str = validate_date_format(data.get('date'))
         result = build_presence_intervals(date_str)
         return jsonify({'success': True, **result})
     except ValueError as e:
