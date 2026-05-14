@@ -14038,7 +14038,7 @@ def team_attendance_v2(team_id, date):
         # match multiple participant_keys (one per rejoin variant) — all
         # intervals get summed under the member's row.
         norm_pi   = _sql_normalize_name('dk.participant_name')
-        norm_tm   = _sql_normalize_name('tm.participant_name')
+        norm_tm   = _sql_normalize_name('tm.member_name')
         q = f"""
         WITH team_members AS (
             SELECT
