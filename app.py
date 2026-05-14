@@ -14289,6 +14289,590 @@ def report_compare():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
+    """Find dates in [start, end] with no presence_intervals rows and build
+    up to max_builds of them. Returns (built_count, still_missing_count).
+
+    For wide ranges users navigate to, this lets them see something even if
+    backfill wasn't run — but caps the per-request cost. Beyond the cap,
+    /intervals/backfill is the right tool.
+    """
+    client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+    _ensure_presence_intervals_table()
+    q = f"""
+    WITH wanted AS (
+      SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(@start, @end)) AS day
+    ),
+    built AS (
+      SELECT DISTINCT event_date FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+      WHERE event_date BETWEEN @start AND @end
+    )
+    SELECT w.day
+    FROM wanted w
+    LEFT JOIN built b ON w.day = b.event_date
+    WHERE b.event_date IS NULL
+    ORDER BY w.day DESC
+    """
+    rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("start", "DATE", start_date),
+            bigquery.ScalarQueryParameter("end", "DATE", end_date),
+        ]
+    )).result())
+    missing = [r.day.isoformat() for r in rows]
+    built = 0
+    for d in missing[:max_builds]:
+        try:
+            build_presence_intervals(d)
+            built += 1
+        except Exception as e:
+            print(f"[AutoBuildRange] {d} failed: {e}")
+    return built, max(0, len(missing) - max_builds)
+
+
+@app.route('/teams/<team_id>/attendance/range_v2', methods=['GET'])
+def team_attendance_range_v2(team_id):
+    """v2 team attendance over a date range. Reads from presence_intervals.
+
+    Query: ?start=YYYY-MM-DD&end=YYYY-MM-DD[&format=csv]
+    Same JSON shape as v1 /teams/<id>/attendance/range so the frontend swaps
+    cleanly. Auto-builds up to 15 unbuilt dates in the range.
+    """
+    try:
+        start_date = validate_date_format(request.args.get('start'))
+        end_date = validate_date_format(request.args.get('end'))
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        built, still_missing = _auto_build_dates_in_range(start_date, end_date)
+        if built:
+            print(f"[RangeV2] auto-built {built} dates for {team_id} {start_date}..{end_date}")
+
+        norm_pi = _sql_normalize_name('dk.participant_name')
+        norm_tm = _sql_normalize_name('tm.member_name')
+        q = f"""
+        WITH team_members AS (
+            SELECT participant_name AS member_name, participant_email AS member_email
+            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+            WHERE team_id = @team_id
+        ),
+        distinct_keys AS (
+            SELECT DISTINCT event_date, participant_key, participant_name, participant_email
+            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+            WHERE event_date BETWEEN @start AND @end
+              AND participant_name IS NOT NULL AND participant_name != ''
+        ),
+        member_bridge AS (
+            SELECT DISTINCT
+                tm.member_name, tm.member_email,
+                dk.event_date, dk.participant_key
+            FROM team_members tm
+            JOIN distinct_keys dk
+              ON (
+                {norm_pi} = {norm_tm}
+                OR (
+                  NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
+                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(tm.member_email)), '')
+                )
+              )
+        ),
+        per_day AS (
+            SELECT
+                mb.member_name, mb.member_email, mb.event_date,
+                ANY_VALUE(pi.participant_name) AS display_name,
+                MAX(pi.participant_email) AS display_email,
+                SUM(IF(pi.room_category='main',     pi.duration_seconds, 0)) AS main_seconds,
+                SUM(IF(pi.room_category='breakout', pi.duration_seconds, 0)) AS breakout_seconds,
+                SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
+                SUM(pi.alone_seconds) AS isolation_seconds,
+                SUM(pi.duration_seconds) AS total_seconds,
+                MIN(pi.start_ts) AS first_seen_utc,
+                MAX(pi.end_ts)   AS last_seen_utc
+            FROM member_bridge mb
+            JOIN `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+              ON pi.event_date = mb.event_date AND pi.participant_key = mb.participant_key
+            GROUP BY mb.member_name, mb.member_email, mb.event_date
+        )
+        SELECT
+            pd.member_name AS name, pd.member_email AS email,
+            CAST(pd.event_date AS STRING) AS date,
+            CEILING(COALESCE(pd.main_seconds,0)/60.0)     AS main_room_minutes,
+            CEILING(COALESCE(pd.breakout_seconds,0)/60.0) AS breakout_minutes,
+            CEILING(COALESCE(pd.break_seconds,0)/60.0)    AS break_minutes,
+            CEILING(COALESCE(pd.isolation_seconds,0)/60.0) AS isolation_minutes,
+            CEILING(COALESCE(pd.total_seconds,0)/60.0)    AS active_minutes,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
+        FROM per_day pd
+        WHERE COALESCE(pd.total_seconds, 0) > 0
+        ORDER BY pd.member_name, pd.event_date
+        """
+        rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("start", "DATE", start_date),
+                bigquery.ScalarQueryParameter("end", "DATE", end_date),
+            ]
+        )).result())
+
+        # Team info
+        team_q = f"SELECT team_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id"
+        team_rows = list(client.query(team_q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )).result())
+        team_name = team_rows[0].team_name if team_rows else 'Unknown'
+
+        # All team members for absence handling
+        members_q = f"SELECT participant_name, participant_email FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id"
+        all_members = list(client.query(members_q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )).result())
+
+        def _status(total):
+            return 'present' if total >= 300 else ('half_day' if total >= 240 else 'absent')
+
+        daily_data = []
+        for r in rows:
+            total = int(r.active_minutes or 0)
+            daily_data.append({
+                'date': r.date,
+                'name': r.name,
+                'email': r.email or '',
+                'first_seen_ist': r.first_seen_ist,
+                'last_seen_ist': r.last_seen_ist,
+                'active_minutes': total,
+                'breakout_minutes': int(r.breakout_minutes or 0),
+                'main_room_minutes': int(r.main_room_minutes or 0),
+                'break_minutes': int(r.break_minutes or 0),
+                'isolation_minutes': int(r.isolation_minutes or 0),
+                'status': _status(total),
+            })
+
+        # Member summary keyed by normalized name (collapses rejoin variants)
+        member_summary = {}
+        for r in daily_data:
+            clean = normalize_participant_name(r['name'])
+            key = clean.lower().strip()
+            if not key:
+                continue
+            if key not in member_summary:
+                member_summary[key] = {
+                    'name': clean, 'email': r['email'],
+                    'days_present': 0, 'total_active_mins': 0,
+                    'total_break_mins': 0, 'total_isolation_mins': 0,
+                }
+            if r['status'] in ('present', 'half_day'):
+                member_summary[key]['days_present'] += 1
+            member_summary[key]['total_active_mins']    += r['active_minutes']
+            member_summary[key]['total_break_mins']     += r['break_minutes']
+            member_summary[key]['total_isolation_mins'] += r['isolation_minutes']
+
+        # CSV export
+        if request.args.get('format') == 'csv':
+            import csv, io
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Date','Name','Email','Status','First_Seen_IST','Last_Seen_IST',
+                             'Active_Minutes','Break_Minutes','Isolation_Minutes'])
+            for r in daily_data:
+                writer.writerow([r['date'], r['name'], r['email'], r['status'],
+                                 r['first_seen_ist'], r['last_seen_ist'],
+                                 r['active_minutes'], r['break_minutes'], r['isolation_minutes']])
+            return Response(output.getvalue(), mimetype='text/csv',
+                            headers={'Content-Disposition': f'attachment; filename=team_{team_name.replace(" ","_")}_{start_date}_to_{end_date}.csv'})
+
+        return jsonify({
+            'success': True,
+            'team_id': team_id,
+            'team_name': team_name,
+            'start_date': start_date,
+            'end_date': end_date,
+            'total_members': len(all_members),
+            'daily_data': daily_data,
+            'member_summary': list(member_summary.values()),
+            'source': 'presence_intervals_v2',
+            'auto_built_dates': built,
+            'unbuilt_dates_remaining': still_missing,
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[RangeV2] error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/<team_id>/report/monthly_v2', methods=['GET'])
+def team_monthly_report_v2(team_id):
+    """v2 monthly report. Reads from presence_intervals.
+
+    Query: ?year=YYYY&month=M[&format=csv]
+    Same JSON+CSV shape as v1 /teams/<id>/report/monthly.
+    """
+    try:
+        year  = int(request.args.get('year'))
+        month = int(request.args.get('month'))
+        if not (1 <= month <= 12):
+            return jsonify({'success': False, 'error': 'month must be 1..12'}), 400
+
+        from calendar import monthrange
+        start_date = f"{year:04d}-{month:02d}-01"
+        end_date   = f"{year:04d}-{month:02d}-{monthrange(year, month)[1]:02d}"
+
+        # Reuse range_v2 logic. We could call it directly, but copying the
+        # data path here avoids HTTP overhead and lets us shape the response
+        # exactly like v1 monthly.
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        built, still_missing = _auto_build_dates_in_range(start_date, end_date)
+        if built:
+            print(f"[MonthlyV2] auto-built {built} dates for {team_id} {year}-{month:02d}")
+
+        norm_pi = _sql_normalize_name('dk.participant_name')
+        norm_tm = _sql_normalize_name('tm.member_name')
+        q = f"""
+        WITH team_members AS (
+            SELECT participant_name AS member_name, participant_email AS member_email
+            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+            WHERE team_id = @team_id
+        ),
+        distinct_keys AS (
+            SELECT DISTINCT event_date, participant_key, participant_name, participant_email
+            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+            WHERE event_date BETWEEN @start AND @end
+              AND participant_name IS NOT NULL AND participant_name != ''
+        ),
+        member_bridge AS (
+            SELECT DISTINCT
+                tm.member_name, tm.member_email,
+                dk.event_date, dk.participant_key
+            FROM team_members tm
+            JOIN distinct_keys dk
+              ON (
+                {norm_pi} = {norm_tm}
+                OR (
+                  NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
+                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(tm.member_email)), '')
+                )
+              )
+        ),
+        per_day AS (
+            SELECT
+                mb.member_name, mb.member_email, mb.event_date,
+                SUM(IF(pi.room_category='main',     pi.duration_seconds, 0)) AS main_seconds,
+                SUM(IF(pi.room_category='breakout', pi.duration_seconds, 0)) AS breakout_seconds,
+                SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
+                SUM(pi.alone_seconds)             AS isolation_seconds,
+                SUM(pi.duration_seconds)          AS total_seconds,
+                MIN(pi.start_ts) AS first_seen_utc,
+                MAX(pi.end_ts)   AS last_seen_utc
+            FROM member_bridge mb
+            JOIN `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+              ON pi.event_date = mb.event_date AND pi.participant_key = mb.participant_key
+            GROUP BY mb.member_name, mb.member_email, mb.event_date
+        )
+        SELECT
+            pd.member_name AS name, pd.member_email AS email,
+            CAST(pd.event_date AS STRING) AS date,
+            CEILING(COALESCE(pd.main_seconds,0)/60.0)     AS main_room_minutes,
+            CEILING(COALESCE(pd.breakout_seconds,0)/60.0) AS breakout_minutes,
+            CEILING(COALESCE(pd.break_seconds,0)/60.0)    AS break_minutes,
+            CEILING(COALESCE(pd.isolation_seconds,0)/60.0) AS isolation_minutes,
+            CEILING(COALESCE(pd.total_seconds,0)/60.0)    AS active_minutes,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
+        FROM per_day pd
+        WHERE COALESCE(pd.total_seconds, 0) > 0
+        ORDER BY pd.member_name, pd.event_date
+        """
+        rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+                bigquery.ScalarQueryParameter("start", "DATE", start_date),
+                bigquery.ScalarQueryParameter("end",   "DATE", end_date),
+            ]
+        )).result())
+
+        team_q = f"SELECT team_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id"
+        team_rows = list(client.query(team_q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )).result())
+        team_name = team_rows[0].team_name if team_rows else 'Unknown'
+
+        def _status(total):
+            return 'present' if total >= 300 else ('half_day' if total >= 240 else 'absent')
+
+        data = []
+        for r in rows:
+            total = int(r.active_minutes or 0)
+            data.append({
+                'date': r.date,
+                'name': r.name,
+                'email': r.email or '',
+                'first_seen_ist': r.first_seen_ist,
+                'last_seen_ist': r.last_seen_ist,
+                'active_minutes': total,
+                'breakout_minutes': int(r.breakout_minutes or 0),
+                'main_room_minutes': int(r.main_room_minutes or 0),
+                'break_minutes': int(r.break_minutes or 0),
+                'isolation_minutes': int(r.isolation_minutes or 0),
+                'status': _status(total),
+            })
+        data.sort(key=lambda x: (x['name'].lower(), x['date']))
+
+        if request.args.get('format') == 'csv':
+            import csv, io
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Date','Name','Email','Status','First_Seen_IST','Last_Seen_IST',
+                             'Total_Minutes','Breakout_Minutes','Main_Room_Minutes','Break_Minutes','Isolation_Minutes'])
+            for r in data:
+                writer.writerow([r['date'], r['name'], r['email'], r['status'],
+                                 r['first_seen_ist'], r['last_seen_ist'], r['active_minutes'],
+                                 r['breakout_minutes'], r['main_room_minutes'], r['break_minutes'], r['isolation_minutes']])
+            return Response(output.getvalue(), mimetype='text/csv',
+                            headers={'Content-Disposition': f'attachment; filename=team_{team_name.replace(" ","_")}_{year}_{month:02d}.csv'})
+
+        # Member summary
+        member_summary = {}
+        for r in data:
+            clean = normalize_participant_name(r['name'])
+            key = clean.lower().strip()
+            if not key:
+                continue
+            if key not in member_summary:
+                member_summary[key] = {
+                    'name': clean, 'email': r['email'],
+                    'days_present': 0, 'total_active_mins': 0,
+                    'total_break_mins': 0, 'total_isolation_mins': 0,
+                }
+            if r['status'] in ('present', 'half_day'):
+                member_summary[key]['days_present'] += 1
+            member_summary[key]['total_active_mins']    += r['active_minutes']
+            member_summary[key]['total_break_mins']     += r['break_minutes']
+            member_summary[key]['total_isolation_mins'] += r['isolation_minutes']
+
+        # Working days in the month (Mon-Fri)
+        from datetime import date as date_cls
+        working_days = 0
+        for d in range(1, monthrange(year, month)[1] + 1):
+            if date_cls(year, month, d).weekday() < 5:
+                working_days += 1
+
+        return jsonify({
+            'success': True,
+            'team_id': team_id,
+            'team_name': team_name,
+            'year': year,
+            'month': month,
+            'working_days': working_days,
+            'daily_data': data,
+            'member_summary': list(member_summary.values()),
+            'source': 'presence_intervals_v2',
+            'auto_built_dates': built,
+            'unbuilt_dates_remaining': still_missing,
+        })
+    except (TypeError, ValueError) as e:
+        return jsonify({'success': False, 'error': f'invalid year/month: {e}'}), 400
+    except Exception as e:
+        print(f"[MonthlyV2] error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/attendance/summary_v2/<date>', methods=['GET'])
+def attendance_summary_v2(date):
+    """v2 Day View Full. Reads from presence_intervals.
+
+    Same JSON shape as v1 /attendance/summary/<date>: one entry per
+    participant with first_seen, last_seen, total_duration_mins, and
+    room_visits (ordered intervals).
+    """
+    try:
+        report_date = validate_date_format(date)
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # Auto-build if not yet materialized
+        _ensure_presence_intervals_table()
+        check_q = f"""
+        SELECT COUNT(*) AS n FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+        WHERE event_date = @date
+        """
+        check_rows = list(client.query(check_q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
+        )).result())
+        if check_rows and (check_rows[0].n or 0) == 0:
+            print(f"[SummaryV2] No intervals for {report_date} — auto-building")
+            try:
+                build_presence_intervals(report_date)
+            except Exception as e:
+                print(f"[SummaryV2] Auto-build failed for {report_date}: {e}")
+
+        # Pull all intervals for the date, ordered by participant + start_ts
+        q = f"""
+        SELECT
+          participant_key,
+          participant_name,
+          participant_email,
+          room_name,
+          room_category,
+          start_ts,
+          end_ts,
+          duration_seconds,
+          alone_seconds,
+          source
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+        WHERE event_date = @date
+        ORDER BY participant_key, start_ts
+        """
+        rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
+        )).result())
+
+        # Group by participant_key, then collapse rejoin variants via normalized name
+        by_key = {}
+        for r in rows:
+            k = r.participant_key
+            if k not in by_key:
+                by_key[k] = {
+                    'name': r.participant_name,
+                    'email': r.participant_email or '',
+                    'intervals': []
+                }
+            by_key[k]['intervals'].append(r)
+
+        # Collapse rejoin variants: merge participants whose normalized name + email match
+        # (matches v1 monthly/range merge_participants_by_name behaviour)
+        merged = {}
+        for k, info in by_key.items():
+            clean = normalize_participant_name(info['name'])
+            email = (info['email'] or '').strip().lower()
+            mkey = (clean.lower().strip(), email)
+            if mkey not in merged:
+                merged[mkey] = {
+                    'name': clean,
+                    'email': info['email'],
+                    'intervals': []
+                }
+            merged[mkey]['intervals'].extend(info['intervals'])
+
+        def _fmt_ist(ts):
+            if ts is None:
+                return None
+            # ts is a UTC TIMESTAMP from BQ — convert to IST string
+            ist = ts + IST_OFFSET
+            return ist.strftime('%H:%M')
+
+        participants = []
+        for (name_key, _), info in merged.items():
+            ivs = sorted(info['intervals'], key=lambda x: x.start_ts)
+            if not ivs:
+                continue
+            first_seen = min(iv.start_ts for iv in ivs)
+            last_seen  = max(iv.end_ts   for iv in ivs)
+            total_seconds = sum(iv.duration_seconds or 0 for iv in ivs)
+            isolation_seconds = sum(iv.alone_seconds or 0 for iv in ivs)
+            room_visits = []
+            for iv in ivs:
+                room_visits.append({
+                    'room_name':        iv.room_name,
+                    'room_category':    iv.room_category,
+                    'room_joined_ist':  _fmt_ist(iv.start_ts),
+                    'room_left_ist':    _fmt_ist(iv.end_ts),
+                    'duration_minutes': int((iv.duration_seconds or 0) / 60),
+                    'source':           iv.source,
+                })
+            participants.append({
+                'name':                info['name'],
+                'email':               info['email'] or '',
+                'first_seen_ist':      _fmt_ist(first_seen),
+                'last_seen_ist':       _fmt_ist(last_seen),
+                'total_duration_mins': int(round(total_seconds / 60.0)),
+                'isolation_minutes':   int(round(isolation_seconds / 60.0)),
+                'room_visits':         room_visits,
+            })
+
+        participants.sort(key=lambda x: x['name'].lower())
+        return jsonify({
+            'success': True,
+            'date': report_date,
+            'source': 'presence_intervals_v2',
+            'participants': participants,
+            'total_participants': len(participants),
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[SummaryV2] error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/intervals/backfill', methods=['POST'])
+def intervals_backfill():
+    """Build presence_intervals for many dates in one request.
+
+    Body options:
+      {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}
+      {"days": 30}   — last N IST days (excluding today)
+      {"dates": ["YYYY-MM-DD", ...]}
+
+    Returns per-date status + summary counts.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        dates = []
+        if 'dates' in data and isinstance(data['dates'], list):
+            for d in data['dates']:
+                dates.append(validate_date_format(d))
+        elif 'start' in data and 'end' in data:
+            s = datetime.strptime(validate_date_format(data['start']), '%Y-%m-%d').date()
+            e = datetime.strptime(validate_date_format(data['end']),   '%Y-%m-%d').date()
+            cur = s
+            while cur <= e:
+                dates.append(cur.isoformat())
+                cur += timedelta(days=1)
+        elif 'days' in data:
+            n = int(data['days'])
+            today = datetime.strptime(get_ist_date(), '%Y-%m-%d').date()
+            for i in range(1, n + 1):
+                dates.append((today - timedelta(days=i)).isoformat())
+            dates.sort()
+        else:
+            return jsonify({'success': False, 'error': 'specify start+end, days, or dates'}), 400
+
+        results = []
+        for d in dates:
+            try:
+                r = build_presence_intervals(d)
+                results.append({'date': d, 'success': True,
+                                'intervals': r['intervals_built'],
+                                'participants': r['participants'],
+                                'elapsed_s': r['elapsed_seconds']})
+            except Exception as e:
+                print(f"[Backfill] {d} failed: {e}")
+                results.append({'date': d, 'success': False, 'error': str(e)[:200]})
+
+        ok = sum(1 for r in results if r.get('success'))
+        return jsonify({
+            'success': True,
+            'requested': len(dates),
+            'succeeded': ok,
+            'failed': len(results) - ok,
+            'total_intervals': sum(r.get('intervals', 0) for r in results if r.get('success')),
+            'results': results,
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[Backfill] error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
 

@@ -38,7 +38,8 @@ export async function fetchHeatmap(date, interval = 15) {
 
 export async function fetchSummary(date) {
   const d = date || istDate();
-  return apiFetch(`/attendance/summary/${d}`);
+  // v2: reads from presence_intervals (auto-builds if missing).
+  return apiFetch(`/attendance/summary_v2/${d}`);
 }
 
 // ─── TRANSFORM: API response → app employee format ─────
@@ -208,11 +209,14 @@ export async function fetchTeamAttendance(teamId, date) {
 }
 
 export async function fetchTeamAttendanceRange(teamId, startDate, endDate) {
-  return apiFetch(`/teams/${teamId}/attendance/range?start=${startDate}&end=${endDate}`);
+  // v2: reads from presence_intervals. Auto-builds up to 15 unbuilt dates
+  // in the range; for larger backfills hit POST /intervals/backfill once.
+  return apiFetch(`/teams/${teamId}/attendance/range_v2?start=${startDate}&end=${endDate}`);
 }
 
 export async function fetchTeamMonthlyReport(teamId, year, month) {
-  return apiFetch(`/teams/${teamId}/report/monthly?year=${year}&month=${month}`);
+  // v2: reads from presence_intervals.
+  return apiFetch(`/teams/${teamId}/report/monthly_v2?year=${year}&month=${month}`);
 }
 
 export async function fetchTeamComparison(teamIds, date) {
@@ -299,11 +303,13 @@ export async function deleteAttendanceOverride(overrideId) {
 }
 
 export function getTeamRangeCsvUrl(teamId, startDate, endDate) {
-  return `${ZOOM_API_BASE}/teams/${teamId}/attendance/range?start=${startDate}&end=${endDate}&format=csv`;
+  return `${ZOOM_API_BASE}/teams/${teamId}/attendance/range_v2?start=${startDate}&end=${endDate}&format=csv`;
 }
 
 export function getTeamMonthlyCsvUrl(teamId, year, month) {
-  return `${ZOOM_API_BASE}/teams/${teamId}/report/monthly?year=${year}&month=${month}&format=csv`;
+  // v2 CSV. employee_csv and team_summary_csv formats remain on v1
+  // (separate exports below) until those custom layouts are migrated.
+  return `${ZOOM_API_BASE}/teams/${teamId}/report/monthly_v2?year=${year}&month=${month}&format=csv`;
 }
 
 export function getTeamMonthlyEmployeeCsvUrl(teamId, year, month) {
