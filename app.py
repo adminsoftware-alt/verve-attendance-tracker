@@ -14126,6 +14126,19 @@ def team_attendance_v2(team_id, date):
                 'status': _status(total),
             })
 
+        # Match v1 post-processing: merge Zoom rejoin variants ("Aastha-1"
+        # → "Aastha") and same-email duplicates. Without this, a person who
+        # rejoined mid-meeting appears as two participants and one of them
+        # (the one not in the team roster) gets dropped silently. See
+        # app.py:8184-8185 for v1's equivalent calls.
+        participants = merge_participants_by_name(participants, mode='team')
+        participants = collapse_by_email(participants, mode='team')
+
+        # Re-derive status from merged totals (statuses summed via mode='team'
+        # but rank-merge happens during merge; recompute defensively).
+        for p in participants:
+            p['status'] = _status(int(p.get('total_duration_mins') or 0))
+
         return jsonify({
             'success': True,
             'team_id': team_id,
