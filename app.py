@@ -13504,6 +13504,21 @@ def _classify_room(room_name):
     return 'breakout'
 
 
+def _sql_normalize_name(col_expr):
+    """SQL expression that strips Zoom rejoin suffixes the same way
+    normalize_participant_name() does in Python. Used by the team_v2
+    identity bridge so 'Kajal Yadav-1' in snapshots links to the
+    'Kajal Yadav' row in team_members."""
+    s = f"TRIM({col_expr})"
+    # In order: " - TEXT" suffix, "-N", "_TEXT", "-CAPS", trailing " N"
+    s = f"REGEXP_REPLACE({s}, r'\\s+-\\s+\\w+$', '')"
+    s = f"REGEXP_REPLACE({s}, r'-\\d+$', '')"
+    s = f"REGEXP_REPLACE({s}, r'_\\w+$', '')"
+    s = f"REGEXP_REPLACE({s}, r'-[A-Z]{{2,}}$', '')"
+    s = f"REGEXP_REPLACE({s}, r'\\s+\\d$', '')"
+    return f"LOWER(TRIM({s}))"
+
+
 def _ensure_presence_intervals_table():
     """Create presence_intervals table if it does not yet exist.
     Partitioned by event_date, clustered by meeting_id, participant_key."""
@@ -14017,46 +14032,51 @@ def team_attendance_v2(team_id, date):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        # Resolve team members → participant_keys via name/email bridge built
-        # from THIS date's snapshots+intervals (matches v1 behaviour).
-        # Then aggregate intervals per participant_key.
+        # Team-member -> presence_intervals bridge uses NORMALIZED names so
+        # Zoom rejoin variants ("Kajal Yadav-1") link to the "Kajal Yadav"
+        # roster row. Also matches by email when present. One member may
+        # match multiple participant_keys (one per rejoin variant) — all
+        # intervals get summed under the member's row.
+        norm_pi   = _sql_normalize_name('dk.participant_name')
+        norm_tm   = _sql_normalize_name('tm.participant_name')
         q = f"""
         WITH team_members AS (
-            SELECT participant_name, participant_email
+            SELECT
+                participant_name AS member_name,
+                participant_email AS member_email
             FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
             WHERE team_id = @team_id
         ),
-        identity_map AS (
+        distinct_keys AS (
             SELECT DISTINCT
                 participant_key,
-                LOWER(TRIM(participant_name)) AS name_key,
-                NULLIF(LOWER(TRIM(participant_email)), '') AS email_key
+                participant_name,
+                participant_email
             FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
             WHERE event_date = @date
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
-        name_to_key AS (
-            SELECT name_key, MIN(participant_key) AS participant_key
-            FROM identity_map GROUP BY name_key
-        ),
-        email_to_key AS (
-            SELECT email_key, MIN(participant_key) AS participant_key
-            FROM identity_map WHERE email_key IS NOT NULL GROUP BY email_key
-        ),
-        team_keys AS (
+        member_bridge AS (
             SELECT DISTINCT
-                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(tm.participant_name))) AS participant_key,
-                tm.participant_name AS member_name,
-                tm.participant_email AS member_email
+                tm.member_name,
+                tm.member_email,
+                dk.participant_key
             FROM team_members tm
-            LEFT JOIN email_to_key etk ON NULLIF(LOWER(TRIM(tm.participant_email)), '') = etk.email_key
-            LEFT JOIN name_to_key  ntk ON LOWER(TRIM(tm.participant_name)) = ntk.name_key
+            JOIN distinct_keys dk
+              ON (
+                {norm_pi} = {norm_tm}
+                OR (
+                  NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
+                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(tm.member_email)), '')
+                )
+              )
         ),
-        per_participant AS (
+        per_member AS (
             SELECT
-                pi.participant_key,
-                ANY_VALUE(pi.participant_name) AS participant_name,
-                MAX(pi.participant_email)      AS participant_email,
+                mb.member_name,
+                mb.member_email,
+                ANY_VALUE(pi.participant_name) AS display_name,
+                MAX(pi.participant_email) AS display_email,
                 SUM(IF(pi.room_category='main',     pi.duration_seconds, 0)) AS main_seconds,
                 SUM(IF(pi.room_category='breakout', pi.duration_seconds, 0)) AS breakout_seconds,
                 SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
@@ -14064,25 +14084,29 @@ def team_attendance_v2(team_id, date):
                 SUM(pi.duration_seconds) AS total_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
-            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
-            WHERE pi.event_date = @date
-            GROUP BY pi.participant_key
+            FROM member_bridge mb
+            JOIN `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+              ON pi.event_date = @date
+              AND pi.participant_key = mb.participant_key
+            GROUP BY mb.member_name, mb.member_email
         )
         SELECT
-            tk.member_name,
-            tk.member_email,
-            pp.participant_name,
-            pp.participant_email,
-            CEILING(COALESCE(pp.main_seconds,0)     / 60.0) AS main_room_mins,
-            CEILING(COALESCE(pp.breakout_seconds,0) / 60.0) AS breakout_mins,
-            CEILING(COALESCE(pp.break_seconds,0)    / 60.0) AS break_minutes,
-            CEILING(COALESCE(pp.isolation_seconds,0)/ 60.0) AS isolation_minutes,
-            CEILING(COALESCE(pp.total_seconds,0)    / 60.0) AS total_duration_mins,
-            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pp.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
-            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pp.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
-        FROM team_keys tk
-        LEFT JOIN per_participant pp USING (participant_key)
-        ORDER BY tk.member_name
+            tm.member_name,
+            tm.member_email,
+            pm.display_name AS participant_name,
+            pm.display_email AS participant_email,
+            CEILING(COALESCE(pm.main_seconds,0)     / 60.0) AS main_room_mins,
+            CEILING(COALESCE(pm.breakout_seconds,0) / 60.0) AS breakout_mins,
+            CEILING(COALESCE(pm.break_seconds,0)    / 60.0) AS break_minutes,
+            CEILING(COALESCE(pm.isolation_seconds,0)/ 60.0) AS isolation_minutes,
+            CEILING(COALESCE(pm.total_seconds,0)    / 60.0) AS total_duration_mins,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
+        FROM team_members tm
+        LEFT JOIN per_member pm
+          ON pm.member_name = tm.member_name
+         AND COALESCE(pm.member_email, '') = COALESCE(tm.member_email, '')
+        ORDER BY tm.member_name
         """
         rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
             query_parameters=[
