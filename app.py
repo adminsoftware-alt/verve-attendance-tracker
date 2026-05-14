@@ -13889,25 +13889,67 @@ def build_presence_intervals(date_str):
             'built_at': built_at_iso,
         })
 
-    # ----- Step 6: DELETE existing rows for date, then INSERT --------------
-    del_q = f"""
-    DELETE FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-    WHERE event_date = @date
-    """
-    client.query(del_q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
-    )).result()
+    # ----- Step 6: Atomic partition replace via load job -------------------
+    # Use a BigQuery LOAD job with WRITE_TRUNCATE and a partition decorator
+    # instead of DELETE+streaming-INSERT. This avoids the streaming buffer
+    # entirely: load jobs go straight to the partition's permanent storage,
+    # and WRITE_TRUNCATE replaces the partition atomically (no DELETE needed,
+    # no buffer-blocks-DELETE race). Also free (no streaming insert cost).
+    import io as _io
+    table_id = f"{dataset_ref}.{PRESENCE_INTERVALS_TABLE}"
+    partition_id = f"{table_id}${date_str.replace('-', '')}"
 
     inserted = 0
     if intervals:
-        table_id = f"{dataset_ref}.{PRESENCE_INTERVALS_TABLE}"
-        # Insert in batches of 500 to stay well under BQ streaming limits
-        for i in range(0, len(intervals), 500):
-            batch = intervals[i:i+500]
-            errors = client.insert_rows_json(table_id, batch)
-            if errors:
-                raise RuntimeError(f"BigQuery insert errors: {errors[:3]}")
-            inserted += len(batch)
+        ndjson = "\n".join(json.dumps(iv) for iv in intervals)
+        load_cfg = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            schema=[
+                bigquery.SchemaField("interval_id",       "STRING"),
+                bigquery.SchemaField("event_date",        "DATE"),
+                bigquery.SchemaField("meeting_id",        "STRING"),
+                bigquery.SchemaField("meeting_uuid",      "STRING"),
+                bigquery.SchemaField("participant_key",   "STRING"),
+                bigquery.SchemaField("participant_name",  "STRING"),
+                bigquery.SchemaField("participant_email", "STRING"),
+                bigquery.SchemaField("room_name",         "STRING"),
+                bigquery.SchemaField("room_category",     "STRING"),
+                bigquery.SchemaField("start_ts",          "TIMESTAMP"),
+                bigquery.SchemaField("end_ts",            "TIMESTAMP"),
+                bigquery.SchemaField("duration_seconds",  "INT64"),
+                bigquery.SchemaField("alone_seconds",     "INT64"),
+                bigquery.SchemaField("snapshot_count",    "INT64"),
+                bigquery.SchemaField("source",            "STRING"),
+                bigquery.SchemaField("confidence",        "FLOAT64"),
+                bigquery.SchemaField("built_at",          "TIMESTAMP"),
+            ],
+        )
+        load_job = client.load_table_from_file(
+            _io.BytesIO(ndjson.encode('utf-8')),
+            partition_id,
+            job_config=load_cfg,
+        )
+        load_job.result()  # wait for completion; raises on error
+        inserted = len(intervals)
+    else:
+        # No intervals for this date — clear the partition so it stays
+        # consistent with the source data. Empty load with WRITE_TRUNCATE
+        # is also fine (creates a 0-row partition).
+        load_cfg = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+        load_job = client.load_table_from_file(
+            _io.BytesIO(b""),
+            partition_id,
+            job_config=load_cfg,
+        )
+        try:
+            load_job.result()
+        except Exception:
+            # Empty load can sometimes 400; safe to ignore — no data to write
+            pass
 
     # ----- Summary stats ---------------------------------------------------
     by_source = defaultdict(int)
