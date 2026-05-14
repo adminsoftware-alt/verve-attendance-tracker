@@ -14107,26 +14107,33 @@ def team_attendance_v2(team_id, date):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        # Auto-build intervals on-demand if not yet materialized for this date.
-        # Lets the frontend hit any historical date without operator intervention.
-        # Cheap pre-check: COUNT(*) on a partitioned table scans only the
-        # partition for @date.
+        # Auto-build behaviour:
+        #   - TODAY's date: ALWAYS rebuild so Team View reflects fresh snapshots
+        #     (idempotent load-job WRITE_TRUNCATE — cheap to redo)
+        #   - past dates: only build if not yet materialized
         _ensure_presence_intervals_table()
-        check_q = f"""
-        SELECT COUNT(*) AS n FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-        WHERE event_date = @date
-        """
-        check_rows = list(client.query(check_q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
-        )).result())
-        if check_rows and (check_rows[0].n or 0) == 0:
-            print(f"[TeamV2] No intervals for {report_date} — auto-building")
+        is_today = (report_date == get_ist_date())
+        if is_today:
             try:
                 build_presence_intervals(report_date)
             except Exception as e:
-                print(f"[TeamV2] Auto-build failed for {report_date}: {e}")
-                # Continue with empty intervals — endpoint still returns the
-                # team roster with zeros instead of erroring.
+                print(f"[TeamV2] Today auto-build failed for {report_date}: {e}")
+        else:
+            check_q = f"""
+            SELECT COUNT(*) AS n FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+            WHERE event_date = @date
+            """
+            check_rows = list(client.query(check_q, job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
+            )).result())
+            if check_rows and (check_rows[0].n or 0) == 0:
+                print(f"[TeamV2] No intervals for {report_date} — auto-building")
+                try:
+                    build_presence_intervals(report_date)
+                except Exception as e:
+                    print(f"[TeamV2] Auto-build failed for {report_date}: {e}")
+                    # Continue with empty intervals — endpoint still returns the
+                    # team roster with zeros instead of erroring.
 
         # Team-member -> presence_intervals bridge uses NORMALIZED names so
         # Zoom rejoin variants ("Kajal Yadav-1") link to the "Kajal Yadav"
@@ -14770,21 +14777,31 @@ def attendance_summary_v2(date):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        # Auto-build if not yet materialized
+        # Auto-build behaviour:
+        #   - TODAY's date: ALWAYS rebuild so Day View reflects fresh snapshots
+        #     (idempotent load-job WRITE_TRUNCATE — cheap to redo)
+        #   - past dates: only build if not yet materialized
         _ensure_presence_intervals_table()
-        check_q = f"""
-        SELECT COUNT(*) AS n FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-        WHERE event_date = @date
-        """
-        check_rows = list(client.query(check_q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
-        )).result())
-        if check_rows and (check_rows[0].n or 0) == 0:
-            print(f"[SummaryV2] No intervals for {report_date} — auto-building")
+        is_today = (report_date == get_ist_date())
+        if is_today:
             try:
                 build_presence_intervals(report_date)
             except Exception as e:
-                print(f"[SummaryV2] Auto-build failed for {report_date}: {e}")
+                print(f"[SummaryV2] Today auto-build failed for {report_date}: {e}")
+        else:
+            check_q = f"""
+            SELECT COUNT(*) AS n FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+            WHERE event_date = @date
+            """
+            check_rows = list(client.query(check_q, job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
+            )).result())
+            if check_rows and (check_rows[0].n or 0) == 0:
+                print(f"[SummaryV2] No intervals for {report_date} — auto-building")
+                try:
+                    build_presence_intervals(report_date)
+                except Exception as e:
+                    print(f"[SummaryV2] Auto-build failed for {report_date}: {e}")
 
         # Pull all intervals for the date, ordered by participant + start_ts
         q = f"""
@@ -14852,13 +14869,16 @@ def attendance_summary_v2(date):
             isolation_seconds = sum(iv.alone_seconds or 0 for iv in ivs)
             room_visits = []
             for iv in ivs:
+                # NOTE: field name MUST be room_duration_mins to match v1 and
+                # the frontend's transformSummaryToEmployees in zoomApi.js
+                # (which sums room_duration_mins to compute total minutes).
                 room_visits.append({
-                    'room_name':        iv.room_name,
-                    'room_category':    iv.room_category,
-                    'room_joined_ist':  _fmt_ist(iv.start_ts),
-                    'room_left_ist':    _fmt_ist(iv.end_ts),
-                    'duration_minutes': int((iv.duration_seconds or 0) / 60),
-                    'source':           iv.source,
+                    'room_name':         iv.room_name,
+                    'room_category':     iv.room_category,
+                    'room_joined_ist':   _fmt_ist(iv.start_ts),
+                    'room_left_ist':     _fmt_ist(iv.end_ts),
+                    'room_duration_mins': int((iv.duration_seconds or 0) / 60),
+                    'source':            iv.source,
                 })
             participants.append({
                 'name':                info['name'],
