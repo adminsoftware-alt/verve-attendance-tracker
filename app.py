@@ -13687,6 +13687,86 @@ def build_presence_intervals(date_str):
     )).result())
     webhook_by_key = {r.participant_key: r for r in webhook_rows}
 
+    # ----- Step 2b: presence windows from join/leave events ----------------
+    # For each participant, build (joined_ts, left_ts) windows so synthesis
+    # only credits Main Room time when they were ACTUALLY in the meeting.
+    # Without this, a participant who left for an hour between breakouts
+    # gets credited that whole hour as phantom Main Room time.
+    events_q = f"""
+    SELECT
+      {norm_pn} AS participant_key,
+      ARRAY_AGG(
+        STRUCT(
+          CAST(pe.event_timestamp AS TIMESTAMP) AS ts,
+          pe.event_type AS et
+        )
+        ORDER BY pe.event_timestamp
+      ) AS events
+    FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+    WHERE pe.event_date = @date
+      AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
+      AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+      AND pe.event_type IN ('participant_joined','participant_left',
+                            'meeting.participant_joined','meeting.participant_left')
+    GROUP BY participant_key
+    """
+    events_rows = list(client.query(events_q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
+    )).result())
+
+    # Coalesce threshold: leave/rejoin gaps shorter than this are treated
+    # as continuous presence (Zoom often sends micro-disconnects).
+    COALESCE_GAP_S = 30
+
+    def _build_presence_windows(evt_list):
+        """Return list of (join_dt, leave_dt) UTC tuples. leave_dt may be
+        None if the participant was still present at end of capture."""
+        raw = []
+        current_join = None
+        for e in evt_list:
+            ts = e['ts'] if isinstance(e, dict) else e.ts
+            et = e['et'] if isinstance(e, dict) else e.et
+            if et in ('participant_joined', 'meeting.participant_joined'):
+                if current_join is None:
+                    current_join = ts
+            elif et in ('participant_left', 'meeting.participant_left'):
+                if current_join is not None:
+                    raw.append((current_join, ts))
+                    current_join = None
+        if current_join is not None:
+            raw.append((current_join, None))
+        if not raw:
+            return []
+        merged = [raw[0]]
+        for w in raw[1:]:
+            prev_s, prev_e = merged[-1]
+            if prev_e is not None and w[0] is not None:
+                gap = (w[0] - prev_e).total_seconds()
+                if gap < COALESCE_GAP_S:
+                    merged[-1] = (prev_s, w[1])
+                    continue
+            merged.append(w)
+        return merged
+
+    presence_windows_by_key = {
+        r.participant_key: _build_presence_windows(r.events)
+        for r in events_rows
+    }
+
+    def _present_intersection_seconds(start, end, windows):
+        """Total seconds within [start, end] that fall inside any window."""
+        if not windows:
+            return None  # No webhook data — caller falls back to gap_s
+        total = 0
+        for w_s, w_e in windows:
+            if w_e is None:
+                w_e = end + timedelta(seconds=1)
+            os_ = max(start, w_s)
+            oe = min(end, w_e)
+            if oe > os_:
+                total += (oe - os_).total_seconds()
+        return total
+
     # ----- Step 3: build real intervals from buckets -----------------------
     # Group buckets by (participant_key, room_name), sorted by bucket30.
     # Consecutive buckets (diff == 1, i.e. 30s apart) belong to the same
@@ -13782,13 +13862,29 @@ def build_presence_intervals(date_str):
 
         synthesized = []
 
-        # 4a. Before first interval (if first is breakout and we have a join time)
-        first = plist[0]
-        first_start = _parse_ts(first['start_ts'])
-        if first['room_category'] == 'breakout' and meeting_joined:
-            gap_s = (first_start - meeting_joined).total_seconds()
-            if gap_s >= MAIN_ROOM_SYNTH_MIN_SECONDS:
-                gap_s = min(gap_s, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
+        windows = presence_windows_by_key.get(pkey, [])
+
+        def _emit_main_for_windows(gap_start, gap_end, confidence):
+            """Emit one synthesized Main Room interval per presence window
+            inside [gap_start, gap_end]. Skips times when the participant
+            had a participant_left webhook (real absence)."""
+            if not windows:
+                # No webhook data — fall back to whole-gap synthesis
+                slices = [(gap_start, gap_end)]
+            else:
+                slices = []
+                for w_s, w_e in windows:
+                    if w_e is None:
+                        w_e = gap_end
+                    os_ = max(gap_start, w_s)
+                    oe = min(gap_end, w_e)
+                    if (oe - os_).total_seconds() >= MAIN_ROOM_SYNTH_MIN_SECONDS:
+                        slices.append((os_, oe))
+            for sl_start, sl_end in slices:
+                sl_s = (sl_end - sl_start).total_seconds()
+                if sl_s < MAIN_ROOM_SYNTH_MIN_SECONDS:
+                    continue
+                sl_s = min(sl_s, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
                 synthesized.append({
                     'interval_id': str(uuid_lib.uuid4()),
                     'event_date': date_str,
@@ -13799,15 +13895,22 @@ def build_presence_intervals(date_str):
                     'participant_email': email_by_key.get(pkey),
                     'room_name': '0.Main Room',
                     'room_category': 'main',
-                    'start_ts': meeting_joined.isoformat(),
-                    'end_ts': (meeting_joined + timedelta(seconds=gap_s)).isoformat(),
-                    'duration_seconds': int(gap_s),
+                    'start_ts': sl_start.isoformat(),
+                    'end_ts': (sl_start + timedelta(seconds=sl_s)).isoformat(),
+                    'duration_seconds': int(sl_s),
                     'alone_seconds': 0,
                     'snapshot_count': 0,
                     'source': 'synthesized_main',
-                    'confidence': 0.6,
+                    'confidence': confidence,
                     'built_at': built_at_iso,
                 })
+
+        # 4a. Before first interval (if first is breakout and we have a join time)
+        first = plist[0]
+        first_start = _parse_ts(first['start_ts'])
+        if first['room_category'] == 'breakout' and meeting_joined:
+            if (first_start - meeting_joined).total_seconds() >= MAIN_ROOM_SYNTH_MIN_SECONDS:
+                _emit_main_for_windows(meeting_joined, first_start, 0.6)
 
         # 4b. Between consecutive intervals (both breakouts → Main Room gap)
         for prev, nxt in zip(plist, plist[1:]):
@@ -13815,56 +13918,16 @@ def build_presence_intervals(date_str):
                 continue
             gap_start = _parse_ts(prev['end_ts'])
             gap_end = _parse_ts(nxt['start_ts'])
-            gap_s = (gap_end - gap_start).total_seconds()
-            if gap_s < MAIN_ROOM_SYNTH_MIN_SECONDS:
+            if (gap_end - gap_start).total_seconds() < MAIN_ROOM_SYNTH_MIN_SECONDS:
                 continue
-            gap_s = min(gap_s, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
-            synthesized.append({
-                'interval_id': str(uuid_lib.uuid4()),
-                'event_date': date_str,
-                'meeting_id': meeting_by_key.get(pkey),
-                'meeting_uuid': None,
-                'participant_key': pkey,
-                'participant_name': name_by_key.get(pkey),
-                'participant_email': email_by_key.get(pkey),
-                'room_name': '0.Main Room',
-                'room_category': 'main',
-                'start_ts': gap_start.isoformat(),
-                'end_ts': (gap_start + timedelta(seconds=gap_s)).isoformat(),
-                'duration_seconds': int(gap_s),
-                'alone_seconds': 0,
-                'snapshot_count': 0,
-                'source': 'synthesized_main',
-                'confidence': 0.7,
-                'built_at': built_at_iso,
-            })
+            _emit_main_for_windows(gap_start, gap_end, 0.7)
 
         # 4c. After last interval (if last is breakout and we have a leave time)
         last = plist[-1]
         last_end = _parse_ts(last['end_ts'])
         if last['room_category'] == 'breakout' and meeting_left:
-            gap_s = (meeting_left - last_end).total_seconds()
-            if gap_s >= MAIN_ROOM_SYNTH_MIN_SECONDS:
-                gap_s = min(gap_s, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
-                synthesized.append({
-                    'interval_id': str(uuid_lib.uuid4()),
-                    'event_date': date_str,
-                    'meeting_id': meeting_by_key.get(pkey),
-                    'meeting_uuid': None,
-                    'participant_key': pkey,
-                    'participant_name': name_by_key.get(pkey),
-                    'participant_email': email_by_key.get(pkey),
-                    'room_name': '0.Main Room',
-                    'room_category': 'main',
-                    'start_ts': last_end.isoformat(),
-                    'end_ts': (last_end + timedelta(seconds=gap_s)).isoformat(),
-                    'duration_seconds': int(gap_s),
-                    'alone_seconds': 0,
-                    'snapshot_count': 0,
-                    'source': 'synthesized_main',
-                    'confidence': 0.6,
-                    'built_at': built_at_iso,
-                })
+            if (meeting_left - last_end).total_seconds() >= MAIN_ROOM_SYNTH_MIN_SECONDS:
+                _emit_main_for_windows(last_end, meeting_left, 0.6)
 
         intervals.extend(synthesized)
         intervals_by_participant[pkey].extend(synthesized)
