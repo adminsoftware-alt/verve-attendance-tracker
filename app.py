@@ -13594,8 +13594,15 @@ def build_presence_intervals(date_str):
     dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
     # ----- Step 1: bucketed snapshot data ----------------------------------
+    # CANONICAL participant_key = email if present, else normalized name.
+    # This merges Zoom rejoin variants (same person with multiple UUIDs)
+    # into one key so synthesis sees their full timeline instead of a
+    # disjoint per-UUID view. Without this, a participant who rejoined
+    # 4 times gets 4 separate "phantom Main Room" intervals because each
+    # UUID-keyed timeline only sees its own subset of breakouts.
+    norm_sn = _sql_normalize_name('s.participant_name')
     bucket_q = f"""
-    WITH dedup AS (
+    WITH normalized AS (
       SELECT
         s.snapshot_time,
         s.meeting_id,
@@ -13603,21 +13610,29 @@ def build_presence_intervals(date_str):
         s.participant_email,
         s.participant_uuid,
         s.room_name,
-        COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) AS participant_key,
+        COALESCE(
+          NULLIF(LOWER(TRIM(s.participant_email)), ''),
+          {norm_sn}
+        ) AS participant_key,
         DIV(UNIX_SECONDS(s.snapshot_time), {BUCKET_SECONDS}) AS bucket30
       FROM `{dataset_ref}.room_snapshots` s
       WHERE s.event_date = @date
         AND s.room_name IS NOT NULL AND s.room_name != ''
         AND s.participant_name IS NOT NULL AND s.participant_name != ''
         AND LOWER(s.participant_name) NOT LIKE '%scout%'
-      -- Collapse SDK-transition artifacts (same participant in two rooms at
-      -- the exact same timestamp): prefer breakout over Main Room.
+    ),
+    dedup AS (
+      -- Within (canonical_key, bucket30): keep ONE row. Prefer non-Main-Room.
+      -- This kills both SDK-transition artifacts (same uuid, same instant,
+      -- two rooms) AND multi-source duplication (Source A says Main Room,
+      -- Source B says Breakout for same person in same 30s window).
+      SELECT *
+      FROM normalized
       QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
-                     s.snapshot_time
+        PARTITION BY participant_key, bucket30
         ORDER BY
-          CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-          s.room_name
+          CASE WHEN LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+          room_name
       ) = 1
     ),
     occupancy AS (
@@ -13651,26 +13666,16 @@ def build_presence_intervals(date_str):
         monitoring_end = max(b.bucket_end for b in buckets)
 
     # ----- Step 2: webhook timestamps per participant ----------------------
+    # Use the SAME canonical key formula as snapshots (email -> normalized
+    # name fallback) so webhook data merges correctly with snapshot data
+    # in Python regardless of rejoin/UUID drift.
+    norm_pn = _sql_normalize_name('pe.participant_name')
     webhook_q = f"""
-    WITH name_email_map AS (
-      SELECT DISTINCT
-        COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) AS participant_key,
-        LOWER(TRIM(participant_name)) AS name_key,
-        NULLIF(LOWER(TRIM(participant_email)), '') AS email_key
-      FROM `{dataset_ref}.room_snapshots`
-      WHERE event_date = @date
-        AND participant_name IS NOT NULL AND participant_name != ''
-    ),
-    name_to_key AS (
-      SELECT name_key, MIN(participant_key) AS participant_key
-      FROM name_email_map GROUP BY name_key
-    ),
-    email_to_key AS (
-      SELECT email_key, MIN(participant_key) AS participant_key
-      FROM name_email_map WHERE email_key IS NOT NULL GROUP BY email_key
-    )
     SELECT
-      COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) AS participant_key,
+      COALESCE(
+        NULLIF(LOWER(TRIM(pe.participant_email)), ''),
+        {norm_pn}
+      ) AS participant_key,
       ANY_VALUE(pe.participant_name) AS participant_name,
       ANY_VALUE(pe.participant_email) AS participant_email,
       ANY_VALUE(pe.meeting_id) AS meeting_id,
@@ -13680,8 +13685,6 @@ def build_presence_intervals(date_str):
           THEN CAST(pe.event_timestamp AS TIMESTAMP) END) AS meeting_left,
       COUNTIF(pe.event_type = 'breakout_room_joined') AS breakout_webhook_count
     FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-    LEFT JOIN email_to_key etk ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-    LEFT JOIN name_to_key  ntk ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
     WHERE pe.event_date = @date
       AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
       AND LOWER(pe.participant_name) NOT LIKE '%scout%'
