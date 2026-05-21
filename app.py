@@ -13491,6 +13491,123 @@ def admin_delete_events():
 
 
 # ==============================================================================
+# WEBHOOK-ONLY REPORT (TEST ENDPOINT)
+# ==============================================================================
+# This endpoint generates a simple attendance report using ONLY webhook data
+# from participant_events table. No SDK polling data, no room names.
+# Used to test the low-cost webhook-only approach before migration.
+# ==============================================================================
+
+@app.route('/report/webhook-preview/<date_str>', methods=['GET'])
+def webhook_only_report_preview(date_str):
+    """
+    Generate a simple attendance report using ONLY webhook data.
+    Returns: Name, Email, First Join (IST), Last Leave (IST), Total Duration
+
+    This is a TEST endpoint to validate webhook-only approach before migration.
+    """
+    try:
+        # Validate date format
+        try:
+            datetime.strptime(date_str, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        query = f"""
+        WITH webhook_events AS (
+            SELECT
+                participant_name,
+                COALESCE(NULLIF(participant_email, ''), '') as participant_email,
+                event_type,
+                TIMESTAMP_ADD(CAST(event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) as event_time_ist
+            FROM `{dataset_ref}.participant_events`
+            WHERE event_date = @report_date
+              AND participant_name IS NOT NULL
+              AND participant_name != ''
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+              AND event_type IN ('participant_joined', 'meeting.participant_joined',
+                                 'participant_left', 'meeting.participant_left')
+        ),
+        participant_summary AS (
+            SELECT
+                participant_name,
+                MAX(participant_email) as participant_email,
+                MIN(CASE WHEN event_type IN ('participant_joined', 'meeting.participant_joined')
+                    THEN event_time_ist END) as first_join_ist,
+                MAX(CASE WHEN event_type IN ('participant_left', 'meeting.participant_left')
+                    THEN event_time_ist END) as last_leave_ist
+            FROM webhook_events
+            GROUP BY participant_name
+        )
+        SELECT
+            participant_name as name,
+            participant_email as email,
+            FORMAT_TIMESTAMP('%H:%M', first_join_ist) as join_time_ist,
+            FORMAT_TIMESTAMP('%H:%M', last_leave_ist) as leave_time_ist,
+            CASE
+                WHEN first_join_ist IS NOT NULL AND last_leave_ist IS NOT NULL
+                THEN TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE)
+                ELSE 0
+            END as duration_minutes,
+            CASE
+                WHEN first_join_ist IS NOT NULL AND last_leave_ist IS NOT NULL
+                THEN CONCAT(
+                    CAST(FLOOR(TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE) / 60) AS STRING), 'h ',
+                    CAST(MOD(TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE), 60) AS STRING), 'm'
+                )
+                ELSE '0h 0m'
+            END as duration_formatted
+        FROM participant_summary
+        WHERE first_join_ist IS NOT NULL
+        ORDER BY participant_name
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("report_date", "STRING", date_str)
+            ]
+        )
+
+        rows = list(client.query(query, job_config=job_config).result())
+
+        participants = []
+        for row in rows:
+            participants.append({
+                'name': row.name,
+                'email': row.email or '',
+                'join_time_ist': row.join_time_ist or '',
+                'leave_time_ist': row.leave_time_ist or '',
+                'duration_minutes': row.duration_minutes or 0,
+                'duration_formatted': row.duration_formatted or '0h 0m'
+            })
+
+        # Generate CSV content
+        csv_lines = ['Name,Email,Join_Time_IST,Leave_Time_IST,Duration_Minutes,Duration']
+        for p in participants:
+            csv_lines.append(f'"{p["name"]}","{p["email"]}",{p["join_time_ist"]},{p["leave_time_ist"]},{p["duration_minutes"]},{p["duration_formatted"]}')
+
+        csv_content = '\r\n'.join(csv_lines)
+
+        return jsonify({
+            'success': True,
+            'date': date_str,
+            'source': 'webhook_only (participant_events table)',
+            'note': 'TEST ENDPOINT - No room names, no break tracking. Simple join/leave times only.',
+            'participant_count': len(participants),
+            'participants': participants,
+            'csv_content': csv_content
+        })
+
+    except Exception as e:
+        print(f"[Webhook Report] Error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==============================================================================
 # PRESENCE INTERVALS - v2 report rebuild (Phase 1)
 # ==============================================================================
 # Single source of truth for duration aggregation. Built once per IST date from
