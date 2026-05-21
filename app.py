@@ -13607,6 +13607,100 @@ def webhook_only_report_preview(date_str):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/report/webhook-csv/<date_str>', methods=['GET'])
+def webhook_only_report_csv(date_str):
+    """
+    Download webhook-only attendance report as CSV file.
+    Can be directly imported into Google Sheets.
+    """
+    try:
+        # Validate date format
+        try:
+            datetime.strptime(date_str, '%Y-%m-%d')
+        except ValueError:
+            return "Invalid date format. Use YYYY-MM-DD", 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        query = f"""
+        WITH webhook_events AS (
+            SELECT
+                participant_name,
+                COALESCE(NULLIF(participant_email, ''), '') as participant_email,
+                event_type,
+                TIMESTAMP_ADD(CAST(event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) as event_time_ist
+            FROM `{dataset_ref}.participant_events`
+            WHERE event_date = @report_date
+              AND participant_name IS NOT NULL
+              AND participant_name != ''
+              AND LOWER(participant_name) NOT LIKE '%scout%'
+              AND event_type IN ('participant_joined', 'meeting.participant_joined',
+                                 'participant_left', 'meeting.participant_left')
+        ),
+        participant_summary AS (
+            SELECT
+                participant_name,
+                MAX(participant_email) as participant_email,
+                MIN(CASE WHEN event_type IN ('participant_joined', 'meeting.participant_joined')
+                    THEN event_time_ist END) as first_join_ist,
+                MAX(CASE WHEN event_type IN ('participant_left', 'meeting.participant_left')
+                    THEN event_time_ist END) as last_leave_ist
+            FROM webhook_events
+            GROUP BY participant_name
+        )
+        SELECT
+            participant_name as name,
+            participant_email as email,
+            FORMAT_TIMESTAMP('%H:%M', first_join_ist) as join_time_ist,
+            FORMAT_TIMESTAMP('%H:%M', last_leave_ist) as leave_time_ist,
+            CASE
+                WHEN first_join_ist IS NOT NULL AND last_leave_ist IS NOT NULL
+                THEN TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE)
+                ELSE 0
+            END as duration_minutes,
+            CASE
+                WHEN first_join_ist IS NOT NULL AND last_leave_ist IS NOT NULL
+                THEN CONCAT(
+                    CAST(FLOOR(TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE) / 60) AS STRING), 'h ',
+                    CAST(MOD(TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE), 60) AS STRING), 'm'
+                )
+                ELSE '0h 0m'
+            END as duration_formatted
+        FROM participant_summary
+        WHERE first_join_ist IS NOT NULL
+        ORDER BY participant_name
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("report_date", "STRING", date_str)
+            ]
+        )
+
+        rows = list(client.query(query, job_config=job_config).result())
+
+        # Generate CSV content
+        csv_lines = ['Name,Email,Join_Time_IST,Leave_Time_IST,Duration_Minutes,Duration']
+        for row in rows:
+            name = (row.name or '').replace('"', '""')
+            email = (row.email or '').replace('"', '""')
+            csv_lines.append(f'"{name}","{email}",{row.join_time_ist or ""},{row.leave_time_ist or ""},{row.duration_minutes or 0},{row.duration_formatted or "0h 0m"}')
+
+        csv_content = '\r\n'.join(csv_lines)
+
+        # Return as downloadable CSV file
+        response = make_response(csv_content)
+        response.headers['Content-Type'] = 'text/csv; charset=utf-8'
+        response.headers['Content-Disposition'] = f'attachment; filename=attendance_webhook_{date_str}.csv'
+        return response
+
+    except Exception as e:
+        print(f"[Webhook CSV] Error: {e}")
+        traceback.print_exc()
+        return f"Error: {str(e)}", 500
+
+
 # ==============================================================================
 # PRESENCE INTERVALS - v2 report rebuild (Phase 1)
 # ==============================================================================
