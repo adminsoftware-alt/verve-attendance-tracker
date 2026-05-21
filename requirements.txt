@@ -11,6 +11,8 @@ gunicorn==21.2.0
 # Google Cloud
 google-cloud-bigquery==3.14.1
 google-cloud-storage==2.14.0
+google-api-python-client==2.111.0
+google-auth==2.25.2
 
 # HTTP Requests (Zoom API)
 requests==2.31.0

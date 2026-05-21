@@ -17,7 +17,7 @@ HR Scout Bot Flow:
 6. Daily report generated and emailed
 """
 
-from flask import Flask, request, jsonify, send_from_directory, Response
+from flask import Flask, request, jsonify, send_from_directory, Response, make_response
 from flask_cors import CORS
 from google.cloud import bigquery
 from datetime import datetime, timedelta, timezone
@@ -31,6 +31,11 @@ import os
 import uuid as uuid_lib
 import traceback
 import urllib.parse
+
+# Google Sheets API
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+import google.auth
 
 # ==============================================================================
 # IST TIMEZONE HELPERS (UTC+5:30 - India Standard Time)
@@ -13699,6 +13704,297 @@ def webhook_only_report_csv(date_str):
         print(f"[Webhook CSV] Error: {e}")
         traceback.print_exc()
         return f"Error: {str(e)}", 500
+
+
+# ==============================================================================
+# GOOGLE SHEETS INTEGRATION - Auto-updating Master Attendance Sheet
+# ==============================================================================
+# Updates a Google Sheet with attendance data hourly during work hours (9 AM - 12 AM)
+# Sheet format: Date | Team | Name | Email | Join Time | Leave Time | Duration
+# ==============================================================================
+
+GOOGLE_SHEETS_ID = '1Ljx1mWYv15McWzuMULIzi9mi0exkrvN_YRnVhjUNH8E'
+GOOGLE_SHEETS_SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+def get_sheets_service():
+    """Get Google Sheets API service using default credentials (Cloud Run service account)"""
+    try:
+        credentials, project = google.auth.default(scopes=GOOGLE_SHEETS_SCOPES)
+        service = build('sheets', 'v4', credentials=credentials, cache_discovery=False)
+        return service
+    except Exception as e:
+        print(f"[Sheets] Error getting service: {e}")
+        traceback.print_exc()
+        return None
+
+
+def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
+    """
+    Get attendance data for Google Sheets.
+    Filters data from start_hour (9 AM) to end_hour (24 = midnight).
+    Includes team information.
+    """
+    try:
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        query = f"""
+        WITH webhook_events AS (
+            SELECT
+                pe.participant_name,
+                COALESCE(NULLIF(pe.participant_email, ''), '') as participant_email,
+                pe.event_type,
+                TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) as event_time_ist
+            FROM `{dataset_ref}.participant_events` pe
+            WHERE pe.event_date = @report_date
+              AND pe.participant_name IS NOT NULL
+              AND pe.participant_name != ''
+              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+              AND pe.event_type IN ('participant_joined', 'meeting.participant_joined',
+                                   'participant_left', 'meeting.participant_left')
+        ),
+        participant_summary AS (
+            SELECT
+                participant_name,
+                MAX(participant_email) as participant_email,
+                MIN(CASE WHEN event_type IN ('participant_joined', 'meeting.participant_joined')
+                    THEN event_time_ist END) as first_join_ist,
+                MAX(CASE WHEN event_type IN ('participant_left', 'meeting.participant_left')
+                    THEN event_time_ist END) as last_leave_ist
+            FROM webhook_events
+            WHERE EXTRACT(HOUR FROM event_time_ist) >= @start_hour
+              AND EXTRACT(HOUR FROM event_time_ist) < @end_hour
+            GROUP BY participant_name
+        ),
+        team_lookup AS (
+            SELECT
+                tm.participant_name,
+                tm.participant_email as team_email,
+                t.team_name
+            FROM `{dataset_ref}.team_members` tm
+            JOIN `{dataset_ref}.teams` t ON tm.team_id = t.team_id
+        )
+        SELECT
+            @report_date as report_date,
+            COALESCE(tl.team_name, 'Unassigned') as team_name,
+            ps.participant_name as name,
+            ps.participant_email as email,
+            FORMAT_TIMESTAMP('%H:%M', ps.first_join_ist) as join_time_ist,
+            FORMAT_TIMESTAMP('%H:%M', ps.last_leave_ist) as leave_time_ist,
+            CASE
+                WHEN ps.first_join_ist IS NOT NULL AND ps.last_leave_ist IS NOT NULL
+                THEN TIMESTAMP_DIFF(ps.last_leave_ist, ps.first_join_ist, MINUTE)
+                ELSE 0
+            END as duration_minutes,
+            CASE
+                WHEN ps.first_join_ist IS NOT NULL AND ps.last_leave_ist IS NOT NULL
+                THEN CONCAT(
+                    CAST(FLOOR(TIMESTAMP_DIFF(ps.last_leave_ist, ps.first_join_ist, MINUTE) / 60) AS STRING), 'h ',
+                    CAST(MOD(TIMESTAMP_DIFF(ps.last_leave_ist, ps.first_join_ist, MINUTE), 60) AS STRING), 'm'
+                )
+                ELSE '0h 0m'
+            END as duration_formatted
+        FROM participant_summary ps
+        LEFT JOIN team_lookup tl ON (
+            LOWER(TRIM(ps.participant_name)) = LOWER(TRIM(tl.participant_name))
+            OR (ps.participant_email != '' AND LOWER(TRIM(ps.participant_email)) = LOWER(TRIM(tl.team_email)))
+        )
+        WHERE ps.first_join_ist IS NOT NULL
+        ORDER BY tl.team_name, ps.participant_name
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("report_date", "STRING", date_str),
+                bigquery.ScalarQueryParameter("start_hour", "INT64", start_hour),
+                bigquery.ScalarQueryParameter("end_hour", "INT64", end_hour)
+            ]
+        )
+
+        rows = list(client.query(query, job_config=job_config).result())
+        return rows
+
+    except Exception as e:
+        print(f"[Sheets] Error getting attendance: {e}")
+        traceback.print_exc()
+        return []
+
+
+@app.route('/sheets/update', methods=['POST'])
+def update_google_sheet():
+    """
+    Update Google Sheet with attendance data.
+    Called hourly by Cloud Scheduler during work hours (9 AM - 12 AM IST).
+
+    Query params:
+    - date: Date to report (default: today)
+    - mode: 'live' (9 AM to current time) or 'final' (9 AM to 11:59 PM)
+    """
+    try:
+        data = request.get_json() or {}
+        date_str = data.get('date', get_ist_date())
+        mode = data.get('mode', 'live')
+
+        # Determine time range
+        if mode == 'final':
+            start_hour = 9
+            end_hour = 24  # Up to midnight
+        else:
+            start_hour = 9
+            current_hour = get_ist_now().hour
+            end_hour = min(current_hour + 1, 24)  # Up to current hour
+
+        print(f"[Sheets] Updating sheet for {date_str}, mode={mode}, hours={start_hour}-{end_hour}")
+
+        # Get attendance data
+        rows = get_attendance_for_sheet(date_str, start_hour, end_hour)
+
+        if not rows:
+            return jsonify({
+                'success': True,
+                'message': 'No attendance data found for this date/time range',
+                'date': date_str,
+                'mode': mode,
+                'rows_updated': 0
+            })
+
+        # Get Sheets service
+        service = get_sheets_service()
+        if not service:
+            return jsonify({'success': False, 'error': 'Could not connect to Google Sheets'}), 500
+
+        sheet = service.spreadsheets()
+
+        # Check if sheet has headers, if not add them
+        try:
+            result = sheet.values().get(
+                spreadsheetId=GOOGLE_SHEETS_ID,
+                range='A1:G1'
+            ).execute()
+            existing_headers = result.get('values', [])
+
+            if not existing_headers or existing_headers[0] != ['Date', 'Team', 'Name', 'Email', 'Join Time', 'Leave Time', 'Duration']:
+                # Add headers
+                sheet.values().update(
+                    spreadsheetId=GOOGLE_SHEETS_ID,
+                    range='A1:G1',
+                    valueInputOption='RAW',
+                    body={'values': [['Date', 'Team', 'Name', 'Email', 'Join Time', 'Leave Time', 'Duration']]}
+                ).execute()
+                print("[Sheets] Added headers")
+        except Exception as e:
+            print(f"[Sheets] Error checking headers: {e}")
+
+        # Clear existing data for this date (to avoid duplicates on hourly updates)
+        try:
+            # Get all existing data
+            result = sheet.values().get(
+                spreadsheetId=GOOGLE_SHEETS_ID,
+                range='A:G'
+            ).execute()
+            all_values = result.get('values', [])
+
+            # Find rows with this date and clear them
+            rows_to_keep = [all_values[0]] if all_values else [['Date', 'Team', 'Name', 'Email', 'Join Time', 'Leave Time', 'Duration']]
+            for row in all_values[1:]:
+                if row and len(row) > 0 and row[0] != date_str:
+                    rows_to_keep.append(row)
+
+            # Clear sheet and rewrite
+            sheet.values().clear(
+                spreadsheetId=GOOGLE_SHEETS_ID,
+                range='A:G'
+            ).execute()
+
+            # Write back rows to keep
+            if rows_to_keep:
+                sheet.values().update(
+                    spreadsheetId=GOOGLE_SHEETS_ID,
+                    range='A1',
+                    valueInputOption='RAW',
+                    body={'values': rows_to_keep}
+                ).execute()
+
+            next_row = len(rows_to_keep) + 1
+
+        except Exception as e:
+            print(f"[Sheets] Error clearing old data: {e}")
+            next_row = 2  # Start after header
+
+        # Prepare new rows
+        new_rows = []
+        for row in rows:
+            new_rows.append([
+                row.report_date,
+                row.team_name,
+                row.name,
+                row.email or '',
+                row.join_time_ist or '',
+                row.leave_time_ist or '',
+                row.duration_formatted or '0h 0m'
+            ])
+
+        # Append new data
+        if new_rows:
+            sheet.values().append(
+                spreadsheetId=GOOGLE_SHEETS_ID,
+                range='A:G',
+                valueInputOption='RAW',
+                insertDataOption='INSERT_ROWS',
+                body={'values': new_rows}
+            ).execute()
+
+        print(f"[Sheets] Updated {len(new_rows)} rows for {date_str}")
+
+        return jsonify({
+            'success': True,
+            'message': f'Updated Google Sheet with {len(new_rows)} attendance records',
+            'date': date_str,
+            'mode': mode,
+            'time_range': f'{start_hour}:00 - {end_hour}:00 IST',
+            'rows_updated': len(new_rows),
+            'sheet_url': f'https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}'
+        })
+
+    except Exception as e:
+        print(f"[Sheets] Update error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/sheets/status', methods=['GET'])
+def google_sheet_status():
+    """Check Google Sheets connection and return sheet info"""
+    try:
+        service = get_sheets_service()
+        if not service:
+            return jsonify({'success': False, 'error': 'Could not connect to Google Sheets'}), 500
+
+        sheet = service.spreadsheets()
+
+        # Get sheet metadata
+        metadata = sheet.get(spreadsheetId=GOOGLE_SHEETS_ID).execute()
+        title = metadata.get('properties', {}).get('title', 'Unknown')
+
+        # Get row count
+        result = sheet.values().get(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            range='A:A'
+        ).execute()
+        row_count = len(result.get('values', []))
+
+        return jsonify({
+            'success': True,
+            'connected': True,
+            'sheet_id': GOOGLE_SHEETS_ID,
+            'sheet_title': title,
+            'row_count': row_count,
+            'sheet_url': f'https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}'
+        })
+
+    except Exception as e:
+        print(f"[Sheets] Status error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # ==============================================================================
