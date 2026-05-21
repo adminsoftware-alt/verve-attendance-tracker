@@ -13576,12 +13576,12 @@ def webhook_only_report_preview(date_str):
                 st.participant_email,
                 st.session_start,
                 CASE
-                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 90
                     THEN ct.now_ist
                     ELSE st.session_end
                 END as session_end,
                 CASE
-                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 90
                     THEN TIMESTAMP_DIFF(ct.now_ist, st.session_start, MINUTE)
                     ELSE TIMESTAMP_DIFF(st.session_end, st.session_start, MINUTE)
                 END as session_minutes
@@ -13733,12 +13733,12 @@ def webhook_only_report_csv(date_str):
                 st.participant_email,
                 st.session_start,
                 CASE
-                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 90
                     THEN ct.now_ist
                     ELSE st.session_end
                 END as session_end,
                 CASE
-                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 90
                     THEN TIMESTAMP_DIFF(ct.now_ist, st.session_start, MINUTE)
                     ELSE TIMESTAMP_DIFF(st.session_end, st.session_start, MINUTE)
                 END as session_minutes
@@ -13829,11 +13829,12 @@ def get_sheets_service():
 def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
     """
     Get attendance data for Google Sheets.
-    Filters data from start_hour (9 AM) to end_hour (24 = midnight).
-    Includes team information.
+    Includes ALL events from the date (no hour filtering - meeting can run past midnight).
 
-    IMPORTANT: A real break ONLY occurs when participant_left → participant_joined with gap > 5 min.
-    Gaps between other events (like breakout_room events) are ignored - user is still in meeting.
+    Key fixes:
+    1. No hour filter - captures late night workers
+    2. Uses current time for participants still in meeting (last event < 30 min ago)
+    3. New session only when participant_joined after 5+ min gap
     """
     try:
         client = get_bq_client()
@@ -13851,8 +13852,8 @@ def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
               AND pe.participant_name IS NOT NULL
               AND pe.participant_name != ''
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-              AND EXTRACT(HOUR FROM TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE)) >= @start_hour
-              AND EXTRACT(HOUR FROM TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE)) < @end_hour
+              -- Filter hour >= 9 to exclude previous day's late-night events (00:00-08:59)
+              AND EXTRACT(HOUR FROM TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE)) >= 9
         ),
         events_with_prev AS (
             SELECT
@@ -13899,12 +13900,12 @@ def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
                 st.session_start,
                 -- If last event < 30 min ago, use current time (still in meeting)
                 CASE
-                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 90
                     THEN ct.now_ist
                     ELSE st.session_end
                 END as session_end,
                 CASE
-                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 90
                     THEN TIMESTAMP_DIFF(ct.now_ist, st.session_start, MINUTE)
                     ELSE TIMESTAMP_DIFF(st.session_end, st.session_start, MINUTE)
                 END as session_minutes
@@ -13958,9 +13959,7 @@ def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
 
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ScalarQueryParameter("report_date", "STRING", date_str),
-                bigquery.ScalarQueryParameter("start_hour", "INT64", start_hour),
-                bigquery.ScalarQueryParameter("end_hour", "INT64", end_hour)
+                bigquery.ScalarQueryParameter("report_date", "STRING", date_str)
             ]
         )
 
