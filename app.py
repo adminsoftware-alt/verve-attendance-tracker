@@ -13567,17 +13567,28 @@ def webhook_only_report_preview(date_str):
             FROM events_with_session
             GROUP BY participant_name, session_id
         ),
+        current_time_ist AS (
+            SELECT TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 330 MINUTE) as now_ist
+        ),
         sessions AS (
             SELECT
-                participant_name,
-                participant_email,
-                session_start,
-                session_end,
-                TIMESTAMP_DIFF(session_end, session_start, MINUTE) as session_minutes
-            FROM session_times
-            WHERE session_start IS NOT NULL AND session_end IS NOT NULL
+                st.participant_name,
+                st.participant_email,
+                st.session_start,
+                CASE
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    THEN ct.now_ist
+                    ELSE st.session_end
+                END as session_end,
+                CASE
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    THEN TIMESTAMP_DIFF(ct.now_ist, st.session_start, MINUTE)
+                    ELSE TIMESTAMP_DIFF(st.session_end, st.session_start, MINUTE)
+                END as session_minutes
+            FROM session_times st
+            CROSS JOIN current_time_ist ct
+            WHERE st.session_start IS NOT NULL AND st.session_end IS NOT NULL
         ),
-        -- Aggregate per participant: first join, last leave, total ACTIVE minutes
         participant_summary AS (
             SELECT
                 participant_name,
@@ -13713,15 +13724,27 @@ def webhook_only_report_csv(date_str):
             FROM events_with_session
             GROUP BY participant_name, session_id
         ),
+        current_time_ist AS (
+            SELECT TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 330 MINUTE) as now_ist
+        ),
         sessions AS (
             SELECT
-                participant_name,
-                participant_email,
-                session_start,
-                session_end,
-                TIMESTAMP_DIFF(session_end, session_start, MINUTE) as session_minutes
-            FROM session_times
-            WHERE session_start IS NOT NULL AND session_end IS NOT NULL
+                st.participant_name,
+                st.participant_email,
+                st.session_start,
+                CASE
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    THEN ct.now_ist
+                    ELSE st.session_end
+                END as session_end,
+                CASE
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    THEN TIMESTAMP_DIFF(ct.now_ist, st.session_start, MINUTE)
+                    ELSE TIMESTAMP_DIFF(st.session_end, st.session_start, MINUTE)
+                END as session_minutes
+            FROM session_times st
+            CROSS JOIN current_time_ist ct
+            WHERE st.session_start IS NOT NULL AND st.session_end IS NOT NULL
         ),
         participant_summary AS (
             SELECT
@@ -13865,15 +13888,29 @@ def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
             FROM events_with_session
             GROUP BY participant_name, session_id
         ),
+        -- Current time in IST for active participant detection
+        current_time_ist AS (
+            SELECT TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 330 MINUTE) as now_ist
+        ),
         sessions AS (
             SELECT
-                participant_name,
-                participant_email,
-                session_start,
-                session_end,
-                TIMESTAMP_DIFF(session_end, session_start, MINUTE) as session_minutes
-            FROM session_times
-            WHERE session_start IS NOT NULL AND session_end IS NOT NULL
+                st.participant_name,
+                st.participant_email,
+                st.session_start,
+                -- If last event < 30 min ago, use current time (still in meeting)
+                CASE
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    THEN ct.now_ist
+                    ELSE st.session_end
+                END as session_end,
+                CASE
+                    WHEN TIMESTAMP_DIFF(ct.now_ist, st.session_end, MINUTE) < 30
+                    THEN TIMESTAMP_DIFF(ct.now_ist, st.session_start, MINUTE)
+                    ELSE TIMESTAMP_DIFF(st.session_end, st.session_start, MINUTE)
+                END as session_minutes
+            FROM session_times st
+            CROSS JOIN current_time_ist ct
+            WHERE st.session_start IS NOT NULL AND st.session_end IS NOT NULL
         ),
         -- Aggregate per participant: first join, last leave, total ACTIVE minutes
         participant_summary AS (
