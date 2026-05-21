@@ -13820,10 +13820,51 @@ def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
         return []
 
 
+def get_or_create_date_sheet(service, spreadsheet_id, date_str):
+    """
+    Get or create a sheet tab for a specific date.
+    Sheet name format: DD-MM-YY (e.g., "21-05-26" for 2026-05-21)
+    Returns the sheet name.
+    """
+    # Convert YYYY-MM-DD to DD-MM-YY
+    try:
+        dt = datetime.strptime(date_str, '%Y-%m-%d')
+        sheet_name = dt.strftime('%d-%m-%y')
+    except:
+        sheet_name = date_str.replace('-', '')[-6:]  # Fallback
+
+    # Get existing sheets
+    spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    existing_sheets = [s['properties']['title'] for s in spreadsheet.get('sheets', [])]
+
+    # Create sheet if it doesn't exist
+    if sheet_name not in existing_sheets:
+        try:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    'requests': [{
+                        'addSheet': {
+                            'properties': {
+                                'title': sheet_name,
+                                'index': 0  # Add at the beginning
+                            }
+                        }
+                    }]
+                }
+            ).execute()
+            print(f"[Sheets] Created new sheet tab: {sheet_name}")
+        except Exception as e:
+            print(f"[Sheets] Error creating sheet: {e}")
+
+    return sheet_name
+
+
 @app.route('/sheets/update', methods=['POST'])
 def update_google_sheet():
     """
     Update Google Sheet with attendance data.
+    Creates a separate sheet tab for each date (format: DD-MM-YY).
     Called hourly by Cloud Scheduler during work hours (9 AM - 12 AM IST).
 
     Query params:
@@ -13849,83 +13890,46 @@ def update_google_sheet():
         # Get attendance data
         rows = get_attendance_for_sheet(date_str, start_hour, end_hour)
 
-        if not rows:
-            return jsonify({
-                'success': True,
-                'message': 'No attendance data found for this date/time range',
-                'date': date_str,
-                'mode': mode,
-                'rows_updated': 0
-            })
-
         # Get Sheets service
         service = get_sheets_service()
         if not service:
             return jsonify({'success': False, 'error': 'Could not connect to Google Sheets'}), 500
 
+        # Get or create sheet tab for this date
+        sheet_name = get_or_create_date_sheet(service, GOOGLE_SHEETS_ID, date_str)
+
+        if not rows:
+            # Still create the sheet with headers even if no data
+            service.spreadsheets().values().update(
+                spreadsheetId=GOOGLE_SHEETS_ID,
+                range=f"'{sheet_name}'!A1:F1",
+                valueInputOption='RAW',
+                body={'values': [['Team', 'Name', 'Email', 'Join Time', 'Leave Time', 'Duration']]}
+            ).execute()
+            return jsonify({
+                'success': True,
+                'message': f'No attendance data found. Created empty sheet: {sheet_name}',
+                'date': date_str,
+                'sheet_name': sheet_name,
+                'mode': mode,
+                'rows_updated': 0
+            })
+
         sheet = service.spreadsheets()
 
-        # Check if sheet has headers, if not add them
+        # Clear the sheet and add headers
         try:
-            result = sheet.values().get(
-                spreadsheetId=GOOGLE_SHEETS_ID,
-                range='A1:G1'
-            ).execute()
-            existing_headers = result.get('values', [])
-
-            if not existing_headers or existing_headers[0] != ['Date', 'Team', 'Name', 'Email', 'Join Time', 'Leave Time', 'Duration']:
-                # Add headers
-                sheet.values().update(
-                    spreadsheetId=GOOGLE_SHEETS_ID,
-                    range='A1:G1',
-                    valueInputOption='RAW',
-                    body={'values': [['Date', 'Team', 'Name', 'Email', 'Join Time', 'Leave Time', 'Duration']]}
-                ).execute()
-                print("[Sheets] Added headers")
-        except Exception as e:
-            print(f"[Sheets] Error checking headers: {e}")
-
-        # Clear existing data for this date (to avoid duplicates on hourly updates)
-        try:
-            # Get all existing data
-            result = sheet.values().get(
-                spreadsheetId=GOOGLE_SHEETS_ID,
-                range='A:G'
-            ).execute()
-            all_values = result.get('values', [])
-
-            # Find rows with this date and clear them
-            rows_to_keep = [all_values[0]] if all_values else [['Date', 'Team', 'Name', 'Email', 'Join Time', 'Leave Time', 'Duration']]
-            for row in all_values[1:]:
-                if row and len(row) > 0 and row[0] != date_str:
-                    rows_to_keep.append(row)
-
-            # Clear sheet and rewrite
             sheet.values().clear(
                 spreadsheetId=GOOGLE_SHEETS_ID,
-                range='A:G'
+                range=f"'{sheet_name}'!A:F"
             ).execute()
-
-            # Write back rows to keep
-            if rows_to_keep:
-                sheet.values().update(
-                    spreadsheetId=GOOGLE_SHEETS_ID,
-                    range='A1',
-                    valueInputOption='RAW',
-                    body={'values': rows_to_keep}
-                ).execute()
-
-            next_row = len(rows_to_keep) + 1
-
         except Exception as e:
-            print(f"[Sheets] Error clearing old data: {e}")
-            next_row = 2  # Start after header
+            print(f"[Sheets] Error clearing sheet: {e}")
 
-        # Prepare new rows
-        new_rows = []
+        # Prepare data with headers (no Date column since sheet name is the date)
+        all_rows = [['Team', 'Name', 'Email', 'Join Time', 'Leave Time', 'Duration']]
         for row in rows:
-            new_rows.append([
-                row.report_date,
+            all_rows.append([
                 row.team_name,
                 row.name,
                 row.email or '',
@@ -13934,25 +13938,24 @@ def update_google_sheet():
                 row.duration_formatted or '0h 0m'
             ])
 
-        # Append new data
-        if new_rows:
-            sheet.values().append(
-                spreadsheetId=GOOGLE_SHEETS_ID,
-                range='A:G',
-                valueInputOption='RAW',
-                insertDataOption='INSERT_ROWS',
-                body={'values': new_rows}
-            ).execute()
+        # Write all data
+        sheet.values().update(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            range=f"'{sheet_name}'!A1",
+            valueInputOption='RAW',
+            body={'values': all_rows}
+        ).execute()
 
-        print(f"[Sheets] Updated {len(new_rows)} rows for {date_str}")
+        print(f"[Sheets] Updated {len(rows)} rows in sheet '{sheet_name}'")
 
         return jsonify({
             'success': True,
-            'message': f'Updated Google Sheet with {len(new_rows)} attendance records',
+            'message': f'Updated sheet "{sheet_name}" with {len(rows)} attendance records',
             'date': date_str,
+            'sheet_name': sheet_name,
             'mode': mode,
             'time_range': f'{start_hour}:00 - {end_hour}:00 IST',
-            'rows_updated': len(new_rows),
+            'rows_updated': len(rows),
             'sheet_url': f'https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}'
         })
 
