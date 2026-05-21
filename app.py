@@ -13507,9 +13507,10 @@ def admin_delete_events():
 def webhook_only_report_preview(date_str):
     """
     Generate a simple attendance report using ONLY webhook data.
-    Returns: Name, Email, First Join (IST), Last Leave (IST), Total Duration
+    Returns: Name, Email, First Join (IST), Last Leave (IST), Total Active Duration
 
-    This is a TEST endpoint to validate webhook-only approach before migration.
+    IMPORTANT: Calculates ACTUAL ACTIVE TIME by pairing each join with next leave.
+    Example: Join 1PM, Leave 3PM, Rejoin 4PM, Leave 6PM = 2h + 2h = 4h (not 5h)
     """
     try:
         # Validate date format
@@ -13527,7 +13528,8 @@ def webhook_only_report_preview(date_str):
                 participant_name,
                 COALESCE(NULLIF(participant_email, ''), '') as participant_email,
                 event_type,
-                TIMESTAMP_ADD(CAST(event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) as event_time_ist
+                TIMESTAMP_ADD(CAST(event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) as event_time_ist,
+                ROW_NUMBER() OVER (PARTITION BY participant_name ORDER BY event_timestamp) as event_order
             FROM `{dataset_ref}.participant_events`
             WHERE event_date = @report_date
               AND participant_name IS NOT NULL
@@ -13536,15 +13538,40 @@ def webhook_only_report_preview(date_str):
               AND event_type IN ('participant_joined', 'meeting.participant_joined',
                                  'participant_left', 'meeting.participant_left')
         ),
+        -- Pair each join with the next leave event
+        events_with_next AS (
+            SELECT
+                participant_name,
+                participant_email,
+                event_type,
+                event_time_ist,
+                LEAD(event_type) OVER (PARTITION BY participant_name ORDER BY event_order) as next_event_type,
+                LEAD(event_time_ist) OVER (PARTITION BY participant_name ORDER BY event_order) as next_event_time
+            FROM webhook_events
+        ),
+        -- Calculate session durations (only join→leave pairs)
+        sessions AS (
+            SELECT
+                participant_name,
+                MAX(participant_email) as participant_email,
+                event_time_ist as session_start,
+                next_event_time as session_end,
+                TIMESTAMP_DIFF(next_event_time, event_time_ist, MINUTE) as session_minutes
+            FROM events_with_next
+            WHERE event_type IN ('participant_joined', 'meeting.participant_joined')
+              AND next_event_type IN ('participant_left', 'meeting.participant_left')
+              AND next_event_time IS NOT NULL
+            GROUP BY participant_name, event_time_ist, next_event_time
+        ),
+        -- Aggregate per participant: first join, last leave, total ACTIVE minutes
         participant_summary AS (
             SELECT
                 participant_name,
                 MAX(participant_email) as participant_email,
-                MIN(CASE WHEN event_type IN ('participant_joined', 'meeting.participant_joined')
-                    THEN event_time_ist END) as first_join_ist,
-                MAX(CASE WHEN event_type IN ('participant_left', 'meeting.participant_left')
-                    THEN event_time_ist END) as last_leave_ist
-            FROM webhook_events
+                MIN(session_start) as first_join_ist,
+                MAX(session_end) as last_leave_ist,
+                SUM(session_minutes) as total_active_minutes
+            FROM sessions
             GROUP BY participant_name
         )
         SELECT
@@ -13552,16 +13579,12 @@ def webhook_only_report_preview(date_str):
             participant_email as email,
             FORMAT_TIMESTAMP('%H:%M', first_join_ist) as join_time_ist,
             FORMAT_TIMESTAMP('%H:%M', last_leave_ist) as leave_time_ist,
+            COALESCE(total_active_minutes, 0) as duration_minutes,
             CASE
-                WHEN first_join_ist IS NOT NULL AND last_leave_ist IS NOT NULL
-                THEN TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE)
-                ELSE 0
-            END as duration_minutes,
-            CASE
-                WHEN first_join_ist IS NOT NULL AND last_leave_ist IS NOT NULL
+                WHEN total_active_minutes IS NOT NULL AND total_active_minutes > 0
                 THEN CONCAT(
-                    CAST(FLOOR(TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE) / 60) AS STRING), 'h ',
-                    CAST(MOD(TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE), 60) AS STRING), 'm'
+                    CAST(FLOOR(total_active_minutes / 60) AS STRING), 'h ',
+                    CAST(MOD(total_active_minutes, 60) AS STRING), 'm'
                 )
                 ELSE '0h 0m'
             END as duration_formatted
@@ -13617,6 +13640,9 @@ def webhook_only_report_csv(date_str):
     """
     Download webhook-only attendance report as CSV file.
     Can be directly imported into Google Sheets.
+
+    IMPORTANT: Calculates ACTUAL ACTIVE TIME by pairing each join with next leave.
+    Example: Join 1PM, Leave 3PM, Rejoin 4PM, Leave 6PM = 2h + 2h = 4h (not 5h)
     """
     try:
         # Validate date format
@@ -13634,7 +13660,8 @@ def webhook_only_report_csv(date_str):
                 participant_name,
                 COALESCE(NULLIF(participant_email, ''), '') as participant_email,
                 event_type,
-                TIMESTAMP_ADD(CAST(event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) as event_time_ist
+                TIMESTAMP_ADD(CAST(event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) as event_time_ist,
+                ROW_NUMBER() OVER (PARTITION BY participant_name ORDER BY event_timestamp) as event_order
             FROM `{dataset_ref}.participant_events`
             WHERE event_date = @report_date
               AND participant_name IS NOT NULL
@@ -13643,15 +13670,37 @@ def webhook_only_report_csv(date_str):
               AND event_type IN ('participant_joined', 'meeting.participant_joined',
                                  'participant_left', 'meeting.participant_left')
         ),
+        events_with_next AS (
+            SELECT
+                participant_name,
+                participant_email,
+                event_type,
+                event_time_ist,
+                LEAD(event_type) OVER (PARTITION BY participant_name ORDER BY event_order) as next_event_type,
+                LEAD(event_time_ist) OVER (PARTITION BY participant_name ORDER BY event_order) as next_event_time
+            FROM webhook_events
+        ),
+        sessions AS (
+            SELECT
+                participant_name,
+                MAX(participant_email) as participant_email,
+                event_time_ist as session_start,
+                next_event_time as session_end,
+                TIMESTAMP_DIFF(next_event_time, event_time_ist, MINUTE) as session_minutes
+            FROM events_with_next
+            WHERE event_type IN ('participant_joined', 'meeting.participant_joined')
+              AND next_event_type IN ('participant_left', 'meeting.participant_left')
+              AND next_event_time IS NOT NULL
+            GROUP BY participant_name, event_time_ist, next_event_time
+        ),
         participant_summary AS (
             SELECT
                 participant_name,
                 MAX(participant_email) as participant_email,
-                MIN(CASE WHEN event_type IN ('participant_joined', 'meeting.participant_joined')
-                    THEN event_time_ist END) as first_join_ist,
-                MAX(CASE WHEN event_type IN ('participant_left', 'meeting.participant_left')
-                    THEN event_time_ist END) as last_leave_ist
-            FROM webhook_events
+                MIN(session_start) as first_join_ist,
+                MAX(session_end) as last_leave_ist,
+                SUM(session_minutes) as total_active_minutes
+            FROM sessions
             GROUP BY participant_name
         )
         SELECT
@@ -13659,16 +13708,12 @@ def webhook_only_report_csv(date_str):
             participant_email as email,
             FORMAT_TIMESTAMP('%H:%M', first_join_ist) as join_time_ist,
             FORMAT_TIMESTAMP('%H:%M', last_leave_ist) as leave_time_ist,
+            COALESCE(total_active_minutes, 0) as duration_minutes,
             CASE
-                WHEN first_join_ist IS NOT NULL AND last_leave_ist IS NOT NULL
-                THEN TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE)
-                ELSE 0
-            END as duration_minutes,
-            CASE
-                WHEN first_join_ist IS NOT NULL AND last_leave_ist IS NOT NULL
+                WHEN total_active_minutes IS NOT NULL AND total_active_minutes > 0
                 THEN CONCAT(
-                    CAST(FLOOR(TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE) / 60) AS STRING), 'h ',
-                    CAST(MOD(TIMESTAMP_DIFF(last_leave_ist, first_join_ist, MINUTE), 60) AS STRING), 'm'
+                    CAST(FLOOR(total_active_minutes / 60) AS STRING), 'h ',
+                    CAST(MOD(total_active_minutes, 60) AS STRING), 'm'
                 )
                 ELSE '0h 0m'
             END as duration_formatted
@@ -13733,6 +13778,9 @@ def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
     Get attendance data for Google Sheets.
     Filters data from start_hour (9 AM) to end_hour (24 = midnight).
     Includes team information.
+
+    IMPORTANT: Calculates ACTUAL ACTIVE TIME by pairing each join with next leave.
+    Example: Join 1PM, Leave 3PM, Rejoin 4PM, Leave 6PM = 2h + 2h = 4h (not 5h)
     """
     try:
         client = get_bq_client()
@@ -13744,7 +13792,8 @@ def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
                 pe.participant_name,
                 COALESCE(NULLIF(pe.participant_email, ''), '') as participant_email,
                 pe.event_type,
-                TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) as event_time_ist
+                TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) as event_time_ist,
+                ROW_NUMBER() OVER (PARTITION BY pe.participant_name ORDER BY pe.event_timestamp) as event_order
             FROM `{dataset_ref}.participant_events` pe
             WHERE pe.event_date = @report_date
               AND pe.participant_name IS NOT NULL
@@ -13752,18 +13801,43 @@ def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
               AND pe.event_type IN ('participant_joined', 'meeting.participant_joined',
                                    'participant_left', 'meeting.participant_left')
+              AND EXTRACT(HOUR FROM TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE)) >= @start_hour
+              AND EXTRACT(HOUR FROM TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE)) < @end_hour
         ),
+        -- Pair each join with the next leave event
+        events_with_next AS (
+            SELECT
+                participant_name,
+                participant_email,
+                event_type,
+                event_time_ist,
+                LEAD(event_type) OVER (PARTITION BY participant_name ORDER BY event_order) as next_event_type,
+                LEAD(event_time_ist) OVER (PARTITION BY participant_name ORDER BY event_order) as next_event_time
+            FROM webhook_events
+        ),
+        -- Calculate session durations (only join→leave pairs)
+        sessions AS (
+            SELECT
+                participant_name,
+                MAX(participant_email) as participant_email,
+                event_time_ist as session_start,
+                next_event_time as session_end,
+                TIMESTAMP_DIFF(next_event_time, event_time_ist, MINUTE) as session_minutes
+            FROM events_with_next
+            WHERE event_type IN ('participant_joined', 'meeting.participant_joined')
+              AND next_event_type IN ('participant_left', 'meeting.participant_left')
+              AND next_event_time IS NOT NULL
+            GROUP BY participant_name, event_time_ist, next_event_time
+        ),
+        -- Aggregate per participant: first join, last leave, total ACTIVE minutes
         participant_summary AS (
             SELECT
                 participant_name,
                 MAX(participant_email) as participant_email,
-                MIN(CASE WHEN event_type IN ('participant_joined', 'meeting.participant_joined')
-                    THEN event_time_ist END) as first_join_ist,
-                MAX(CASE WHEN event_type IN ('participant_left', 'meeting.participant_left')
-                    THEN event_time_ist END) as last_leave_ist
-            FROM webhook_events
-            WHERE EXTRACT(HOUR FROM event_time_ist) >= @start_hour
-              AND EXTRACT(HOUR FROM event_time_ist) < @end_hour
+                MIN(session_start) as first_join_ist,
+                MAX(session_end) as last_leave_ist,
+                SUM(session_minutes) as total_active_minutes
+            FROM sessions
             GROUP BY participant_name
         ),
         team_lookup AS (
@@ -13781,16 +13855,12 @@ def get_attendance_for_sheet(date_str, start_hour=9, end_hour=24):
             ps.participant_email as email,
             FORMAT_TIMESTAMP('%H:%M', ps.first_join_ist) as join_time_ist,
             FORMAT_TIMESTAMP('%H:%M', ps.last_leave_ist) as leave_time_ist,
+            COALESCE(ps.total_active_minutes, 0) as duration_minutes,
             CASE
-                WHEN ps.first_join_ist IS NOT NULL AND ps.last_leave_ist IS NOT NULL
-                THEN TIMESTAMP_DIFF(ps.last_leave_ist, ps.first_join_ist, MINUTE)
-                ELSE 0
-            END as duration_minutes,
-            CASE
-                WHEN ps.first_join_ist IS NOT NULL AND ps.last_leave_ist IS NOT NULL
+                WHEN ps.total_active_minutes IS NOT NULL AND ps.total_active_minutes > 0
                 THEN CONCAT(
-                    CAST(FLOOR(TIMESTAMP_DIFF(ps.last_leave_ist, ps.first_join_ist, MINUTE) / 60) AS STRING), 'h ',
-                    CAST(MOD(TIMESTAMP_DIFF(ps.last_leave_ist, ps.first_join_ist, MINUTE), 60) AS STRING), 'm'
+                    CAST(FLOOR(ps.total_active_minutes / 60) AS STRING), 'h ',
+                    CAST(MOD(ps.total_active_minutes, 60) AS STRING), 'm'
                 )
                 ELSE '0h 0m'
             END as duration_formatted
