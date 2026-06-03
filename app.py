@@ -14174,6 +14174,21 @@ GAP_THRESHOLD_SECONDS = 300          # >5min gap between snapshots = new interva
 BUCKET_SECONDS = 30                  # 30s dedup bucket (multi-source polling)
 MAIN_ROOM_SYNTH_CAP_MINUTES = 600    # Cap any single synthesized Main Room interval
 MAIN_ROOM_SYNTH_MIN_SECONDS = 120    # Don't synthesize gaps smaller than 2min
+# --- Inherited-meeting (overnight-spillover) guard ------------------------
+# Zoom meetings can run 24h+. When one is left running across IST midnight its
+# tail lands on the NEXT day's partition starting at ~00:00, with the whole
+# cohort "frozen" in their rooms (flat occupancy, no joins/leaves) until the
+# meeting finally ends in a single mass-exit; the real meeting for the day then
+# starts afterwards as people actually join (occupancy ramps up from ~1). We
+# detect that mass-exit boundary from global per-bucket occupancy and drop
+# every interval that STARTS before it. This implements "count from the meeting
+# that starts today; skip the post-midnight tail of yesterday's meeting." On a
+# normal day nobody is present at 00:00, so nothing is dropped. Tunable via env.
+INHERITED_MIN_PARTICIPANTS     = int(os.environ.get('INHERITED_MIN_PARTICIPANTS', '10'))      # >=N frozen at 00:00 => inherited meeting
+INHERITED_LEAVE_FRACTION       = float(os.environ.get('INHERITED_LEAVE_FRACTION', '0.5'))     # occupancy < frac*start_level => mass-exit
+INHERITED_MAX_BOUNDARY_IST_MIN = int(os.environ.get('INHERITED_MAX_BOUNDARY_IST_MIN', '840')) # don't place boundary after 14:00 IST
+INHERITED_EXIT_SUSTAIN_BUCKETS = int(os.environ.get('INHERITED_EXIT_SUSTAIN_BUCKETS', '10'))  # exit must stay low this many 30s buckets (5min)
+IST_OFFSET_MINUTES = 330
 
 
 def _classify_room(room_name):
@@ -14505,92 +14520,80 @@ def build_presence_intervals(date_str):
             intervals.append(iv)
             intervals_by_participant[pkey].append(iv)
 
-    # ----- Step 4: synthesize Main Room between/around breakouts -----------
+    # ----- Step 4: synthesize Main Room from webhook presence --------------
+    # Snapshots are primary truth. Wherever a participant has webhook presence
+    # (join->leave windows) NOT already covered by a snapshot interval, credit
+    # that time as Main Room. This fills holes when the snapshot monitor had an
+    # outage but webhooks kept flowing (Zoom sends them automatically), so a day
+    # is no longer under-counted just because polling stopped. Open windows
+    # (missing leave) are capped at the monitoring window end — never phantom
+    # presence past it.
     def _parse_ts(s):
         # ISO string -> naive UTC datetime
         if isinstance(s, str):
             return datetime.fromisoformat(s.replace('Z', ''))
         return s
 
+    def _emit_main(bucket_list, pkey, s_dt, e_dt):
+        secs = (e_dt - s_dt).total_seconds()
+        if secs < MAIN_ROOM_SYNTH_MIN_SECONDS:
+            return
+        secs = min(secs, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
+        bucket_list.append({
+            'interval_id': str(uuid_lib.uuid4()),
+            'event_date': date_str,
+            'meeting_id': meeting_by_key.get(pkey),
+            'meeting_uuid': None,
+            'participant_key': pkey,
+            'participant_name': name_by_key.get(pkey),
+            'participant_email': email_by_key.get(pkey),
+            'room_name': '0.Main Room',
+            'room_category': 'main',
+            'start_ts': s_dt.isoformat(),
+            'end_ts': (s_dt + timedelta(seconds=secs)).isoformat(),
+            'duration_seconds': int(secs),
+            'alone_seconds': 0,
+            'snapshot_count': 0,
+            'source': 'synthesized_main',
+            'confidence': 0.6,
+            'built_at': built_at_iso,
+        })
+
     for pkey, plist in list(intervals_by_participant.items()):
-        plist.sort(key=lambda x: x['start_ts'])
-        wh = webhook_by_key.get(pkey)
-        meeting_joined = wh.meeting_joined if wh else None
-        meeting_left = wh.meeting_left if wh else None
-        # Cap meeting_left at monitoring window end (no phantom attendance
-        # after monitoring stopped).
-        if meeting_left and monitoring_end and meeting_left > monitoring_end:
-            meeting_left = monitoring_end
-
-        synthesized = []
-
         windows = presence_windows_by_key.get(pkey, [])
-
-        def _emit_main_for_windows(gap_start, gap_end, confidence):
-            """Emit one synthesized Main Room interval per presence window
-            inside [gap_start, gap_end]. Skips times when the participant
-            had a participant_left webhook (real absence)."""
-            if not windows:
-                # No webhook data — fall back to whole-gap synthesis
-                slices = [(gap_start, gap_end)]
-            else:
-                slices = []
-                for w_s, w_e in windows:
-                    if w_e is None:
-                        w_e = gap_end
-                    os_ = max(gap_start, w_s)
-                    oe = min(gap_end, w_e)
-                    if (oe - os_).total_seconds() >= MAIN_ROOM_SYNTH_MIN_SECONDS:
-                        slices.append((os_, oe))
-            for sl_start, sl_end in slices:
-                sl_s = (sl_end - sl_start).total_seconds()
-                if sl_s < MAIN_ROOM_SYNTH_MIN_SECONDS:
+        if not windows:
+            continue  # no webhook presence -> nothing to synthesize
+        wh = webhook_by_key.get(pkey)
+        meeting_left = wh.meeting_left if wh else None
+        # Time already covered by ANY snapshot interval (breakout or main).
+        covered = sorted(
+            (_parse_ts(iv['start_ts']), _parse_ts(iv['end_ts']))
+            for iv in plist if iv['source'] == 'snapshot'
+        )
+        synthesized = []
+        for w_s, w_e in windows:
+            if w_e is None:
+                w_e = meeting_left or monitoring_end
+            if w_e is None:
+                continue
+            # No phantom presence after monitoring/meeting ended.
+            if monitoring_end and w_e > monitoring_end:
+                w_e = monitoring_end
+            if w_e <= w_s:
+                continue
+            # Walk the window, emitting Main Room for every stretch not already
+            # covered by a snapshot interval.
+            cursor = w_s
+            for c_s, c_e in covered:
+                if c_e <= cursor or c_s >= w_e:
                     continue
-                sl_s = min(sl_s, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
-                synthesized.append({
-                    'interval_id': str(uuid_lib.uuid4()),
-                    'event_date': date_str,
-                    'meeting_id': meeting_by_key.get(pkey),
-                    'meeting_uuid': None,
-                    'participant_key': pkey,
-                    'participant_name': name_by_key.get(pkey),
-                    'participant_email': email_by_key.get(pkey),
-                    'room_name': '0.Main Room',
-                    'room_category': 'main',
-                    'start_ts': sl_start.isoformat(),
-                    'end_ts': (sl_start + timedelta(seconds=sl_s)).isoformat(),
-                    'duration_seconds': int(sl_s),
-                    'alone_seconds': 0,
-                    'snapshot_count': 0,
-                    'source': 'synthesized_main',
-                    'confidence': confidence,
-                    'built_at': built_at_iso,
-                })
-
-        # 4a. Before first interval (if first is breakout and we have a join time)
-        first = plist[0]
-        first_start = _parse_ts(first['start_ts'])
-        if first['room_category'] == 'breakout' and meeting_joined:
-            if (first_start - meeting_joined).total_seconds() >= MAIN_ROOM_SYNTH_MIN_SECONDS:
-                _emit_main_for_windows(meeting_joined, first_start, 0.6)
-
-        # 4b. Between consecutive intervals (both breakouts → Main Room gap)
-        for prev, nxt in zip(plist, plist[1:]):
-            if prev['room_category'] != 'breakout' or nxt['room_category'] != 'breakout':
-                continue
-            gap_start = _parse_ts(prev['end_ts'])
-            gap_end = _parse_ts(nxt['start_ts'])
-            if (gap_end - gap_start).total_seconds() < MAIN_ROOM_SYNTH_MIN_SECONDS:
-                continue
-            _emit_main_for_windows(gap_start, gap_end, 0.7)
-
-        # 4c. After last interval (if last is breakout and we have a leave time)
-        last = plist[-1]
-        last_end = _parse_ts(last['end_ts'])
-        if last['room_category'] == 'breakout' and meeting_left:
-            if (meeting_left - last_end).total_seconds() >= MAIN_ROOM_SYNTH_MIN_SECONDS:
-                _emit_main_for_windows(last_end, meeting_left, 0.6)
-
+                if c_s > cursor:
+                    _emit_main(synthesized, pkey, cursor, min(c_s, w_e))
+                cursor = max(cursor, c_e)
+                if cursor >= w_e:
+                    break
+            if cursor < w_e:
+                _emit_main(synthesized, pkey, cursor, w_e)
         intervals.extend(synthesized)
         intervals_by_participant[pkey].extend(synthesized)
 
@@ -14631,6 +14634,64 @@ def build_presence_intervals(date_str):
             'confidence': 0.5,
             'built_at': built_at_iso,
         })
+
+    # ----- Step 5b: drop the inherited (overnight) meeting block -----------
+    # See the INHERITED_* constants above for the full rationale. We rebuild
+    # global per-30s-bucket occupancy from the snapshot buckets, check whether
+    # a large cohort was already present at the very start of the IST day, and
+    # if so find the mass-exit boundary (occupancy falls below a fraction of
+    # that start level and STAYS low). Every interval starting before that
+    # boundary is the tail of yesterday's meeting and is dropped.
+    inherited_cutoff_utc = None
+    if buckets:
+        presence_by_bucket = defaultdict(set)
+        for b in buckets:
+            presence_by_bucket[b.bucket30].add(b.participant_key)
+        # First 30s bucket of this IST day: 00:00 IST == UTC midnight - 5:30.
+        from datetime import timezone as _tz
+        day0_utc_unix = int(
+            datetime.fromisoformat(date_str).replace(tzinfo=_tz.utc).timestamp()
+        ) - IST_OFFSET_MINUTES * 60
+        day_start_bucket = day0_utc_unix // BUCKET_SECONDS
+        # Occupancy at the very start of the IST day (peak over first 5 min).
+        start_level = max(
+            (len(presence_by_bucket.get(day_start_bucket + i, ())) for i in range(10)),
+            default=0,
+        )
+        if start_level >= INHERITED_MIN_PARTICIPANTS:
+            threshold = max(1, int(start_level * INHERITED_LEAVE_FRACTION))
+            max_scan_bucket = day_start_bucket + (INHERITED_MAX_BOUNDARY_IST_MIN * 60) // BUCKET_SECONDS
+            sustain = INHERITED_EXIT_SUSTAIN_BUCKETS
+            scan = day_start_bucket
+            while scan <= max_scan_bucket:
+                # A real mass-exit stays low; a one-bucket polling blip does not.
+                if all(len(presence_by_bucket.get(scan + i, ())) < threshold
+                       for i in range(sustain)):
+                    inherited_cutoff_utc = datetime.fromtimestamp(
+                        scan * BUCKET_SECONDS, _tz.utc).replace(tzinfo=None)
+                    break
+                scan += 1
+            if inherited_cutoff_utc is None:
+                print(f"[BuildIntervals {date_str}] WARNING: {start_level} present at "
+                      f"00:00 IST but no sustained mass-exit found before "
+                      f"{INHERITED_MAX_BOUNDARY_IST_MIN // 60:02d}:00 IST — no overnight drop applied")
+
+    if inherited_cutoff_utc is not None:
+        kept_intervals = []
+        dropped_n = 0
+        dropped_secs = 0
+        for iv in intervals:
+            if _parse_ts(iv['start_ts']) < inherited_cutoff_utc:
+                dropped_n += 1
+                dropped_secs += iv['duration_seconds']
+            else:
+                kept_intervals.append(iv)
+        if dropped_n:
+            ist_cut = inherited_cutoff_utc + timedelta(minutes=IST_OFFSET_MINUTES)
+            print(f"[BuildIntervals {date_str}] inherited overnight meeting detected "
+                  f"(start_level={start_level}); dropped {dropped_n} intervals "
+                  f"({dropped_secs // 60} min) starting before {ist_cut.strftime('%H:%M')} IST")
+        intervals = kept_intervals
 
     # ----- Step 6: Atomic partition replace via load job -------------------
     # Use a BigQuery LOAD job with WRITE_TRUNCATE and a partition decorator
