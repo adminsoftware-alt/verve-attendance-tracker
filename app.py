@@ -2800,7 +2800,7 @@ def chat_endpoint():
 # Cross-request snapshot dedup. When the MonitorPanel is open on >1 device
 # (HR client + Scout Bot VM), each polls every 30s and writes its own row.
 # Downstream queries already bucket-dedup, so reports are correct — but
-# room_snapshots itself silently inflates, costing storage. Here we drop
+# room_snapshots_v2 itself silently inflates, costing storage. Here we drop
 # any row whose (meeting_id, participant_key, room_name, 30s_bucket) was
 # already inserted by a previous request from this same instance within the
 # last few minutes. Conservative on purpose: only identical (room, bucket)
@@ -2925,7 +2925,7 @@ def monitor_snapshot():
     if rows:
         try:
             client = get_bq_client()
-            table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots"
+            table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2"
             errors = client.insert_rows_json(table_id, rows)
             if errors:
                 print(f"[Monitor] BigQuery insert errors: {errors[:3]}")
@@ -2960,7 +2960,7 @@ def monitor_status():
           COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), NULLIF(participant_email, ''), participant_name)) as participant_count,
           MIN(snapshot_time) as first_snapshot,
           MAX(snapshot_time) as last_snapshot
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
         WHERE event_date = '{today}'
         """
         result = list(client.query(query).result())
@@ -2995,7 +2995,7 @@ def monitor_sample():
         client = get_bq_client()
         query = f"""
         SELECT snapshot_time, room_name, participant_name, participant_email
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
         WHERE event_date = '{today}'
         ORDER BY snapshot_time DESC
         LIMIT 50
@@ -3035,7 +3035,7 @@ def monitor_health():
           MIN(snapshot_time) as first_snapshot,
           MAX(snapshot_time) as last_snapshot,
           TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(snapshot_time), SECOND) as seconds_since_last
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
         WHERE event_date = '{today}'
         """
         result = list(client.query(query).result())
@@ -3463,7 +3463,7 @@ def check_and_send_stale_alert():
         SELECT
           COUNT(*) as snapshot_count,
           TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(snapshot_time), SECOND) as seconds_since_last
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
         WHERE event_date = '{today}'
         """
         result = list(client.query(query).result())
@@ -6304,13 +6304,13 @@ def attendance_live():
         query = f"""
         WITH latest_snapshot AS (
           SELECT MAX(snapshot_time) as max_time
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
           WHERE event_date = '{target_date}'
         ),
         -- All room names seen during the entire day
         all_rooms AS (
           SELECT DISTINCT room_name
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
           WHERE event_date = '{target_date}'
             AND room_name IS NOT NULL AND room_name != ''
         ),
@@ -6323,7 +6323,7 @@ def attendance_live():
         -- per-room latest lets ALL recently-active rooms contribute.
         recent_per_room AS (
           SELECT s.room_name, MAX(s.snapshot_time) as room_latest
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` s
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2` s
           CROSS JOIN latest_snapshot ls
           WHERE s.event_date = '{target_date}'
             AND s.snapshot_time > TIMESTAMP_SUB(ls.max_time, INTERVAL 60 SECOND)
@@ -6341,7 +6341,7 @@ def attendance_live():
             s.participant_email,
             s.participant_uuid,
             s.snapshot_time
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` s
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2` s
           INNER JOIN recent_per_room rpr
             ON s.room_name = rpr.room_name AND s.snapshot_time = rpr.room_latest
           WHERE s.event_date = '{target_date}'
@@ -6459,7 +6459,7 @@ def attendance_summary(date=None):
               NULLIF(LOWER(TRIM(participant_email)), ''),
               LOWER(TRIM(participant_name))
             ) as participant_key
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
           WHERE event_date = '{date}'
             AND participant_name IS NOT NULL AND participant_name != ''
         ),
@@ -6483,7 +6483,7 @@ def attendance_summary(date=None):
           SELECT
             MIN(snapshot_time) as global_first_snapshot,
             MAX(snapshot_time) as global_last_snapshot
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
           WHERE event_date = '{date}'
         ),
         -- Per-participant final breakout state. Tracks the MOST RECENT
@@ -6566,7 +6566,7 @@ def attendance_summary(date=None):
             COALESCE(NULLIF(rs.participant_email, ''), '') as participant_email,
             rs.room_name,
             rs.snapshot_time
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` rs
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2` rs
           LEFT JOIN name_to_key ntk ON LOWER(TRIM(rs.participant_name)) = ntk.name_key
           WHERE rs.event_date = '{date}'
             AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
@@ -6622,7 +6622,7 @@ def attendance_summary(date=None):
               MAX(COALESCE(NULLIF(rs.participant_email, ''), '')) as participant_email,
               MIN(rs.snapshot_time) as first_seen,
               MAX(rs.snapshot_time) as last_seen
-            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` rs
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2` rs
             LEFT JOIN name_to_key ntk ON LOWER(TRIM(rs.participant_name)) = ntk.name_key
             WHERE rs.event_date = '{date}'
               AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
@@ -6997,7 +6997,7 @@ def attendance_heatmap(date=None):
             COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
             snapshot_time,
             TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
           WHERE event_date = '{date}'
             AND participant_name NOT LIKE '%Scout%'
             AND room_name IS NOT NULL AND room_name != ''
@@ -7680,7 +7680,7 @@ def list_known_participants():
 
         query = f"""
         SELECT DISTINCT participant_name, participant_email
-        FROM `{dataset_ref}.room_snapshots`
+        FROM `{dataset_ref}.room_snapshots_v2`
         WHERE SAFE.PARSE_DATE('%Y-%m-%d', event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
           AND LOWER(participant_name) NOT LIKE '%scout%'
           AND participant_name IS NOT NULL AND participant_name != ''
@@ -7738,7 +7738,7 @@ def team_attendance(team_id, date):
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
                 LOWER(TRIM(participant_name)) as name_key,
                 NULLIF(LOWER(TRIM(participant_email)), '') as email_key
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date = @report_date
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
@@ -7772,7 +7772,7 @@ def team_attendance(team_id, date):
                 s.room_name,
                 COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
                 TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
             WHERE s.event_date = @report_date
@@ -7795,7 +7795,7 @@ def team_attendance(team_id, date):
                 COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
                 -- Bucket to 30s windows to dedup multi-source polls.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as break_room_seconds
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
             WHERE s.event_date = @report_date
@@ -7869,7 +7869,7 @@ def team_attendance(team_id, date):
                 snapshot_time,
                 room_name,
                 COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as occupant_count
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date = @report_date
               AND room_name IS NOT NULL AND room_name != ''
               AND participant_name IS NOT NULL AND participant_name != ''
@@ -7906,7 +7906,7 @@ def team_attendance(team_id, date):
         -- point would be phantom attendance from a monitoring outage.
         monitoring_window AS (
             SELECT MAX(TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE)) as last_snapshot_ist
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date = @report_date
         ),
         -- Did this participant have ANY breakout_room_joined webhook today?
@@ -8306,7 +8306,7 @@ def team_attendance_range(team_id):
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
                 LOWER(TRIM(participant_name)) as name_key,
                 NULLIF(LOWER(TRIM(participant_email)), '') as email_key
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
@@ -8344,7 +8344,7 @@ def team_attendance_range(team_id):
                 s.participant_uuid,
                 s.room_name,
                 s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
                AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
@@ -8372,7 +8372,7 @@ def team_attendance_range(team_id):
                 -- writes its own row. Bucketing to 30-second windows keeps
                 -- one count per polling cycle regardless of source.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
                AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
@@ -8444,7 +8444,7 @@ def team_attendance_range(team_id):
         room_occupancy AS (
             SELECT snapshot_time, room_name,
                    COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as occupant_count
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND room_name IS NOT NULL AND room_name != ''
               AND participant_name IS NOT NULL
@@ -8457,7 +8457,7 @@ def team_attendance_range(team_id):
                 COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
                 -- Bucket to 30-second windows to dedup multi-source polls.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
                AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
@@ -8477,7 +8477,7 @@ def team_attendance_range(team_id):
         -- point would be phantom attendance from a monitoring outage.
         daily_monitoring_window AS (
             SELECT event_date, MAX(snapshot_time) as last_snapshot_ts
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
             GROUP BY event_date
         ),
@@ -8753,7 +8753,7 @@ def compare_teams():
                     s.participant_name,
                     s.room_name,
                     s.snapshot_time
-                FROM `{dataset_ref}.room_snapshots` s
+                FROM `{dataset_ref}.room_snapshots_v2` s
                 -- Match on name OR email; Zoom display names drift from
                 -- team_members.participant_name and would otherwise drop users.
                 INNER JOIN team_members tm
@@ -8920,7 +8920,7 @@ def team_monthly_report(team_id):
               NULLIF(LOWER(TRIM(participant_email)), ''),
               LOWER(TRIM(participant_name))
             ) as participant_key
-          FROM `{dataset_ref}.room_snapshots`
+          FROM `{dataset_ref}.room_snapshots_v2`
           WHERE event_date >= @start_date AND event_date <= @end_date
             AND participant_name IS NOT NULL AND participant_name != ''
         ),
@@ -8948,7 +8948,7 @@ def team_monthly_report(team_id):
             COALESCE(NULLIF(rs.participant_email, ''), '') as participant_email,
             rs.room_name,
             rs.snapshot_time
-          FROM `{dataset_ref}.room_snapshots` rs
+          FROM `{dataset_ref}.room_snapshots_v2` rs
           LEFT JOIN name_to_key ntk ON rs.event_date = ntk.event_date AND LOWER(TRIM(rs.participant_name)) = ntk.name_key
           WHERE rs.event_date >= @start_date AND rs.event_date <= @end_date
             AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
@@ -8977,7 +8977,7 @@ def team_monthly_report(team_id):
             -- Dedup multi-source duplicates: bucket to 30-second windows
             -- so polls from multiple devices count once per cycle.
             COUNT(DISTINCT DIV(UNIX_SECONDS(rs.snapshot_time), 30)) * 0.5 as break_room_mins
-          FROM `{dataset_ref}.room_snapshots` rs
+          FROM `{dataset_ref}.room_snapshots_v2` rs
           LEFT JOIN name_to_key ntk ON rs.event_date = ntk.event_date AND LOWER(TRIM(rs.participant_name)) = ntk.name_key
           WHERE rs.event_date >= @start_date AND rs.event_date <= @end_date
             AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
@@ -9059,7 +9059,7 @@ def team_monthly_report(team_id):
         -- this point would be phantom attendance from a monitoring outage.
         daily_monitoring_window AS (
           SELECT event_date, MAX(snapshot_time) as last_snapshot_ts
-          FROM `{dataset_ref}.room_snapshots`
+          FROM `{dataset_ref}.room_snapshots_v2`
           WHERE event_date >= @start_date AND event_date <= @end_date
           GROUP BY event_date
         ),
@@ -10188,7 +10188,7 @@ def detect_attendance_conflicts():
                 -- Bucket to 30s windows so multi-source polls don't double-count.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(snapshot_time), 30)) as snapshot_count,
                 CEILING(COUNT(DISTINCT DIV(UNIX_SECONDS(snapshot_time), 30)) * 0.5) as approx_mins
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
               AND LOWER(participant_name) NOT LIKE '%scout%'
@@ -10233,7 +10233,7 @@ def detect_attendance_conflicts():
                 LOWER(TRIM(participant_name)) as name_key,
                 event_date,
                 COUNT(*) as snapshot_count
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
               AND LOWER(participant_name) NOT LIKE '%scout%'
@@ -10376,7 +10376,7 @@ def teams_leave_summary():
                 participant_name,
                 snapshot_time,
                 LAG(snapshot_time) OVER (PARTITION BY participant_name ORDER BY snapshot_time) as prev_time
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date = @date
               AND participant_name IS NOT NULL
               AND LOWER(participant_name) NOT LIKE '%scout%'
@@ -10493,7 +10493,7 @@ def team_historical_trends(team_id):
                 COUNT(DISTINCT s.event_date) as days_present,
                 -- Bucket to 30s windows so multi-source polls don't double hours.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 / 3600.0 as total_hours
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             -- Match on name OR email; Zoom display names drift from the
             -- canonical name in team_members and would otherwise drop users.
             INNER JOIN team_members tm
@@ -11815,7 +11815,7 @@ def list_unrecognized_participants(date):
         # 1. Get all zoom participants for the date
         zoom_query = f"""
         SELECT DISTINCT participant_name, participant_email
-        FROM `{dataset_ref}.room_snapshots`
+        FROM `{dataset_ref}.room_snapshots_v2`
         WHERE event_date = @date
           AND participant_name IS NOT NULL AND participant_name != ''
           AND LOWER(participant_name) NOT LIKE '%scout%'
@@ -11980,7 +11980,7 @@ def list_unrecognized_monthly():
                 s.participant_email,
                 s.room_name,
                 s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
               AND s.room_name IS NOT NULL AND s.room_name != ''
@@ -12036,7 +12036,7 @@ def list_unrecognized_monthly():
                 -- writes its own row. Bucketing to 30-second windows keeps
                 -- one count per polling cycle regardless of source.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
@@ -12049,7 +12049,7 @@ def list_unrecognized_monthly():
         room_occupancy AS (
             SELECT snapshot_time, room_name,
                    COUNT(DISTINCT LOWER(TRIM(participant_name))) as cnt
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND room_name IS NOT NULL AND room_name != ''
               AND LOWER(participant_name) NOT LIKE '%scout%'
@@ -12061,7 +12061,7 @@ def list_unrecognized_monthly():
                 LOWER(TRIM(s.participant_name)) as name_key,
                 -- Bucket to 30-second windows to dedup multi-source polls.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN room_occupancy ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
@@ -12131,7 +12131,7 @@ def list_unrecognized_monthly():
               COALESCE(NULLIF(participant_uuid, ''), '') AS uuid,
               LOWER(TRIM(participant_name)) AS name_key,
               LOWER(TRIM(COALESCE(participant_email, ''))) AS email_key
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
             """,
@@ -12405,7 +12405,7 @@ def list_classified_monthly():
                 s.participant_email,
                 s.room_name,
                 s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
               AND s.room_name IS NOT NULL AND s.room_name != ''
@@ -12461,7 +12461,7 @@ def list_classified_monthly():
                 -- writes its own row. Bucketing to 30-second windows keeps
                 -- one count per polling cycle regardless of source.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
@@ -12474,7 +12474,7 @@ def list_classified_monthly():
         room_occupancy AS (
             SELECT snapshot_time, room_name,
                    COUNT(DISTINCT LOWER(TRIM(participant_name))) as cnt
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND room_name IS NOT NULL AND room_name != ''
               AND LOWER(participant_name) NOT LIKE '%scout%'
@@ -12486,7 +12486,7 @@ def list_classified_monthly():
                 LOWER(TRIM(s.participant_name)) as name_key,
                 -- Bucket to 30-second windows to dedup multi-source polls.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN room_occupancy ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
@@ -12650,7 +12650,7 @@ def employee_attendance_detail(employee_id, date):
             -- that user's data.
             SELECT DISTINCT
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
               AND (
@@ -12667,7 +12667,7 @@ def employee_attendance_detail(employee_id, date):
                 s.participant_name,
                 s.room_name,
                 s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN emp_keys ek
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
@@ -12689,7 +12689,7 @@ def employee_attendance_detail(employee_id, date):
                 -- writes its own row. Bucketing to 30-second windows keeps
                 -- one count per polling cycle regardless of source.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN emp_keys ek
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
@@ -12735,7 +12735,7 @@ def employee_attendance_detail(employee_id, date):
             INNER JOIN (
                 SELECT snapshot_time, room_name,
                        COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as cnt
-                FROM `{dataset_ref}.room_snapshots`
+                FROM `{dataset_ref}.room_snapshots_v2`
                 WHERE event_date >= @start_date AND event_date <= @end_date
                   AND room_name IS NOT NULL AND room_name != ''
                   AND LOWER(participant_name) NOT LIKE '%scout%'
@@ -12894,7 +12894,7 @@ def employee_yearly_report(employee_id):
             -- that user's data.
             SELECT DISTINCT
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key
-            FROM `{dataset_ref}.room_snapshots`
+            FROM `{dataset_ref}.room_snapshots_v2`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
               AND (
@@ -12911,7 +12911,7 @@ def employee_yearly_report(employee_id):
                 s.participant_name,
                 s.room_name,
                 s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN emp_keys ek
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
@@ -12933,7 +12933,7 @@ def employee_yearly_report(employee_id):
                 -- writes its own row. Bucketing to 30-second windows keeps
                 -- one count per polling cycle regardless of source.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots` s
+            FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN emp_keys ek
                 ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
@@ -12981,7 +12981,7 @@ def employee_yearly_report(employee_id):
             INNER JOIN (
                 SELECT snapshot_time, room_name,
                        COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as cnt
-                FROM `{dataset_ref}.room_snapshots`
+                FROM `{dataset_ref}.room_snapshots_v2`
                 WHERE event_date >= @start_date AND event_date <= @end_date
                   AND room_name IS NOT NULL AND room_name != ''
                   AND LOWER(participant_name) NOT LIKE '%scout%'
@@ -13184,7 +13184,7 @@ def admin_update_role():
 
 @app.route('/admin/snapshots', methods=['GET'])
 def admin_search_snapshots():
-    """Search room_snapshots by date and optional participant name. Superadmin only."""
+    """Search room_snapshots_v2 by date and optional participant name. Superadmin only."""
     try:
         date_str = request.args.get('date')
         search = request.args.get('search', '').strip()
@@ -13203,7 +13203,7 @@ def admin_search_snapshots():
         query = f"""
         SELECT snapshot_id, snapshot_time, event_date, meeting_id, room_name,
                participant_name, participant_email, participant_uuid
-        FROM `{dataset_ref}.room_snapshots`
+        FROM `{dataset_ref}.room_snapshots_v2`
         WHERE event_date = @date{where_extra}
         ORDER BY participant_name, snapshot_time
         LIMIT 2000
@@ -13288,7 +13288,7 @@ def admin_edit_snapshots():
         # Use parameterized ARRAY to prevent SQL injection
         params.append(bigquery.ArrayQueryParameter("snapshot_ids", "STRING", snapshot_ids))
         query = f"""
-        UPDATE `{dataset_ref}.room_snapshots`
+        UPDATE `{dataset_ref}.room_snapshots_v2`
         SET {', '.join(sets)}
         WHERE snapshot_id IN UNNEST(@snapshot_ids)
         """
@@ -13319,7 +13319,7 @@ def admin_delete_snapshots():
         job_config = bigquery.QueryJobConfig(query_parameters=[
             bigquery.ArrayQueryParameter("snapshot_ids", "STRING", snapshot_ids)
         ])
-        query = f"DELETE FROM `{dataset_ref}.room_snapshots` WHERE snapshot_id IN UNNEST(@snapshot_ids)"
+        query = f"DELETE FROM `{dataset_ref}.room_snapshots_v2` WHERE snapshot_id IN UNNEST(@snapshot_ids)"
         result = client.query(query, job_config=job_config).result()
         deleted = result.num_dml_affected_rows if hasattr(result, 'num_dml_affected_rows') else len(snapshot_ids)
 
@@ -13357,7 +13357,7 @@ def admin_add_snapshot():
                 'inserted_at': datetime.now(IST).isoformat(),
             })
 
-        errors = client.insert_rows_json(f"{dataset_ref}.room_snapshots", bq_rows)
+        errors = client.insert_rows_json(f"{dataset_ref}.room_snapshots_v2", bq_rows)
         if errors:
             return jsonify({'success': False, 'error': str(errors)}), 500
 
@@ -14156,7 +14156,7 @@ def google_sheet_status():
 # PRESENCE INTERVALS - v2 report rebuild (Phase 1)
 # ==============================================================================
 # Single source of truth for duration aggregation. Built once per IST date from
-# room_snapshots + participant_events, then all team/attendance reports become
+# room_snapshots_v2 + participant_events, then all team/attendance reports become
 # trivial GROUP BY SUM queries against this table.
 #
 # Categories per row: 'main' | 'breakout' | 'break' (exclusive — every minute
@@ -14288,7 +14288,7 @@ def build_presence_intervals(date_str):
         s.room_name,
         {norm_sn} AS participant_key,
         DIV(UNIX_SECONDS(s.snapshot_time), {BUCKET_SECONDS}) AS bucket30
-      FROM `{dataset_ref}.room_snapshots` s
+      FROM `{dataset_ref}.room_snapshots_v2` s
       WHERE s.event_date = @date
         AND s.room_name IS NOT NULL AND s.room_name != ''
         AND s.participant_name IS NOT NULL AND s.participant_name != ''
