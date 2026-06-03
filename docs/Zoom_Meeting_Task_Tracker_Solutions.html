@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zoom Meeting Task Tracker - Solution Document</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 40px 20px;
+            background: #fff;
+        }
+
+        @media print {
+            body {
+                padding: 20px;
+                font-size: 11pt;
+            }
+            .page-break {
+                page-break-before: always;
+            }
+            h1, h2, h3 {
+                page-break-after: avoid;
+            }
+            table, pre {
+                page-break-inside: avoid;
+            }
+        }
+
+        h1 {
+            color: #1a365d;
+            font-size: 2.2em;
+            margin-bottom: 10px;
+            border-bottom: 3px solid #3182ce;
+            padding-bottom: 15px;
+        }
+
+        h2 {
+            color: #2c5282;
+            font-size: 1.5em;
+            margin-top: 35px;
+            margin-bottom: 15px;
+            border-left: 4px solid #3182ce;
+            padding-left: 15px;
+        }
+
+        h3 {
+            color: #2d3748;
+            font-size: 1.2em;
+            margin-top: 25px;
+            margin-bottom: 10px;
+        }
+
+        .meta {
+            color: #718096;
+            margin-bottom: 30px;
+        }
+
+        .meta p {
+            margin: 5px 0;
+        }
+
+        .summary-box {
+            background: #ebf8ff;
+            border: 1px solid #90cdf4;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+
+        .summary-box h3 {
+            color: #2b6cb0;
+            margin-top: 0;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            font-size: 0.95em;
+        }
+
+        th, td {
+            border: 1px solid #e2e8f0;
+            padding: 12px;
+            text-align: left;
+        }
+
+        th {
+            background: #edf2f7;
+            font-weight: 600;
+            color: #2d3748;
+        }
+
+        tr:nth-child(even) {
+            background: #f7fafc;
+        }
+
+        tr:hover {
+            background: #edf2f7;
+        }
+
+        pre {
+            background: #1a202c;
+            color: #e2e8f0;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.9em;
+            line-height: 1.5;
+            margin: 15px 0;
+        }
+
+        code {
+            background: #edf2f7;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.9em;
+        }
+
+        pre code {
+            background: none;
+            padding: 0;
+        }
+
+        ul, ol {
+            margin: 10px 0 10px 25px;
+        }
+
+        li {
+            margin: 8px 0;
+        }
+
+        .pros-cons {
+            display: flex;
+            gap: 20px;
+            margin: 15px 0;
+        }
+
+        .pros, .cons {
+            flex: 1;
+            padding: 15px;
+            border-radius: 8px;
+        }
+
+        .pros {
+            background: #f0fff4;
+            border: 1px solid #9ae6b4;
+        }
+
+        .cons {
+            background: #fff5f5;
+            border: 1px solid #feb2b2;
+        }
+
+        .pros h4 {
+            color: #276749;
+        }
+
+        .cons h4 {
+            color: #c53030;
+        }
+
+        .highlight {
+            background: #fffbeb;
+            border: 1px solid #f6e05e;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+        }
+
+        .recommendation {
+            background: #f0fff4;
+            border: 2px solid #48bb78;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+
+        .recommendation h3 {
+            color: #276749;
+            margin-top: 0;
+        }
+
+        .toc {
+            background: #f7fafc;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+
+        .toc h3 {
+            margin-top: 0;
+            margin-bottom: 15px;
+        }
+
+        .toc ol {
+            margin: 0;
+            padding-left: 20px;
+        }
+
+        .toc li {
+            margin: 8px 0;
+        }
+
+        .toc a {
+            color: #3182ce;
+            text-decoration: none;
+        }
+
+        .toc a:hover {
+            text-decoration: underline;
+        }
+
+        .cost-total {
+            font-weight: bold;
+            background: #ebf8ff;
+        }
+
+        .architecture-diagram {
+            background: #1a202c;
+            color: #e2e8f0;
+            padding: 20px;
+            border-radius: 8px;
+            font-family: 'Consolas', monospace;
+            font-size: 0.85em;
+            white-space: pre;
+            overflow-x: auto;
+            line-height: 1.4;
+        }
+
+        hr {
+            border: none;
+            border-top: 2px solid #e2e8f0;
+            margin: 30px 0;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 600;
+        }
+
+        .badge-recommended {
+            background: #48bb78;
+            color: white;
+        }
+
+        .badge-alternative {
+            background: #4299e1;
+            color: white;
+        }
+
+        .badge-complex {
+            background: #ed8936;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <h1>Zoom Meeting Task Tracker</h1>
+    <p class="meta" style="font-size: 1.1em; color: #4a5568;">Solution Document</p>
+
+    <div class="meta">
+        <p><strong>Version:</strong> 1.0</p>
+        <p><strong>Date:</strong> June 1, 2026</p>
+        <p><strong>Prepared for:</strong> Verve Internal Use</p>
+    </div>
+
+    <div class="summary-box">
+        <h3>Executive Summary</h3>
+        <p><strong>Goal:</strong> Automatically capture tasks assigned during Zoom meetings (Hinglish conversations), transcribe them, extract actionable items, and track them in Google Sheets for daily follow-up.</p>
+        <p style="margin-top: 10px;"><strong>Challenge:</strong> 4 hours of daily meetings = high transcription costs and complex recording requirements.</p>
+        <p style="margin-top: 10px;"><strong>Solution:</strong> A lightweight recording system integrated with Sarvam AI (Hinglish transcription), Claude AI (task extraction), and Google Sheets (tracking).</p>
+    </div>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ol>
+            <li><a href="#problem">Problem Statement</a></li>
+            <li><a href="#overview">Solution Options Overview</a></li>
+            <li><a href="#option1">Option 1: Desktop Recorder App</a> <span class="badge badge-recommended">Recommended</span></li>
+            <li><a href="#option2">Option 2: Chrome Extension</a></li>
+            <li><a href="#option3">Option 3: Zoom Local Recording + Watcher</a></li>
+            <li><a href="#option4">Option 4: Zoom Cloud Recording + Webhook</a></li>
+            <li><a href="#option5">Option 5: Custom Recording Bot</a></li>
+            <li><a href="#pipeline">Backend Processing Pipeline</a></li>
+            <li><a href="#costs">Cost Comparison</a></li>
+            <li><a href="#sheets">Google Sheet Structure</a></li>
+            <li><a href="#roadmap">Implementation Roadmap</a></li>
+            <li><a href="#recommendation">Final Recommendation</a></li>
+        </ol>
+    </div>
+
+    <hr>
+
+    <h2 id="problem">1. Problem Statement</h2>
+
+    <h3>Current Situation</h3>
+    <ul>
+        <li>Manager conducts ~4 hours of Zoom meetings daily</li>
+        <li>Conversations are in <strong>Hinglish</strong> (Hindi + English mix)</li>
+        <li>Tasks are assigned verbally to employees</li>
+        <li>No systematic tracking of assigned tasks</li>
+        <li>Next-day follow-up is difficult without written records</li>
+    </ul>
+
+    <h3>Requirements</h3>
+    <table>
+        <tr><th>Requirement</th><th>Priority</th></tr>
+        <tr><td>Record meeting audio</td><td>Must Have</td></tr>
+        <tr><td>Transcribe Hinglish accurately</td><td>Must Have</td></tr>
+        <tr><td>Extract tasks with assignee names</td><td>Must Have</td></tr>
+        <tr><td>Store in Google Sheets</td><td>Must Have</td></tr>
+        <tr><td>Minimal manual intervention</td><td>Should Have</td></tr>
+        <tr><td>Low operational cost</td><td>Should Have</td></tr>
+    </table>
+
+    <h3>Constraints</h3>
+    <ul>
+        <li>Zoom Business+ plan may not be available (no cloud recording API)</li>
+        <li>Recording 4 hours daily = storage and cost considerations</li>
+        <li>Hinglish requires specialized transcription (not standard English ASR)</li>
+    </ul>
+
+    <hr class="page-break">
+
+    <h2 id="overview">2. Solution Options Overview</h2>
+
+    <table>
+        <tr>
+            <th>Option</th>
+            <th>Recording Method</th>
+            <th>Install Required</th>
+            <th>Zoom Plan</th>
+            <th>Complexity</th>
+            <th>Cost/Month</th>
+        </tr>
+        <tr style="background: #f0fff4;">
+            <td><strong>1. Desktop Recorder App</strong></td>
+            <td>System audio capture</td>
+            <td>Yes (one-time)</td>
+            <td>Any</td>
+            <td>Low</td>
+            <td>~5,000</td>
+        </tr>
+        <tr>
+            <td>2. Chrome Extension</td>
+            <td>Tab audio capture</td>
+            <td>Yes (extension)</td>
+            <td>Any (browser)</td>
+            <td>Low</td>
+            <td>~5,000</td>
+        </tr>
+        <tr>
+            <td>3. Local Recording + Watcher</td>
+            <td>Zoom native local</td>
+            <td>Yes (script)</td>
+            <td>Any</td>
+            <td>Medium</td>
+            <td>~5,000</td>
+        </tr>
+        <tr>
+            <td>4. Cloud Recording + Webhook</td>
+            <td>Zoom cloud</td>
+            <td>No</td>
+            <td>Business+</td>
+            <td>Low</td>
+            <td>~7,500</td>
+        </tr>
+        <tr>
+            <td>5. Custom Recording Bot</td>
+            <td>Meeting SDK</td>
+            <td>No</td>
+            <td>Any</td>
+            <td>High</td>
+            <td>~8,000</td>
+        </tr>
+    </table>
+
+    <hr>
+
+    <h2 id="option1">3. Option 1: Desktop Recorder App <span class="badge badge-recommended">Recommended</span></h2>
+
+    <h3>Overview</h3>
+    <p>A lightweight desktop application installed on HR's computer that captures system audio (whatever plays through speakers/headphones).</p>
+
+    <h3>Architecture</h3>
+    <div class="architecture-diagram">
++----------------------------------------------------------+
+|                    HR's Computer                          |
+|  +----------------------------------------------------+  |
+|  |  RECORDER APP (Python/Electron)                    |  |
+|  |                                                    |  |
+|  |   +-------------+    +-------------+               |  |
+|  |   | Start       |    | Stop        |               |  |
+|  |   | Recording   |    | & Upload    |               |  |
+|  |   +-------------+    +-------------+               |  |
+|  |                                                    |  |
+|  |   Status: Recording... (01:23:45)                  |  |
+|  +----------------------------------------------------+  |
+|                          |                               |
+|     Captures system audio (Zoom meeting audio)           |
+|                          v                               |
+|             [meeting_2026-06-01.mp3]                     |
++---------------------------+------------------------------+
+                            | Upload on Stop
+                            v
+                   +----------------+
+                   |  GCS Bucket    |
+                   +-------+--------+
+                           | Triggers Cloud Function
+                           v
+            +--------------+--------------+
+            v              v              v
+      +---------+    +---------+    +---------+
+      | Sarvam  |    | Claude  |    | Google  |
+      | AI      |--->| AI      |--->| Sheets  |
+      |Transcribe    | Extract |    | Write   |
+      +---------+    +---------+    +---------+
+    </div>
+
+    <h3>How It Works</h3>
+    <ol>
+        <li>HR opens the recorder app before meeting</li>
+        <li>Clicks "Start Recording" when meeting begins</li>
+        <li>App captures all system audio (including Zoom)</li>
+        <li>HR clicks "Stop & Upload" when meeting ends</li>
+        <li>App compresses audio to MP3 and uploads to GCS</li>
+        <li>Backend pipeline processes automatically</li>
+    </ol>
+
+    <div class="pros-cons">
+        <div class="pros">
+            <h4>Pros</h4>
+            <ul>
+                <li>Works with ANY Zoom plan</li>
+                <li>Full control over recording</li>
+                <li>High quality audio capture</li>
+                <li>Simple implementation</li>
+                <li>No Zoom API dependency</li>
+            </ul>
+        </div>
+        <div class="cons">
+            <h4>Cons</h4>
+            <ul>
+                <li>Requires one-time install</li>
+                <li>HR must remember to start/stop</li>
+                <li>Only captures one computer's audio</li>
+                <li>Needs system audio permissions</li>
+            </ul>
+        </div>
+    </div>
+
+    <p><strong>Estimated Build Time:</strong> 1-2 days</p>
+
+    <hr class="page-break">
+
+    <h2 id="option2">4. Option 2: Chrome Extension <span class="badge badge-alternative">Alternative</span></h2>
+
+    <h3>Overview</h3>
+    <p>A Chrome extension that captures audio from the Zoom browser tab. HR must join Zoom meeting via Chrome browser (not desktop app).</p>
+
+    <h3>How It Works</h3>
+    <ol>
+        <li>HR joins Zoom meeting in Chrome browser</li>
+        <li>Clicks extension icon → "Start Recording"</li>
+        <li>Extension captures tab audio using <code>chrome.tabCapture</code></li>
+        <li>On stop, uploads to GCS</li>
+        <li>Processing pipeline runs</li>
+    </ol>
+
+    <div class="pros-cons">
+        <div class="pros">
+            <h4>Pros</h4>
+            <ul>
+                <li>No desktop app install</li>
+                <li>Clean tab-only audio</li>
+                <li>Easy to distribute</li>
+                <li>Automatic updates</li>
+            </ul>
+        </div>
+        <div class="cons">
+            <h4>Cons</h4>
+            <ul>
+                <li>Must use Zoom in browser</li>
+                <li>Browser Zoom has fewer features</li>
+                <li>Chrome-only</li>
+                <li>Tab must stay active</li>
+            </ul>
+        </div>
+    </div>
+
+    <p><strong>Estimated Build Time:</strong> 2-3 days</p>
+
+    <hr>
+
+    <h2 id="option3">5. Option 3: Zoom Local Recording + Watcher</h2>
+
+    <h3>Overview</h3>
+    <p>Uses Zoom's built-in local recording feature. A background script watches the Zoom recordings folder and auto-uploads new files.</p>
+
+    <h3>How It Works</h3>
+    <ol>
+        <li>HR uses Zoom's normal "Record" button</li>
+        <li>Zoom saves MP4 to local folder when meeting ends</li>
+        <li>Watcher script detects new recording</li>
+        <li>Extracts audio, compresses, uploads</li>
+        <li>Optionally deletes local file to save space</li>
+    </ol>
+
+    <div class="pros-cons">
+        <div class="pros">
+            <h4>Pros</h4>
+            <ul>
+                <li>Uses Zoom's own recording (best quality)</li>
+                <li>HR uses familiar Zoom interface</li>
+                <li>Works offline (uploads later)</li>
+                <li>Any Zoom plan</li>
+            </ul>
+        </div>
+        <div class="cons">
+            <h4>Cons</h4>
+            <ul>
+                <li>Needs background script</li>
+                <li>Slight delay (process after meeting)</li>
+                <li>Local storage used temporarily</li>
+                <li>Script must run continuously</li>
+            </ul>
+        </div>
+    </div>
+
+    <p><strong>Estimated Build Time:</strong> 1 day</p>
+
+    <hr class="page-break">
+
+    <h2 id="option4">6. Option 4: Zoom Cloud Recording + Webhook</h2>
+
+    <h3>Overview</h3>
+    <p>Uses Zoom's cloud recording feature with webhook notification. Fully automated, no HR intervention needed.</p>
+
+    <div class="highlight">
+        <strong>Requirement:</strong> Zoom Business+ plan (required for cloud recording API)
+    </div>
+
+    <h3>How It Works</h3>
+    <ol>
+        <li>Cloud recording enabled for Zoom account</li>
+        <li>Automatically records all meetings</li>
+        <li>Meeting ends → Zoom processes recording (5-30 min)</li>
+        <li>Zoom sends webhook: <code>recording.completed</code></li>
+        <li>Backend downloads via Zoom API → processes</li>
+    </ol>
+
+    <div class="pros-cons">
+        <div class="pros">
+            <h4>Pros</h4>
+            <ul>
+                <li>Fully automated</li>
+                <li>No HR intervention</li>
+                <li>Reliable (Zoom handles recording)</li>
+                <li>Works even if HR forgets</li>
+            </ul>
+        </div>
+        <div class="cons">
+            <h4>Cons</h4>
+            <ul>
+                <li>Requires Business+ plan</li>
+                <li>5-30 min processing delay</li>
+                <li>Zoom storage limits apply</li>
+                <li>Monthly Zoom cost increase</li>
+            </ul>
+        </div>
+    </div>
+
+    <p><strong>Estimated Build Time:</strong> 1-2 days</p>
+
+    <hr>
+
+    <h2 id="option5">7. Option 5: Custom Recording Bot <span class="badge badge-complex">Complex</span></h2>
+
+    <h3>Overview</h3>
+    <p>A dedicated bot participant that joins meetings and records audio using Zoom Meeting SDK. Most complex but most powerful.</p>
+
+    <h3>Technical Requirements</h3>
+    <ul>
+        <li>Zoom Meeting SDK license</li>
+        <li>Server with audio processing capabilities</li>
+        <li>Meeting SDK app in Zoom Marketplace</li>
+    </ul>
+
+    <div class="pros-cons">
+        <div class="pros">
+            <h4>Pros</h4>
+            <ul>
+                <li>Fully automated</li>
+                <li>Real-time streaming possible</li>
+                <li>Works with any plan</li>
+                <li>Bot visible in participants</li>
+            </ul>
+        </div>
+        <div class="cons">
+            <h4>Cons</h4>
+            <ul>
+                <li>Complex implementation</li>
+                <li>Requires Meeting SDK license</li>
+                <li>Needs dedicated server</li>
+                <li>Higher maintenance</li>
+            </ul>
+        </div>
+    </div>
+
+    <p><strong>Estimated Build Time:</strong> 1-2 weeks</p>
+
+    <hr class="page-break">
+
+    <h2 id="pipeline">8. Backend Processing Pipeline</h2>
+
+    <p>This pipeline is common to ALL recording options above.</p>
+
+    <div class="architecture-diagram">
++----------------------------------------------------------+
+|  CLOUD STORAGE (GCS)                                      |
+|  Bucket: gs://verve-meeting-recordings/                   |
+|  New file: meeting_2026-06-01_10-30.mp3                   |
++----------------------------+-----------------------------+
+                             | Triggers Cloud Function
+                             v
++----------------------------------------------------------+
+|  CLOUD FUNCTION: process-meeting-recording                |
+|                                                           |
+|  Step 1: Download audio from GCS                          |
+|                                                           |
+|  Step 2: Split into chunks (if > 30 min)                  |
+|          (Sarvam has file size/duration limits)           |
+|                                                           |
+|  Step 3: Transcribe with Sarvam AI                        |
+|          - Handles Hinglish (Hindi + English)             |
+|          - Returns text with timestamps                   |
+|                                                           |
+|  Step 4: Extract tasks with Claude AI                     |
+|          - Prompt: "Extract tasks, assignees, deadlines"  |
+|          - Returns structured JSON                        |
+|                                                           |
+|  Step 5: Write to Google Sheets                           |
+|          - Appends rows to tracking sheet                 |
+|                                                           |
+|  Step 6: Send notification (optional)                     |
+|          - Email/Slack summary                            |
++----------------------------------------------------------+
+    </div>
+
+    <h3>Sarvam AI Integration</h3>
+    <pre><code>import requests
+
+def transcribe_with_sarvam(audio_path):
+    url = "https://api.sarvam.ai/speech-to-text"
+
+    headers = {"Authorization": f"Bearer {SARVAM_API_KEY}"}
+
+    with open(audio_path, "rb") as f:
+        files = {"file": f}
+        data = {
+            "model": "saarika:v1",
+            "language_code": "hi-IN",  # Handles Hinglish
+            "with_timestamps": True
+        }
+        response = requests.post(url, headers=headers,
+                                 files=files, data=data)
+
+    return response.json()["transcript"]</code></pre>
+
+    <h3>Claude AI Task Extraction</h3>
+    <pre><code>import anthropic
+
+def extract_tasks(transcript):
+    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+
+    prompt = f"""
+    Analyze this meeting transcript and extract all tasks.
+    The conversation is in Hinglish (Hindi + English mix).
+
+    For each task, identify:
+    1. Task description (in English)
+    2. Assignee name
+    3. Deadline (if mentioned)
+    4. Priority (High/Medium/Low)
+
+    Return as JSON array.
+
+    Transcript: {transcript}
+    """
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return json.loads(response.content[0].text)</code></pre>
+
+    <hr class="page-break">
+
+    <h2 id="costs">9. Cost Comparison</h2>
+
+    <h3>Monthly Cost Breakdown (4 hrs/day, 22 working days)</h3>
+
+    <table>
+        <tr>
+            <th>Component</th>
+            <th>Calculation</th>
+            <th>Cost (INR)</th>
+            <th>Cost (USD)</th>
+        </tr>
+        <tr>
+            <td><strong>Sarvam AI</strong></td>
+            <td>240 min x 22 days x Rs.0.75/min</td>
+            <td>Rs.3,960</td>
+            <td>$47</td>
+        </tr>
+        <tr>
+            <td><strong>Claude API</strong></td>
+            <td>~60k tokens x 22 days</td>
+            <td>Rs.1,000</td>
+            <td>$12</td>
+        </tr>
+        <tr>
+            <td><strong>GCS Storage</strong></td>
+            <td>~3 GB/month</td>
+            <td>Rs.10</td>
+            <td>$0.12</td>
+        </tr>
+        <tr>
+            <td><strong>Cloud Functions</strong></td>
+            <td>~22 invocations</td>
+            <td>Free</td>
+            <td>Free</td>
+        </tr>
+        <tr>
+            <td><strong>Google Sheets</strong></td>
+            <td>API calls</td>
+            <td>Free</td>
+            <td>Free</td>
+        </tr>
+        <tr class="cost-total">
+            <td><strong>Total (Processing)</strong></td>
+            <td></td>
+            <td><strong>Rs.4,970</strong></td>
+            <td><strong>$59</strong></td>
+        </tr>
+    </table>
+
+    <h3>Additional Costs by Option</h3>
+    <table>
+        <tr>
+            <th>Option</th>
+            <th>Additional Cost</th>
+            <th>Total Monthly</th>
+        </tr>
+        <tr style="background: #f0fff4;">
+            <td>1. Desktop App</td>
+            <td>Rs.0 (one-time build)</td>
+            <td><strong>Rs.4,970</strong></td>
+        </tr>
+        <tr>
+            <td>2. Chrome Extension</td>
+            <td>Rs.0 (one-time build)</td>
+            <td>Rs.4,970</td>
+        </tr>
+        <tr>
+            <td>3. Local + Watcher</td>
+            <td>Rs.0 (one-time build)</td>
+            <td>Rs.4,970</td>
+        </tr>
+        <tr>
+            <td>4. Cloud Recording</td>
+            <td>Rs.2,000-5,000 (Zoom upgrade)</td>
+            <td>Rs.7,000-10,000</td>
+        </tr>
+        <tr>
+            <td>5. Recording Bot</td>
+            <td>Rs.3,000 (SDK + server)</td>
+            <td>Rs.8,000</td>
+        </tr>
+    </table>
+
+    <h3>Alternative Transcription Services</h3>
+    <table>
+        <tr>
+            <th>Service</th>
+            <th>Cost/Minute</th>
+            <th>Monthly (5,280 min)</th>
+            <th>Hinglish Quality</th>
+        </tr>
+        <tr style="background: #f0fff4;">
+            <td><strong>Sarvam AI</strong></td>
+            <td>Rs.0.75</td>
+            <td>Rs.3,960</td>
+            <td>Excellent</td>
+        </tr>
+        <tr>
+            <td>OpenAI Whisper</td>
+            <td>$0.006</td>
+            <td>$31.68 (Rs.2,640)</td>
+            <td>Good</td>
+        </tr>
+        <tr>
+            <td>Google STT</td>
+            <td>$0.016</td>
+            <td>$84.48 (Rs.7,040)</td>
+            <td>Good</td>
+        </tr>
+        <tr>
+            <td>Deepgram</td>
+            <td>$0.0043</td>
+            <td>$22.70 (Rs.1,890)</td>
+            <td>Moderate</td>
+        </tr>
+    </table>
+
+    <hr class="page-break">
+
+    <h2 id="sheets">10. Google Sheet Structure</h2>
+
+    <h3>Sheet: "Meeting Tasks"</h3>
+    <table>
+        <tr>
+            <th>Column</th>
+            <th>Description</th>
+            <th>Example</th>
+        </tr>
+        <tr><td>A: Date</td><td>Meeting date</td><td>2026-06-01</td></tr>
+        <tr><td>B: Time</td><td>Extraction time</td><td>10:32 AM</td></tr>
+        <tr><td>C: Task</td><td>Task description</td><td>Complete Q2 sales report</td></tr>
+        <tr><td>D: Assignee</td><td>Person responsible</td><td>Rahul Sharma</td></tr>
+        <tr><td>E: Deadline</td><td>Due date</td><td>June 5, 2026</td></tr>
+        <tr><td>F: Context</td><td>Brief context</td><td>Discussed in Q2 review</td></tr>
+        <tr><td>G: Priority</td><td>High/Medium/Low</td><td>High</td></tr>
+        <tr><td>H: Status</td><td>Pending/In Progress/Done</td><td>Pending</td></tr>
+    </table>
+
+    <h3>Conditional Formatting</h3>
+    <ul>
+        <li style="color: #c53030;"><strong>Red:</strong> Overdue tasks (Deadline < Today, Status != Done)</li>
+        <li style="color: #d69e2e;"><strong>Yellow:</strong> Due today</li>
+        <li style="color: #38a169;"><strong>Green:</strong> Completed tasks</li>
+    </ul>
+
+    <hr>
+
+    <h2 id="roadmap">11. Implementation Roadmap</h2>
+
+    <h3>Phase 1: MVP (Week 1)</h3>
+    <table>
+        <tr><th>Day</th><th>Task</th></tr>
+        <tr><td>1</td><td>Set up GCS bucket + Cloud Function skeleton</td></tr>
+        <tr><td>2</td><td>Build Python desktop recorder app</td></tr>
+        <tr><td>3</td><td>Integrate Sarvam AI transcription</td></tr>
+        <tr><td>4</td><td>Integrate Claude task extraction</td></tr>
+        <tr><td>5</td><td>Set up Google Sheets + test end-to-end</td></tr>
+    </table>
+
+    <h3>Phase 2: Polish (Week 2)</h3>
+    <table>
+        <tr><th>Day</th><th>Task</th></tr>
+        <tr><td>6</td><td>Add error handling, retry logic</td></tr>
+        <tr><td>7</td><td>Build installer for recorder app</td></tr>
+        <tr><td>8</td><td>Create daily summary automation</td></tr>
+        <tr><td>9</td><td>Add Slack/Email notifications</td></tr>
+        <tr><td>10</td><td>Documentation + HR training</td></tr>
+    </table>
+
+    <hr class="page-break">
+
+    <h2 id="recommendation">12. Final Recommendation</h2>
+
+    <div class="recommendation">
+        <h3>Recommended: Option 1 - Desktop Recorder App</h3>
+        <ol>
+            <li><strong>Works with ANY Zoom plan</strong> - no upgrade needed</li>
+            <li><strong>Simple to build</strong> - 1-2 days development</li>
+            <li><strong>Reliable</strong> - captures high-quality system audio</li>
+            <li><strong>Low cost</strong> - only API costs (~Rs.5,000/month)</li>
+            <li><strong>Full control</strong> - no dependency on Zoom features</li>
+        </ol>
+    </div>
+
+    <h3>Recommended Architecture</h3>
+    <div class="architecture-diagram">
++----------------------------------------------------------+
+|                RECOMMENDED ARCHITECTURE                    |
+|                                                           |
+|  +----------+    +----------+    +----------+             |
+|  | Python   |--->| GCS      |--->| Cloud    |             |
+|  | Recorder |    | Bucket   |    | Function |             |
+|  | App      |    |          |    |          |             |
+|  +----------+    +----------+    +----+-----+             |
+|                                       |                   |
+|                       +---------------+-------+           |
+|                       v                       v           |
+|                 +----------+           +----------+       |
+|                 | Sarvam   |---------->| Claude   |       |
+|                 | AI       |           | AI       |       |
+|                 +----------+           +----+-----+       |
+|                                             |             |
+|                                             v             |
+|                                      +----------+         |
+|                                      | Google   |         |
+|                                      | Sheets   |         |
+|                                      +----------+         |
++----------------------------------------------------------+
+    </div>
+
+    <h3>Next Steps</h3>
+    <ol>
+        <li><strong>Confirm Sarvam AI access</strong> - Get API key</li>
+        <li><strong>Create Google Sheet</strong> - Set up structure</li>
+        <li><strong>Build recorder app</strong> - 1-2 days</li>
+        <li><strong>Set up GCS + Cloud Function</strong> - 1 day</li>
+        <li><strong>Test end-to-end</strong> - 1 day</li>
+        <li><strong>Train HR</strong> - 30 minutes</li>
+    </ol>
+
+    <hr>
+
+    <h2>Appendix: API Keys Required</h2>
+    <table>
+        <tr>
+            <th>Service</th>
+            <th>Key Type</th>
+            <th>Where to Get</th>
+        </tr>
+        <tr><td>Sarvam AI</td><td>API Key</td><td>https://sarvam.ai</td></tr>
+        <tr><td>Claude AI</td><td>API Key</td><td>https://console.anthropic.com</td></tr>
+        <tr><td>GCS</td><td>Service Account</td><td>GCP Console</td></tr>
+        <tr><td>Google Sheets</td><td>Service Account</td><td>GCP Console</td></tr>
+    </table>
+
+    <hr>
+    <p style="text-align: center; color: #718096; margin-top: 40px;">
+        <strong>Document End</strong><br>
+        <em>For questions or implementation support, contact the development team.</em>
+    </p>
+
+</body>
+</html>

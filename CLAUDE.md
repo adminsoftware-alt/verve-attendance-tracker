@@ -12,9 +12,9 @@ This file provides complete guidance to Claude Code when working with this repos
 - Scout Bot VM auto-joins meetings; HR clicks app once to start monitoring
 
 **Cloud Run URLs:**
-- Backend API: `https://breakout-room-calibrator-1073587167150.us-central1.run.app`
-- Frontend UI: `https://attendance-frontend-1073587167150.us-central1.run.app`
-- Zoom App Home: `https://breakout-room-calibrator-1073587167150.us-central1.run.app/app`
+- Backend API: `https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app`
+- Frontend UI: `https://attendance-frontend-4e5na4tdha-uc.a.run.app`
+- Zoom App Home: `https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/app`
 
 **GCP Project:** `verve-attendance-tracker` (Project #: 1073587167150)
 **BigQuery Dataset:** `breakout_room_calibrator`
@@ -302,26 +302,26 @@ meeting_state.event_dedup_cache   # Dict: event_hash -> timestamp
 
 ### Manual Report Generation
 ```bash
-curl -X POST "https://breakout-room-calibrator-1041741270489.us-central1.run.app/report/generate" \
+curl -X POST "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/report/generate" \
   -H "Content-Type: application/json" \
   -d '{"date": "2026-02-19"}'
 ```
 
 ### Check Camera Status
 ```bash
-curl -X POST "https://breakout-room-calibrator-1041741270489.us-central1.run.app/test/camera-qos" \
+curl -X POST "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/test/camera-qos" \
   -H "Content-Type: application/json" \
   -d '{"meeting_id": "123456789", "search": "John"}'
 ```
 
 ### Force Reload Mappings
 ```bash
-curl -X POST "https://breakout-room-calibrator-1041741270489.us-central1.run.app/calibration/reload"
+curl -X POST "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/calibration/reload"
 ```
 
 ### Check Health
 ```bash
-curl "https://breakout-room-calibrator-1041741270489.us-central1.run.app/health"
+curl "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/health"
 ```
 
 ## Troubleshooting

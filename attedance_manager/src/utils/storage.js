@@ -3,7 +3,7 @@
  * Replaces Supabase with direct BigQuery API calls
  */
 
-const API_BASE = 'https://breakout-room-calibrator-1073587167150.us-central1.run.app';
+const API_BASE = 'https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app';
 
 const STORAGE_KEY = 'verve_attendance_data';
 
