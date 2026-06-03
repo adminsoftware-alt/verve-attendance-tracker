@@ -14667,8 +14667,11 @@ def build_presence_intervals(date_str):
                 # A real mass-exit stays low; a one-bucket polling blip does not.
                 if all(len(presence_by_bucket.get(scan + i, ())) < threshold
                        for i in range(sustain)):
+                    # Keep tz-aware (UTC): the interval start_ts values parsed
+                    # below come from BigQuery timestamps and are tz-aware, so
+                    # the cutoff must be too or the comparison raises.
                     inherited_cutoff_utc = datetime.fromtimestamp(
-                        scan * BUCKET_SECONDS, _tz.utc).replace(tzinfo=None)
+                        scan * BUCKET_SECONDS, _tz.utc)
                     break
                 scan += 1
             if inherited_cutoff_utc is None:
