@@ -15216,6 +15216,12 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
     stale_settling = []  # today/yesterday whose materialization is stale
     for r in rows:
         d = r.day.isoformat()
+        # NEVER build future dates: they have no source data yet, and an empty
+        # partition stays at 0 rows, so they'd look "missing" and get rebuilt on
+        # EVERY load — e.g. viewing the current month rebuilds all remaining
+        # days of the month each time, adding ~20s+ of pointless latency.
+        if d > today_ist:
+            continue
         if not r.has_rows:
             if d not in settling:
                 missing.append(d)
