@@ -17,9 +17,9 @@ This system captures participant activity in Zoom meetings and breakout rooms. T
 ### URLs
 | Service | URL |
 |---------|-----|
-| **Frontend (UI)** | `https://attendance-frontend-1073587167150.us-central1.run.app` |
-| **Backend API** | `https://breakout-room-calibrator-1073587167150.us-central1.run.app` |
-| **Zoom App Home** | `https://breakout-room-calibrator-1073587167150.us-central1.run.app/app` |
+| **Frontend (UI)** | `https://attendance-frontend-4e5na4tdha-uc.a.run.app` |
+| **Backend API** | `https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app` |
+| **Zoom App Home** | `https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/app` |
 
 ### IDs & Credentials
 | Item | Value |
@@ -256,20 +256,20 @@ gcloud.cmd run services logs read breakout-room-calibrator --region us-central1 
 
 ```bash
 # Health check
-curl "https://breakout-room-calibrator-1073587167150.us-central1.run.app/health"
+curl "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/health"
 
 # Login test
-curl -X POST "https://breakout-room-calibrator-1073587167150.us-central1.run.app/auth/login" \
+curl -X POST "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/auth/login" \
   -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"verve2026"}'
 
 # Generate report
-curl -X POST "https://breakout-room-calibrator-1073587167150.us-central1.run.app/report/generate" \
+curl -X POST "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/report/generate" \
   -H "Content-Type: application/json" \
   -d '{"date": "2026-04-06"}'
 
 # Check monitor
-curl "https://breakout-room-calibrator-1073587167150.us-central1.run.app/monitor/health"
+curl "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/monitor/health"
 ```
 
 ---

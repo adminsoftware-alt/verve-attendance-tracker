@@ -14174,6 +14174,11 @@ GAP_THRESHOLD_SECONDS = 300          # >5min gap between snapshots = new interva
 BUCKET_SECONDS = 30                  # 30s dedup bucket (multi-source polling)
 MAIN_ROOM_SYNTH_CAP_MINUTES = 600    # Cap any single synthesized Main Room interval
 MAIN_ROOM_SYNTH_MIN_SECONDS = 120    # Don't synthesize gaps smaller than 2min
+# Recent days (today/yesterday) are kept fresh by the hourly + nightly rebuild
+# Cloud Scheduler jobs. The Team View pivot only re-materializes one of those
+# days on view if it's gone STALER than this (a scheduler missed/died) — so a
+# healthy system pays no rebuild latency, but a dead scheduler self-heals.
+SETTLING_STALE_MINUTES = int(os.environ.get('SETTLING_STALE_MINUTES', '90'))
 # --- Inherited-meeting (overnight-spillover) guard ------------------------
 # Zoom meetings can run 24h+. When one is left running across IST midnight its
 # tail lands on the NEXT day's partition starting at ~00:00, with the whole
@@ -15156,28 +15161,48 @@ def report_compare():
 
 
 def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
-    """Find dates in [start, end] with no presence_intervals rows and build
-    up to max_builds of them. Returns (built_count, still_missing_count).
+    """Build presence_intervals for dates in [start, end] that need it, and
+    return (built_count, still_missing_count).
 
-    For wide ranges users navigate to, this lets them see something even if
-    backfill wasn't run — but caps the per-request cost. Beyond the cap,
-    /intervals/backfill is the right tool.
+    Freshness for recent days is owned by Cloud Scheduler:
+      - an hourly job rebuilds TODAY  (so the pivot is never >1h stale), and
+      - a nightly job rebuilds YESTERDAY at 00:30 IST (after it completes).
+    This function is the lazy/self-healing backstop on top of that:
+      1. Dates with NO rows yet: built once, capped at max_builds, so a wide
+         range the user navigates to still shows something even if backfill
+         wasn't run. Already-built older days are stable — left alone.
+      2. The still-settling window (TODAY/YESTERDAY IST) is rebuilt ONLY if its
+         materialization is STALE (older than SETTLING_STALE_MINUTES). That way
+         if a scheduler ever dies (e.g. pointed at a dead URL), opening the view
+         self-heals the frozen day — but a freshly-built day adds no latency.
+         Builds are idempotent (load-job WRITE_TRUNCATE) so re-running is safe.
     """
     client = get_bq_client()
     dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
     _ensure_presence_intervals_table()
+
+    # Still-settling window: today + yesterday IST, intersected with the range.
+    today_ist = get_ist_date()
+    yesterday_ist = (get_ist_now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    settling = {d for d in (today_ist, yesterday_ist) if start_date <= d <= end_date}
+
+    # Per-date row count + freshness in one pass.
     q = f"""
     WITH wanted AS (
       SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(@start, @end)) AS day
     ),
     built AS (
-      SELECT DISTINCT event_date FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+      SELECT event_date, MAX(built_at) AS last_built
+      FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
       WHERE event_date BETWEEN @start AND @end
+      GROUP BY event_date
     )
-    SELECT w.day
+    SELECT
+      w.day,
+      b.event_date IS NOT NULL AS has_rows,
+      TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), b.last_built, MINUTE) AS age_min
     FROM wanted w
     LEFT JOIN built b ON w.day = b.event_date
-    WHERE b.event_date IS NULL
     ORDER BY w.day DESC
     """
     rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
@@ -15186,8 +15211,28 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
             bigquery.ScalarQueryParameter("end", "DATE", end_date),
         ]
     )).result())
-    missing = [r.day.isoformat() for r in rows]
+
+    missing = []        # older dates never built
+    stale_settling = []  # today/yesterday whose materialization is stale
+    for r in rows:
+        d = r.day.isoformat()
+        if not r.has_rows:
+            if d not in settling:
+                missing.append(d)
+            else:
+                stale_settling.append(d)  # in window but never built -> build
+        elif d in settling and (r.age_min is None or r.age_min >= SETTLING_STALE_MINUTES):
+            stale_settling.append(d)
+
     built = 0
+    # 1. Refresh stale today/yesterday first (self-healing backstop).
+    for d in sorted(stale_settling, reverse=True):
+        try:
+            build_presence_intervals(d)
+            built += 1
+        except Exception as e:
+            print(f"[AutoBuildRange] settling-day {d} failed: {e}")
+    # 2. Build older never-built dates, capped.
     for d in missing[:max_builds]:
         try:
             build_presence_intervals(d)

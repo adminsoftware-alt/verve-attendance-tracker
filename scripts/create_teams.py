@@ -2,7 +2,7 @@
 import json
 import urllib.request
 
-API = 'https://breakout-room-calibrator-1073587167150.us-central1.run.app'
+API = 'https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app'
 
 members = [
     {"name":"Aditya Agarwal","team_name":"Team Infrabeat","manager_name":"Team Infrabeat"},

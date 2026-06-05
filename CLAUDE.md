@@ -224,7 +224,7 @@ ZOOM_CLIENT_ID        # Server-to-Server OAuth app
 ZOOM_CLIENT_SECRET    # Server-to-Server OAuth app
 ZOOM_WEBHOOK_SECRET   # Webhook validation
 ZOOM_ACCOUNT_ID       # Account ID for API calls
-GCP_PROJECT_ID        # variant-finance-data-project
+GCP_PROJECT_ID        # verve-attendance-tracker
 SENDGRID_API_KEY      # For email reports
 REPORT_EMAIL_TO       # Recipients (comma or semicolon separated)
 ```
