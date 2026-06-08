@@ -7717,10 +7717,13 @@ def team_attendance(team_id, date):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        # Big query: get team info, members, and their attendance from snapshots
-        # Grouping is keyed by participant_uuid (via a name-to-uuid bridge from
-        # SDK snapshots), so a participant who renames mid-meeting (Shashank ->
-        # Shashank-1) stays as one person across all metrics.
+        # Use normalized names for participant_key. This handles:
+        # 1. UUID changes when a participant reconnects mid-meeting
+        # 2. Zoom rejoin suffixes like "-1", "- DND", etc.
+        # 3. Spacing/casing differences between team roster and Zoom display name
+        norm_snap = _sql_normalize_name('s.participant_name')
+        norm_tm = _sql_normalize_name('tm.participant_name')
+
         query = f"""
         WITH team_info AS (
             SELECT team_id, team_name, manager_name
@@ -7732,15 +7735,17 @@ def team_attendance(team_id, date):
             FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
             WHERE team_id = @team_id
         ),
-        -- Identity bridge: every (UUID, name) pair seen in snapshots today.
+        -- Identity bridge: normalized name -> all snapshot names that match.
+        -- Using normalized names instead of UUIDs because UUIDs can change
+        -- when a participant reconnects mid-meeting.
         participant_name_map AS (
             SELECT DISTINCT
-                COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
-                LOWER(TRIM(participant_name)) as name_key,
-                NULLIF(LOWER(TRIM(participant_email)), '') as email_key
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date = @report_date
-              AND participant_name IS NOT NULL AND participant_name != ''
+                {norm_snap} as participant_key,
+                LOWER(TRIM(s.participant_name)) as name_key,
+                NULLIF(LOWER(TRIM(s.participant_email)), '') as email_key
+            FROM `{dataset_ref}.room_snapshots_v2` s
+            WHERE s.event_date = @report_date
+              AND s.participant_name IS NOT NULL AND s.participant_name != ''
         ),
         -- Separate lookups to avoid OR-join cartesian products
         name_to_key AS (
@@ -7754,10 +7759,10 @@ def team_attendance(team_id, date):
             WHERE email_key IS NOT NULL
             GROUP BY email_key
         ),
-        -- Resolve each team member to the UUID-based key used downstream.
+        -- Resolve each team member to normalized name key.
         team_member_keys AS (
             SELECT DISTINCT
-                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(tm.participant_name))) as participant_key
+                COALESCE(etk.participant_key, ntk.participant_key, {norm_tm}) as participant_key
             FROM team_members tm
             LEFT JOIN email_to_key etk
                 ON NULLIF(LOWER(TRIM(tm.participant_email)), '') = etk.email_key
@@ -7770,11 +7775,11 @@ def team_attendance(team_id, date):
                 s.participant_name,
                 s.participant_email,
                 s.room_name,
-                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                {norm_snap} as participant_key,
                 TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist
             FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
-                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+                ON {norm_snap} = tmk.participant_key
             WHERE s.event_date = @report_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
@@ -7782,7 +7787,7 @@ def team_attendance(team_id, date):
             -- Dedupe: one row per (participant, snapshot_time). Prevents the
             -- SDK-transition case where a user appears in two rooms at once.
             QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
+                PARTITION BY {norm_snap},
                              s.snapshot_time
                 ORDER BY
                     CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
@@ -7792,12 +7797,12 @@ def team_attendance(team_id, date):
         -- Break time from BREAK TIME room visits
         break_room_summary AS (
             SELECT
-                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                {norm_snap} as participant_key,
                 -- Bucket to 30s windows to dedup multi-source polls.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as break_room_seconds
             FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
-                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+                ON {norm_snap} = tmk.participant_key
             WHERE s.event_date = @report_date
               AND s.participant_name IS NOT NULL AND s.participant_name != ''
               AND LOWER(s.room_name) LIKE '%break time%'
@@ -7862,18 +7867,18 @@ def team_attendance(team_id, date):
         -- Matches the day view's behaviour, which treats Break Time presence
         -- as the only break signal.
         -- Isolation: times when participant was alone in their room.
-        -- Count distinct UUIDs per (snapshot_time, room) so renames don't
-        -- make a single person look like two room occupants.
+        -- Count distinct normalized names per (snapshot_time, room) so renames
+        -- and UUID changes don't make a single person look like two occupants.
         room_occupancy AS (
             SELECT
                 snapshot_time,
                 room_name,
-                COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as occupant_count
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date = @report_date
-              AND room_name IS NOT NULL AND room_name != ''
-              AND participant_name IS NOT NULL AND participant_name != ''
-              AND LOWER(participant_name) NOT LIKE '%scout%'
+                COUNT(DISTINCT {norm_snap}) as occupant_count
+            FROM `{dataset_ref}.room_snapshots_v2` s
+            WHERE s.event_date = @report_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND s.participant_name IS NOT NULL AND s.participant_name != ''
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
             GROUP BY snapshot_time, room_name
         ),
         isolation_snapshots AS (
@@ -8291,24 +8296,26 @@ def team_attendance_range(team_id):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        # Group per-day by participant_uuid (via name-to-uuid bridge from SDK
-        # snapshots) so renamers collapse into one row per day.
+        # Use normalized names for participant_key (same fix as team_attendance).
+        norm_snap = _sql_normalize_name('s.participant_name')
+        norm_tm = _sql_normalize_name('tm.participant_name')
+
         query = f"""
         WITH team_members AS (
             SELECT participant_name, participant_email
             FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
             WHERE team_id = @team_id
         ),
-        -- Identity bridge across the whole date range.
+        -- Identity bridge across the whole date range using normalized names.
         participant_name_map AS (
             SELECT DISTINCT
-                event_date,
-                COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
-                LOWER(TRIM(participant_name)) as name_key,
-                NULLIF(LOWER(TRIM(participant_email)), '') as email_key
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date >= @start_date AND event_date <= @end_date
-              AND participant_name IS NOT NULL AND participant_name != ''
+                s.event_date,
+                {norm_snap} as participant_key,
+                LOWER(TRIM(s.participant_name)) as name_key,
+                NULLIF(LOWER(TRIM(s.participant_email)), '') as email_key
+            FROM `{dataset_ref}.room_snapshots_v2` s
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.participant_name IS NOT NULL AND s.participant_name != ''
         ),
         -- Separate lookups to avoid OR-join cartesian products
         name_to_key AS (
@@ -8325,7 +8332,7 @@ def team_attendance_range(team_id):
         team_member_keys AS (
             SELECT DISTINCT
                 COALESCE(etk.event_date, ntk.event_date) as event_date,
-                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(tm.participant_name))) as participant_key
+                COALESCE(etk.participant_key, ntk.participant_key, {norm_tm}) as participant_key
             FROM team_members tm
             LEFT JOIN email_to_key etk
                 ON NULLIF(LOWER(TRIM(tm.participant_email)), '') = etk.email_key
@@ -8347,7 +8354,7 @@ def team_attendance_range(team_id):
             FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
-               AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+               AND {norm_snap} = tmk.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.room_name IS NOT NULL AND s.room_name != ''
               AND s.participant_name IS NOT NULL
@@ -8355,7 +8362,7 @@ def team_attendance_range(team_id):
               AND LOWER(s.room_name) NOT LIKE '%break time%'
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY s.event_date,
-                             COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
+                             {norm_snap},
                              s.snapshot_time
                 ORDER BY
                     CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
@@ -8366,7 +8373,7 @@ def team_attendance_range(team_id):
         break_room_time AS (
             SELECT
                 s.event_date,
-                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                {norm_snap} as participant_key,
                 -- Dedup multi-source duplicates: if the MonitorPanel is open
                 -- on >1 device (HR client + VM), each polls every 30s and
                 -- writes its own row. Bucketing to 30-second windows keeps
@@ -8375,7 +8382,7 @@ def team_attendance_range(team_id):
             FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
-               AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+               AND {norm_snap} = tmk.participant_key
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
               AND s.participant_name IS NOT NULL
               AND LOWER(s.participant_name) NOT LIKE '%scout%'
@@ -8388,15 +8395,15 @@ def team_attendance_range(team_id):
                 event_date,
                 participant_name,
                 room_name,
-                COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
+                {norm_snap} as participant_key,
                 snapshot_time,
                 TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
                 LAG(snapshot_time) OVER (
                     PARTITION BY event_date,
-                        COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))
+                        {norm_snap}
                     ORDER BY snapshot_time
                 ) as prev_snapshot
-            FROM deduped_snaps
+            FROM deduped_snaps s
         ),
         daily_stats AS (
             SELECT
@@ -8440,27 +8447,27 @@ def team_attendance_range(team_id):
         -- Gap-based break detection removed: long absences (left meeting /
         -- SDK outage) couldn't be distinguished from real breaks. Aligns
         -- with the day view's behaviour.
-        -- Count distinct UUIDs per (time, room) so renames don't inflate room occupancy
+        -- Count distinct normalized names per (time, room) so renames/UUID changes don't inflate occupancy
         room_occupancy AS (
-            SELECT snapshot_time, room_name,
-                   COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as occupant_count
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date >= @start_date AND event_date <= @end_date
-              AND room_name IS NOT NULL AND room_name != ''
-              AND participant_name IS NOT NULL
-              AND LOWER(participant_name) NOT LIKE '%scout%'
-            GROUP BY snapshot_time, room_name
+            SELECT s.snapshot_time, s.room_name,
+                   COUNT(DISTINCT {norm_snap}) as occupant_count
+            FROM `{dataset_ref}.room_snapshots_v2` s
+            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
+              AND s.room_name IS NOT NULL AND s.room_name != ''
+              AND s.participant_name IS NOT NULL
+              AND LOWER(s.participant_name) NOT LIKE '%scout%'
+            GROUP BY s.snapshot_time, s.room_name
         ),
         daily_isolation AS (
             SELECT
                 s.event_date,
-                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
+                {norm_snap} as participant_key,
                 -- Bucket to 30-second windows to dedup multi-source polls.
                 COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
             FROM `{dataset_ref}.room_snapshots_v2` s
             INNER JOIN team_member_keys tmk
                 ON s.event_date = tmk.event_date
-               AND COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = tmk.participant_key
+               AND {norm_snap} = tmk.participant_key
             INNER JOIN room_occupancy ro
                 ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
             WHERE s.event_date >= @start_date AND s.event_date <= @end_date
