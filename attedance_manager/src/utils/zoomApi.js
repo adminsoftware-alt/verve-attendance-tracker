@@ -61,13 +61,9 @@ export function transformSummaryToEmployees(summaryData) {
         session: p.name,
       }));
 
-    // Day View only: include Break Time in the displayed duration so HR
-    // sees the full meeting span. p.total_duration_mins from the backend
-    // excludes Break Time (kept that way for CSV exports + team view
-    // logic). Sum room visit durations directly to add it back here.
-    const totalMin = rooms.length
-      ? rooms.reduce((sum, r) => sum + (r.duration || 0), 0)
-      : (p.total_duration_mins || 0);
+    // Use the backend aggregate total. Summing rounded room-visit minutes can
+    // lose time across several 30-second intervals and drift from Team View.
+    const totalMin = p.total_duration_mins || 0;
     const h = Math.floor(totalMin / 60);
     const m = Math.round(totalMin % 60);
 

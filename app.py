@@ -456,6 +456,17 @@ ALERT_RATE_LIMIT_SECONDS = 300  # Max 1 alert per 5 minutes (for stale/error ale
 ALERT_START_HOUR = 0  # 12 AM IST (24-hour monitoring)
 ALERT_END_HOUR = 24  # 12 AM IST (24-hour monitoring)
 
+# WhatsApp Alert Configuration
+# Option 1: WAHA (self-hosted, unlimited, free) - Recommended
+# Option 2: Callmebot (free but limited)
+WAHA_API_URL = os.environ.get('WAHA_API_URL', '')  # e.g., http://34.47.178.82:3000
+WAHA_SESSION = os.environ.get('WAHA_SESSION', 'default')  # WAHA session name
+
+# Callmebot fallback
+WHATSAPP_PHONE = os.environ.get('WHATSAPP_ALERT_PHONE', '')  # Your phone with country code, e.g., +919876543210
+WHATSAPP_APIKEY = os.environ.get('WHATSAPP_ALERT_APIKEY', '')  # Callmebot API key
+WHATSAPP_RATE_LIMIT_SECONDS = 60  # Max 1 WhatsApp alert per minute
+
 # Rate limiting state - per alert type
 _email_alert_state = {
     'stale': {'last_time': 0, 'count_today': 0},
@@ -3227,6 +3238,97 @@ def send_email_alert(subject, html_body):
 
 
 # ─────────────────────────────────────────────────────────
+# WHATSAPP ALERT (via Callmebot - free service)
+# Setup: Send "I allow callmebot to send me messages" to +34 644 71 81 99 on WhatsApp
+# ─────────────────────────────────────────────────────────
+
+_whatsapp_last_sent = 0  # Timestamp of last WhatsApp alert
+
+def send_whatsapp_alert(message):
+    """
+    Send WhatsApp alert via WAHA (primary) or Callmebot (fallback).
+    Rate limited to 1 message per WHATSAPP_RATE_LIMIT_SECONDS.
+    """
+    global _whatsapp_last_sent
+
+    # Check if any provider is configured
+    waha_configured = bool(WAHA_API_URL and WHATSAPP_PHONE)
+    callmebot_configured = bool(WHATSAPP_PHONE and WHATSAPP_APIKEY)
+
+    if not waha_configured and not callmebot_configured:
+        print("[WhatsApp] Not configured (set WAHA_API_URL or WHATSAPP_ALERT_APIKEY)")
+        return {'success': False, 'error': 'WhatsApp not configured'}
+
+    # Rate limiting
+    now = time.time()
+    time_since = now - _whatsapp_last_sent
+    if time_since < WHATSAPP_RATE_LIMIT_SECONDS:
+        wait = int(WHATSAPP_RATE_LIMIT_SECONDS - time_since)
+        print(f"[WhatsApp] Rate limited, wait {wait}s")
+        return {'success': False, 'error': f'Rate limited, wait {wait}s'}
+
+    # Try WAHA first (self-hosted, unlimited)
+    if waha_configured:
+        try:
+            # Format phone number for WAHA (remove + and add @c.us)
+            phone_clean = WHATSAPP_PHONE.replace('+', '').replace(' ', '')
+            chat_id = f"{phone_clean}@c.us"
+
+            response = requests.post(
+                f"{WAHA_API_URL}/api/sendText",
+                json={
+                    "chatId": chat_id,
+                    "text": message,
+                    "session": WAHA_SESSION
+                },
+                timeout=10
+            )
+
+            if response.status_code == 200 or response.status_code == 201:
+                _whatsapp_last_sent = now
+                print(f"[WhatsApp] Alert sent via WAHA to {WHATSAPP_PHONE}")
+                return {'success': True, 'phone': WHATSAPP_PHONE, 'provider': 'waha'}
+            else:
+                print(f"[WhatsApp] WAHA failed: {response.status_code} - {response.text[:100]}")
+                # Fall through to Callmebot
+        except Exception as e:
+            print(f"[WhatsApp] WAHA error: {e}, trying Callmebot...")
+
+    # Fallback to Callmebot
+    if callmebot_configured:
+        try:
+            import urllib.parse
+            encoded_msg = urllib.parse.quote(message)
+            url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={encoded_msg}&apikey={WHATSAPP_APIKEY}"
+
+            response = requests.get(url, timeout=10)
+
+            if response.status_code == 200 and 'Message queued' in response.text:
+                _whatsapp_last_sent = now
+                print(f"[WhatsApp] Alert sent via Callmebot to {WHATSAPP_PHONE}")
+                return {'success': True, 'phone': WHATSAPP_PHONE, 'provider': 'callmebot'}
+            else:
+                print(f"[WhatsApp] Callmebot failed: {response.status_code} - {response.text[:100]}")
+                return {'success': False, 'error': response.text[:100]}
+
+        except Exception as e:
+            print(f"[WhatsApp] Callmebot error: {e}")
+            return {'success': False, 'error': str(e)}
+
+    return {'success': False, 'error': 'All providers failed'}
+
+
+def send_stale_whatsapp_alert(seconds_since):
+    """Send WhatsApp alert when monitoring stops."""
+    mins = int(seconds_since / 60) if seconds_since else 0
+    ist_time = get_ist_now().strftime('%H:%M')
+
+    message = f"🚨 ZOOM MONITORING STOPPED!\n\n⏰ Time: {ist_time} IST\n⏱️ Last data: {mins} min ago\n\n👉 Please check the Scout Bot VM and restart the Zoom app."
+
+    return send_whatsapp_alert(message)
+
+
+# ─────────────────────────────────────────────────────────
 # ALERT: Bot Joined Meeting
 # ─────────────────────────────────────────────────────────
 def send_alert_bot_joined(participant_name, meeting_id):
@@ -3508,16 +3610,20 @@ def check_and_send_stale_alert():
                 'seconds_since_last': seconds_since
             }
 
-        # Mark as stale and send stale alert
+        # Mark as stale and send stale alert (Email + WhatsApp)
         _email_alert_state['was_stale'] = True
         send_result = send_alert_stale_data(seconds_since, status)
 
+        # Also send WhatsApp alert for immediate notification
+        whatsapp_result = send_stale_whatsapp_alert(seconds_since)
+
         return {
-            'alert_sent': send_result.get('success', False),
+            'alert_sent': send_result.get('success', False) or whatsapp_result.get('success', False),
             'alert_type': 'stale',
             'status': status,
             'seconds_since_last': seconds_since,
-            'send_result': send_result
+            'email_result': send_result,
+            'whatsapp_result': whatsapp_result
         }
 
     except Exception as e:
@@ -3650,6 +3756,95 @@ def email_alert_status():
         'alert_types': alert_types_status,
         'current_hour_ist': ist_hour
     })
+
+
+# ─────────────────────────────────────────────────────────
+# WHATSAPP ALERT ENDPOINTS
+# ─────────────────────────────────────────────────────────
+
+@app.route('/alert/whatsapp/test', methods=['POST'])
+def whatsapp_alert_test():
+    """Send a test WhatsApp message to verify configuration."""
+    ist_time = get_ist_now().strftime('%H:%M')
+    message = f"✅ TEST: Zoom Monitoring WhatsApp Alerts Working!\n\n⏰ Time: {ist_time} IST\n\nYou will receive alerts when monitoring stops."
+
+    # Bypass rate limiting for test
+    global _whatsapp_last_sent
+    _whatsapp_last_sent = 0
+
+    result = send_whatsapp_alert(message)
+    return jsonify(result)
+
+
+@app.route('/alert/whatsapp/status', methods=['GET'])
+def whatsapp_alert_status():
+    """Get WhatsApp alert configuration status."""
+    global _whatsapp_last_sent
+    now = time.time()
+    time_since = now - _whatsapp_last_sent if _whatsapp_last_sent > 0 else None
+
+    waha_configured = bool(WAHA_API_URL and WHATSAPP_PHONE)
+    callmebot_configured = bool(WHATSAPP_PHONE and WHATSAPP_APIKEY)
+
+    return jsonify({
+        'configured': waha_configured or callmebot_configured,
+        'providers': {
+            'waha': {
+                'configured': waha_configured,
+                'url': WAHA_API_URL[:30] + '...' if WAHA_API_URL and len(WAHA_API_URL) > 30 else WAHA_API_URL,
+                'session': WAHA_SESSION
+            },
+            'callmebot': {
+                'configured': callmebot_configured
+            }
+        },
+        'phone': WHATSAPP_PHONE[:6] + '****' if WHATSAPP_PHONE else None,
+        'rate_limit_seconds': WHATSAPP_RATE_LIMIT_SECONDS,
+        'seconds_since_last': int(time_since) if time_since else None,
+        'can_send': time_since is None or time_since >= WHATSAPP_RATE_LIMIT_SECONDS
+    })
+
+
+@app.route('/alert/check-fast', methods=['GET', 'POST'])
+def fast_alert_check():
+    """
+    Fast health check for 30-second monitoring.
+    Call this from Cloud Scheduler every 30 seconds during meeting hours.
+    Only sends WhatsApp alerts (not email) to avoid spam.
+    """
+    today = get_ist_date()
+    try:
+        client = get_bq_client()
+        query = f"""
+        SELECT
+          MAX(snapshot_time) as last_snapshot,
+          TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(snapshot_time), SECOND) as seconds_since_last
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
+        WHERE event_date = '{today}'
+        """
+        result = list(client.query(query).result())
+        row = result[0] if result else {}
+
+        seconds_since = row.get('seconds_since_last', None)
+
+        # If no data or stale > 60 seconds, send WhatsApp alert
+        if seconds_since is None or seconds_since > 60:
+            whatsapp_result = send_stale_whatsapp_alert(seconds_since or 0)
+            return jsonify({
+                'status': 'STALE',
+                'seconds_since_last': seconds_since,
+                'whatsapp_sent': whatsapp_result.get('success', False),
+                'whatsapp_result': whatsapp_result
+            })
+
+        return jsonify({
+            'status': 'HEALTHY',
+            'seconds_since_last': seconds_since
+        })
+
+    except Exception as e:
+        print(f"[FastCheck] Error: {e}")
+        return jsonify({'status': 'ERROR', 'error': str(e)}), 500
 
 
 # Rate limiter for signature error logging
@@ -14203,6 +14398,15 @@ INHERITED_EXIT_SUSTAIN_BUCKETS = int(os.environ.get('INHERITED_EXIT_SUSTAIN_BUCK
 IST_OFFSET_MINUTES = 330
 
 
+def _whole_minutes_from_seconds(seconds):
+    """Convert stored duration seconds to whole elapsed minutes."""
+    return int((seconds or 0) // 60)
+
+
+def _sql_whole_minutes(seconds_expr):
+    return f"CAST(FLOOR(COALESCE({seconds_expr}, 0) / 60.0) AS INT64)"
+
+
 def _classify_room(room_name):
     """Return 'main' | 'breakout' | 'break' for a room name.
     Matches v1 conventions at app.py:7753, 7760, 7775."""
@@ -14345,10 +14549,12 @@ def build_presence_intervals(date_str):
     ))
     buckets = list(job.result())
 
-    # Last snapshot anywhere = monitoring window end (cap for synthesis)
-    monitoring_end = None
+    # Last snapshot anywhere = initial monitoring window end.
+    # This will be extended in Step 2b if webhooks continued after snapshots stopped.
+    last_snapshot_time = None
     if buckets:
-        monitoring_end = max(b.bucket_end for b in buckets)
+        last_snapshot_time = max(b.bucket_end for b in buckets)
+    monitoring_end = last_snapshot_time  # Will be updated after Step 2
 
     # ----- Step 2: webhook timestamps per participant ----------------------
     # Use the SAME canonical key formula as snapshots (normalized name)
@@ -14441,6 +14647,22 @@ def build_presence_intervals(date_str):
         r.participant_key: _build_presence_windows(r.events)
         for r in events_rows
     }
+
+    # ----- Step 2c: extend monitoring_end if webhooks continued after snapshots -----
+    # When SDK monitoring stops but webhooks keep flowing, use the latest webhook
+    # event time as the cap. This prevents discarding valid webhook data.
+    last_webhook_time = None
+    for wh in webhook_by_key.values():
+        if wh.meeting_left and (last_webhook_time is None or wh.meeting_left > last_webhook_time):
+            last_webhook_time = wh.meeting_left
+
+    if last_webhook_time:
+        if monitoring_end is None:
+            monitoring_end = last_webhook_time
+        elif last_webhook_time > monitoring_end:
+            # Webhooks continued after snapshots stopped — extend the window
+            print(f"[PresenceIntervals] Extending monitoring_end from {monitoring_end} to {last_webhook_time} (webhooks continued after snapshot outage)")
+            monitoring_end = last_webhook_time
 
     def _present_intersection_seconds(start, end, windows):
         """Total seconds within [start, end] that fall inside any window."""
@@ -14994,11 +15216,11 @@ def team_attendance_v2(team_id, date):
             tm.member_email,
             pm.display_name AS participant_name,
             pm.display_email AS participant_email,
-            CEILING(COALESCE(pm.main_seconds,0)     / 60.0) AS main_room_mins,
-            CEILING(COALESCE(pm.breakout_seconds,0) / 60.0) AS breakout_mins,
-            CEILING(COALESCE(pm.break_seconds,0)    / 60.0) AS break_minutes,
-            CEILING(COALESCE(pm.isolation_seconds,0)/ 60.0) AS isolation_minutes,
-            CEILING(COALESCE(pm.total_seconds,0)    / 60.0) AS total_duration_mins,
+            {_sql_whole_minutes('pm.main_seconds')} AS main_room_mins,
+            {_sql_whole_minutes('pm.breakout_seconds')} AS breakout_mins,
+            {_sql_whole_minutes('pm.break_seconds')} AS break_minutes,
+            {_sql_whole_minutes('pm.isolation_seconds')} AS isolation_minutes,
+            {_sql_whole_minutes('pm.total_seconds')} AS total_duration_mins,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
         FROM team_members tm
@@ -15321,11 +15543,11 @@ def team_attendance_range_v2(team_id):
         SELECT
             pd.member_name AS name, pd.member_email AS email,
             CAST(pd.event_date AS STRING) AS date,
-            CEILING(COALESCE(pd.main_seconds,0)/60.0)     AS main_room_minutes,
-            CEILING(COALESCE(pd.breakout_seconds,0)/60.0) AS breakout_minutes,
-            CEILING(COALESCE(pd.break_seconds,0)/60.0)    AS break_minutes,
-            CEILING(COALESCE(pd.isolation_seconds,0)/60.0) AS isolation_minutes,
-            CEILING(COALESCE(pd.total_seconds,0)/60.0)    AS active_minutes,
+            {_sql_whole_minutes('pd.main_seconds')} AS main_room_minutes,
+            {_sql_whole_minutes('pd.breakout_seconds')} AS breakout_minutes,
+            {_sql_whole_minutes('pd.break_seconds')} AS break_minutes,
+            {_sql_whole_minutes('pd.isolation_seconds')} AS isolation_minutes,
+            {_sql_whole_minutes('pd.total_seconds')} AS active_minutes,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
         FROM per_day pd
@@ -15500,11 +15722,11 @@ def team_monthly_report_v2(team_id):
         SELECT
             pd.member_name AS name, pd.member_email AS email,
             CAST(pd.event_date AS STRING) AS date,
-            CEILING(COALESCE(pd.main_seconds,0)/60.0)     AS main_room_minutes,
-            CEILING(COALESCE(pd.breakout_seconds,0)/60.0) AS breakout_minutes,
-            CEILING(COALESCE(pd.break_seconds,0)/60.0)    AS break_minutes,
-            CEILING(COALESCE(pd.isolation_seconds,0)/60.0) AS isolation_minutes,
-            CEILING(COALESCE(pd.total_seconds,0)/60.0)    AS active_minutes,
+            {_sql_whole_minutes('pd.main_seconds')} AS main_room_minutes,
+            {_sql_whole_minutes('pd.breakout_seconds')} AS breakout_minutes,
+            {_sql_whole_minutes('pd.break_seconds')} AS break_minutes,
+            {_sql_whole_minutes('pd.isolation_seconds')} AS isolation_minutes,
+            {_sql_whole_minutes('pd.total_seconds')} AS active_minutes,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
         FROM per_day pd
@@ -15719,7 +15941,7 @@ def attendance_summary_v2(date):
                     'room_category':     iv.room_category,
                     'room_joined_ist':   _fmt_ist(iv.start_ts),
                     'room_left_ist':     _fmt_ist(iv.end_ts),
-                    'room_duration_mins': int((iv.duration_seconds or 0) / 60),
+                    'room_duration_mins': _whole_minutes_from_seconds(iv.duration_seconds),
                     'source':            iv.source,
                 })
             participants.append({
@@ -15727,8 +15949,8 @@ def attendance_summary_v2(date):
                 'email':               info['email'] or '',
                 'first_seen_ist':      _fmt_ist(first_seen),
                 'last_seen_ist':       _fmt_ist(last_seen),
-                'total_duration_mins': int(round(total_seconds / 60.0)),
-                'isolation_minutes':   int(round(isolation_seconds / 60.0)),
+                'total_duration_mins': _whole_minutes_from_seconds(total_seconds),
+                'isolation_minutes':   _whole_minutes_from_seconds(isolation_seconds),
                 'room_visits':         room_visits,
             })
 

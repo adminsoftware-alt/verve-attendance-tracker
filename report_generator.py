@@ -151,8 +151,8 @@ def generate_daily_report(report_date=None):
     Generate daily attendance report with ONE ROW PER PARTICIPANT
     All times in IST (UTC + 5:30)
 
-    MONITOR MODE: Room history is built from SDK polling snapshots (room_snapshots table).
-    Main room join/leave still comes from webhooks (participant_events table).
+    MONITOR MODE: Room history is read from the materialized presence_intervals
+    table, the same source used by the v2 dashboard endpoints.
 
     Args:
         report_date: Date string 'YYYY-MM-DD' (defaults to yesterday)
@@ -172,9 +172,105 @@ def generate_daily_report(report_date=None):
     except ValueError:
         raise ValueError(f"Invalid date: {report_date}")
 
-    print(f"[Report] Generating report for {report_date} (IST) using SDK snapshots")
+    print(f"[Report] Generating report for {report_date} (IST) using presence_intervals")
 
     client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+    # Auto-build presence_intervals if not yet materialized for this date
+    try:
+        from app import build_presence_intervals, _ensure_presence_intervals_table
+        _ensure_presence_intervals_table()
+        check_q = f"""
+        SELECT COUNT(*) AS n FROM `{dataset_ref}.presence_intervals`
+        WHERE event_date = DATE '{report_date}'
+        """
+        check_rows = list(client.query(check_q).result())
+        if not check_rows or (check_rows[0].n or 0) == 0:
+            print(f"[Report] No intervals for {report_date} — auto-building")
+            build_presence_intervals(report_date)
+    except Exception as e:
+        print(f"[Report] Auto-build check/run failed: {e}")
+
+    # v2 canonical report path: presence_intervals already contains
+    # deduped, gap-filled, timezone-bucketed attendance intervals. Keep the
+    # existing CSV shape while removing the legacy room_snapshots query path.
+    main_query = f"""
+    WITH intervals AS (
+      SELECT
+        participant_key,
+        participant_name,
+        participant_email,
+        room_name,
+        start_ts,
+        end_ts,
+        duration_seconds
+      FROM `{dataset_ref}.presence_intervals`
+      WHERE event_date = DATE '{report_date}'
+        AND participant_name IS NOT NULL
+        AND participant_name != ''
+        AND LOWER(participant_name) NOT LIKE '%scout%'
+        AND COALESCE(duration_seconds, 0) > 0
+    ),
+    per_participant AS (
+      SELECT
+        participant_key,
+        ARRAY_AGG(participant_name IGNORE NULLS ORDER BY end_ts DESC LIMIT 1)[OFFSET(0)] AS Name,
+        ARRAY_AGG(NULLIF(participant_email, '') IGNORE NULLS ORDER BY end_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS Email,
+        MIN(start_ts) AS first_seen_utc,
+        MAX(end_ts) AS last_seen_utc,
+        CAST(FLOOR(SUM(COALESCE(duration_seconds, 0)) / 60.0) AS INT64) AS Total_Duration_Minutes
+      FROM intervals
+      GROUP BY participant_key
+    ),
+    room_history AS (
+      SELECT
+        participant_key,
+        STRING_AGG(
+          FORMAT(
+            '%s [Joined: %s | Left: %s | Duration: %dmin]',
+            room_name,
+            FORMAT_TIMESTAMP('%H:%M', start_ts, 'Asia/Kolkata'),
+            FORMAT_TIMESTAMP('%H:%M', end_ts, 'Asia/Kolkata'),
+            CAST(FLOOR(COALESCE(duration_seconds, 0) / 60.0) AS INT64)
+          ),
+          ' -> '
+          ORDER BY start_ts
+        ) AS Room_History
+      FROM intervals
+      GROUP BY participant_key
+    )
+    SELECT
+      p.Name,
+      COALESCE(p.Email, '') AS Email,
+      FORMAT_TIMESTAMP('%H:%M', p.first_seen_utc, 'Asia/Kolkata') AS Main_Joined_IST,
+      FORMAT_TIMESTAMP('%H:%M', p.last_seen_utc, 'Asia/Kolkata') AS Main_Left_IST,
+      p.Total_Duration_Minutes,
+      h.Room_History
+    FROM per_participant p
+    JOIN room_history h USING (participant_key)
+    WHERE p.Total_Duration_Minutes > 0
+    ORDER BY p.Name
+    """
+
+    try:
+        results = list(client.query(main_query).result())
+        print(f"[Report] Query returned {len(results)} participants")
+    except Exception as e:
+        print(f"[Report] Query error: {e}")
+        results = []
+
+    report = {
+        'report_date': report_date,
+        'generated_at': datetime.utcnow().isoformat(),
+        'total_participants': len(results),
+        'participants': [dict(row) for row in results],
+        'source': 'presence_intervals_v2',
+    }
+    report['csv_content'] = generate_csv(report)
+
+    print(f"[Report] Generated report with {len(results)} participants")
+    return report
 
     # =============================================
     # MAIN QUERY - ONE ROW PER PARTICIPANT

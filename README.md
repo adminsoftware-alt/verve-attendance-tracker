@@ -44,15 +44,9 @@ This system captures participant activity in Zoom meetings and breakout rooms. T
 
 ### Scout Bot VM
 | Setting | Value |
-|---------|-------|
-| VM Name | `scout-bot-vm` |
-| External IP | `34.47.178.82` |
-| Zone | `asia-south1-a` |
-| Machine Type | `e2-medium` (2 vCPU, 4GB RAM) |
-| OS | Windows Server |
-| Username | `dataapps` |
-| Password | `ScoutBot2026` |
-
+|-ip_address: 35.253.3.126
+password:   bq>2eR@qw~9fq8S
+username:   dataapps
 ---
 
 ## Architecture

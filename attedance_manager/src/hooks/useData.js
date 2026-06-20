@@ -92,28 +92,32 @@ export function useDayData(dateStr, refreshKey) {
     let cancelled = false;
     setLoading(true);
 
-    // 1) try uploaded CSV data first; 2) fall back to Zoom summary (SDK snapshots);
-    // 3) then live rooms. This lets users navigate any past date with arrows and
-    // still see room history even if no CSV was uploaded.
+    // Priority: 1) Zoom summary API (has correct duration totals from presence_intervals)
+    // 2) Live rooms API (for ongoing meetings); 3) Uploaded CSV data (fallback only).
+    // This ensures totals always come from backend calculations, not stale uploads.
     (async () => {
       let result = null;
+
+      // Try Zoom summary first - this has correct totals from presence_intervals
       try {
-        result = await getDayData(dateStr);
-      } catch (e) { /* ignore, try API */ }
+        const summary = await fetchSummary(dateStr);
+        const emps = transformSummaryToEmployees(summary);
+        if (emps.length > 0) result = emps;
+      } catch (e) { /* try live */ }
 
-      if (!result || result.length === 0) {
-        try {
-          const summary = await fetchSummary(dateStr);
-          const emps = transformSummaryToEmployees(summary);
-          if (emps.length > 0) result = emps;
-        } catch (e) { /* try live */ }
-      }
-
+      // Try live rooms for ongoing meetings
       if (!result || result.length === 0) {
         try {
           const live = await fetchLiveRooms(dateStr);
           const emps = transformLiveToEmployees(live);
           if (emps.length > 0) result = emps;
+        } catch (e) { /* try stored */ }
+      }
+
+      // Fall back to uploaded CSV data only if API unavailable
+      if (!result || result.length === 0) {
+        try {
+          result = await getDayData(dateStr);
         } catch (e) { /* no data */ }
       }
 
