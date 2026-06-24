@@ -28,6 +28,12 @@ function getParticipantEmail(p) {
   return p.email || p.participantEmail || p.user_email || '';
 }
 
+// Normalize UUID - remove curly braces and lowercase for consistent matching
+function normalizeUUID(uuid) {
+  if (!uuid) return '';
+  return String(uuid).replace(/[{}]/g, '').toLowerCase().trim();
+}
+
 // Extract meeting ID from context (handles different SDK versions/formats)
 function extractMeetingId(context) {
   if (!context) return '';
@@ -112,12 +118,20 @@ function MonitorPanel() {
         try {
           rooms = await withRetry(getBreakoutRooms, 'getBreakoutRoomList', 2);
 
-          // Build room UUID -> name mapping
+          // Build room UUID -> name mapping (normalized for consistent matching)
           rooms.forEach(room => {
-            const uuid = room.breakoutRoomUUID || room.uuid || room.id || '';
+            const rawUuid = room.breakoutRoomUUID || room.uuid || room.id || '';
+            const uuid = normalizeUUID(rawUuid);
             const name = room.breakoutRoomName || room.name || 'Unknown';
             if (uuid) roomMap[uuid] = name;
           });
+
+          // Debug: log first few room UUIDs for troubleshooting
+          const sampleRooms = rooms.slice(0, 3).map(r => ({
+            raw: r.breakoutRoomUUID || r.uuid || r.id || '',
+            name: r.breakoutRoomName || r.name || ''
+          }));
+          console.log('Sample room UUIDs:', JSON.stringify(sampleRooms));
 
           // Update cache
           roomCacheRef.current = { rooms, roomMap, timestamp: now };
@@ -142,6 +156,14 @@ function MonitorPanel() {
       try {
         allParticipants = await withRetry(getParticipants, 'getMeetingParticipants', 2);
         addLog(`Got ${allParticipants.length} participants from SDK`);
+
+        // Debug: log first participant's fields to see what SDK returns
+        if (allParticipants.length > 0) {
+          const sample = allParticipants[0];
+          console.log('=== PARTICIPANT FIELDS DEBUG ===');
+          console.log('Full participant object:', JSON.stringify(sample, null, 2));
+          console.log('Available fields:', Object.keys(sample).join(', '));
+        }
       } catch (pErr) {
         addLog(`getMeetingParticipants failed: ${pErr.message}`);
         // Fall back to room.participants if available
@@ -153,49 +175,67 @@ function MonitorPanel() {
         return;
       }
 
-      // Build snapshot data - try both approaches
+      // Build snapshot data using BOTH approaches and merge them
+      // PRIMARY: getBreakoutRoomList() returns rooms WITH embedded participants (most reliable)
+      // SECONDARY: getMeetingParticipants() for Main Room participants (no breakout room)
       const roomData = [];
+      const seenParticipants = new Set(); // Track who we've seen in breakout rooms
 
-      // Approach 1: Use participants with breakoutRoomUUID
-      if (allParticipants.length > 0) {
-        // Group participants by their breakout room. Participants with no
-        // breakoutRoomUUID (or one that doesn't match any known breakout) are
-        // in the Main Room — record them under "Main Room" so reports can
-        // credit Main Room time from snapshots instead of inferring it from
-        // webhook gaps (which under-counts when SDK has full coverage).
-        const participantsByRoom = {};
-        const mainRoomParticipants = [];
-        allParticipants.forEach(p => {
-          const roomUUID = p.breakoutRoomUUID || p.boRoomUUID || '';
+      // Helper to check if name is Scout Bot
+      const isScoutBot = (name) => {
+        const pLower = name.toLowerCase();
+        return pLower.includes('scout bot') || pLower.includes('scoutbot') ||
+               pLower === 'scout s' || pLower.startsWith('scout ');
+      };
+
+      // APPROACH 1 (PRIMARY): Use room.participants from getBreakoutRoomList()
+      // This is the RELIABLE source - SDK embeds participants directly in each room
+      rooms.forEach(room => {
+        const roomName = room.breakoutRoomName || room.name || 'Unknown';
+        const roomParticipants = room.participants || room.members || room.attendees || [];
+
+        console.log(`Room "${roomName}" has ${roomParticipants.length} embedded participants`);
+
+        const validParticipants = roomParticipants.map(p => {
           const pName = getParticipantName(p);
           const pEmail = getParticipantEmail(p);
-
-          // Skip Scout Bot
-          if (pName.toLowerCase().includes('scout') && pName.toLowerCase().includes('bot')) {
-            return;
-          }
-
-          if (!pName) return;
-
-          const personEntry = {
+          return {
             name: pName,
             email: pEmail,
             uuid: p.participantUUID || p.uuid || p.id || ''
           };
-
-          if (roomUUID && roomMap[roomUUID]) {
-            if (!participantsByRoom[roomUUID]) {
-              participantsByRoom[roomUUID] = { room_name: roomMap[roomUUID], participants: [] };
-            }
-            participantsByRoom[roomUUID].participants.push(personEntry);
-          } else {
-            mainRoomParticipants.push(personEntry);
-          }
+        }).filter(p => {
+          if (!p.name) return false;
+          if (isScoutBot(p.name)) return false;
+          seenParticipants.add(p.name.toLowerCase()); // Track seen participants
+          return true;
         });
 
-        Object.values(participantsByRoom).forEach(room => {
-          if (room.participants.length > 0) {
-            roomData.push(room);
+        if (validParticipants.length > 0) {
+          roomData.push({ room_name: roomName, participants: validParticipants });
+        }
+      });
+
+      // APPROACH 2: Use getMeetingParticipants() for Main Room
+      // Anyone in allParticipants but NOT in a breakout room = Main Room
+      if (allParticipants.length > 0) {
+        const mainRoomParticipants = [];
+
+        allParticipants.forEach(p => {
+          const pName = getParticipantName(p);
+          const pEmail = getParticipantEmail(p);
+
+          if (!pName) return;
+          if (isScoutBot(pName)) return;
+
+          // If NOT already seen in a breakout room, they're in Main Room
+          if (!seenParticipants.has(pName.toLowerCase())) {
+            mainRoomParticipants.push({
+              name: pName,
+              email: pEmail,
+              uuid: p.participantUUID || p.uuid || p.id || ''
+            });
+            seenParticipants.add(pName.toLowerCase());
           }
         });
 
@@ -204,21 +244,11 @@ function MonitorPanel() {
         }
       }
 
-      // Approach 2: Fall back to room.participants if no participants from getMeetingParticipants
-      if (roomData.length === 0) {
-        rooms.forEach(room => {
-          const roomName = room.breakoutRoomName || room.name || 'Unknown';
-          const participants = (room.participants || room.members || room.attendees || []).map(p => ({
-            name: getParticipantName(p),
-            email: getParticipantEmail(p),
-            uuid: p.participantUUID || p.uuid || p.id || ''
-          })).filter(p => p.name && !p.name.toLowerCase().includes('scout bot'));
-
-          if (participants.length > 0) {
-            roomData.push({ room_name: roomName, participants });
-          }
-        });
-      }
+      // Debug logging
+      console.log('=== ROOM DATA SUMMARY ===');
+      roomData.forEach(r => {
+        console.log(`${r.room_name}: ${r.participants.map(p => p.name).join(', ')}`);
+      });
 
       const totalParticipants = roomData.reduce((sum, r) => sum + r.participants.length, 0);
 
