@@ -79,7 +79,7 @@ export default function TeamView({ user }) {
     setError(null);
     try {
       if (mode === 'daily') {
-        const data = await fetchTeamAttendance(selectedTeam, date);
+        const data = await fetchTeamAttendance(selectedTeam, date, true);
         setAttendance(data);
         setRangeData(null);
         setMonthlyData(null);
@@ -225,6 +225,21 @@ export default function TeamView({ user }) {
               <StatCard label="Absent" value={dailyStats.absent} sub={`of ${dailyStats.total}`} color="#ef4444" />
               <StatCard label="Avg Active" value={fmtMins(dailyStats.avgActive)} color="#3b82f6" />
               <StatCard label="Total Break" value={fmtMins(dailyStats.totalBreak)} color="#f97316" />
+            </div>
+          )}
+
+          {/* Name-drift warning: people in the meeting whose Zoom name matches
+              no roster member anywhere — their hours are invisible in Team
+              View until an admin fixes the roster name or email. */}
+          {(attendance.unmatched_participants || []).length > 0 && (
+            <div style={{
+              margin: '0 0 12px', padding: '10px 14px', borderRadius: 8,
+              background: '#fef3c7', border: '1px solid #f59e0b', fontSize: 12.5, color: '#92400e',
+            }}>
+              <strong>⚠ {attendance.unmatched_participants.length} participant(s) in the meeting don't match any team roster</strong>
+              {' — their hours are NOT counted in any team: '}
+              {attendance.unmatched_participants.map(u => u.name).join(', ')}
+              {'. Fix their name/email in the team roster to include them.'}
             </div>
           )}
 

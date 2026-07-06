@@ -87,8 +87,12 @@ export default function TeamDashboard({ user }) {
     const members = d.participants || [];
     members.forEach(m => {
       totalMembers++;
-      if (m.status === 'present') { totalPresent++; totalHours += (m.total_duration_mins || 0); }
-      else if (m.status === 'half_day') { totalHalfDay++; totalHours += (m.total_duration_mins || 0); }
+      // Total Hours counts EVERY member's minutes — someone at 3h59m
+      // (status absent) still worked those hours; excluding them made the
+      // dashboard total disagree with Day View.
+      totalHours += (m.total_duration_mins || 0);
+      if (m.status === 'present') { totalPresent++; }
+      else if (m.status === 'half_day') { totalHalfDay++; }
       else { totalAbsent++; allMissing.push({ name: m.name, team: t.team_name }); }
     });
   });

@@ -213,7 +213,9 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
                           first_seen_ist: dayRow?.first_seen_ist || '',
                           last_seen_ist: dayRow?.last_seen_ist || '',
                           status: dayRow?.status?.toLowerCase() || (h >= 5 ? 'present' : h >= 4 ? 'half_day' : 'absent'),
-                          total_duration_mins: dayRow?.active_minutes || Math.round(h * 60),
+                          // total_minutes (break included) drives status;
+                          // active_minutes (the pivot's hours) excludes break.
+                          total_duration_mins: dayRow?.total_minutes ?? dayRow?.active_minutes ?? Math.round(h * 60),
                           break_minutes: dayRow?.break_minutes || 0,
                           isolation_minutes: dayRow?.isolation_minutes || 0,
                         }, ds);

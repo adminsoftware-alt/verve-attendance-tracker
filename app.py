@@ -14376,6 +14376,12 @@ GAP_THRESHOLD_SECONDS = 300          # >5min gap between snapshots = new interva
 BUCKET_SECONDS = 30                  # 30s dedup bucket (multi-source polling)
 MAIN_ROOM_SYNTH_CAP_MINUTES = 600    # Cap any single synthesized Main Room interval
 MAIN_ROOM_SYNTH_MIN_SECONDS = 120    # Don't synthesize gaps smaller than 2min
+# When a participant's LEAVE webhook never arrived (laptop died, Zoom dropped
+# the event) we still credit them (join -> monitoring end) so a whole day isn't
+# lost — but capped tighter than a normal fill, because "no leave event" could
+# also mean they left and we never heard. 4h default = at most a half-day of
+# benefit-of-the-doubt, never a 10h phantom.
+WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES = int(os.environ.get('WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES', '240'))
 # Recent days (today/yesterday) are kept fresh by the hourly + nightly rebuild
 # Cloud Scheduler jobs. The Team View pivot only re-materializes one of those
 # days on view if it's gone STALER than this (a scheduler missed/died) — so a
@@ -14398,13 +14404,43 @@ INHERITED_EXIT_SUSTAIN_BUCKETS = int(os.environ.get('INHERITED_EXIT_SUSTAIN_BUCK
 IST_OFFSET_MINUTES = 330
 
 
+# In-process guard so "always rebuild today" endpoints don't hammer BigQuery:
+# a Dashboard load fires one attendance_v2 call PER TEAM, and each used to run
+# a full build_presence_intervals (5+ queries + a load job). One rebuild per
+# TODAY_REBUILD_MIN_INTERVAL_S per process keeps every view fresh to within
+# ~3 minutes while cutting BQ query volume by the number of teams.
+_TODAY_BUILD_GUARD = {'date': None, 'ts': 0.0}
+TODAY_REBUILD_MIN_INTERVAL_S = int(os.environ.get('TODAY_REBUILD_MIN_INTERVAL_S', '180'))
+
+
+def _rebuild_today_guarded(date_str):
+    """Rebuild today's partition unless this process already did within
+    TODAY_REBUILD_MIN_INTERVAL_S. Returns True if a rebuild actually ran.
+    Races between threads just cause one redundant (idempotent) rebuild."""
+    now = time.time()
+    if (_TODAY_BUILD_GUARD['date'] == date_str
+            and now - _TODAY_BUILD_GUARD['ts'] < TODAY_REBUILD_MIN_INTERVAL_S):
+        return False
+    build_presence_intervals(date_str)
+    _TODAY_BUILD_GUARD['date'] = date_str
+    _TODAY_BUILD_GUARD['ts'] = time.time()
+    return True
+
+
 def _whole_minutes_from_seconds(seconds):
-    """Convert stored duration seconds to whole elapsed minutes."""
-    return int((seconds or 0) // 60)
+    """Convert stored duration seconds to whole minutes, rounding HALF-UP.
+    Was floor(): durations are multiples of 30s, so flooring threw away the
+    :30 of every odd half-minute — an always-downward bias that compounded
+    when per-day values were summed into monthly totals (10-22 min lost per
+    person per month). Half-up keeps the error zero-mean and matches the
+    SQL twin _sql_whole_minutes below (Python round() is banker's rounding,
+    so we use floor(x + 0.5) to stay deterministic and identical to SQL)."""
+    return int(((seconds or 0) + 30) // 60)
 
 
 def _sql_whole_minutes(seconds_expr):
-    return f"CAST(FLOOR(COALESCE({seconds_expr}, 0) / 60.0) AS INT64)"
+    # Round half-up — must stay identical to _whole_minutes_from_seconds.
+    return f"CAST(FLOOR((COALESCE({seconds_expr}, 0) + 30) / 60.0) AS INT64)"
 
 
 def _classify_room(room_name):
@@ -14699,6 +14735,29 @@ def build_presence_intervals(date_str):
 
     gap_buckets = GAP_THRESHOLD_SECONDS // BUCKET_SECONDS  # 10
 
+    # --- Cross-room gap credit --------------------------------------------
+    # A missed 30s poll must not discard presence: the person did not
+    # teleport out of the meeting because the SDK skipped a beat. For each
+    # observed bucket, credit the time up to the participant's NEXT observed
+    # bucket in ANY room (they stayed in the current room until seen
+    # elsewhere), capped at the gap threshold. Holes larger than the
+    # threshold still split intervals and are not credited. Crediting to the
+    # PRECEDING room and looking across rooms keeps the per-person timeline
+    # tiled with no double-counting when someone bounces A->B->A quickly.
+    buckets_by_key = defaultdict(set)
+    for b in buckets:
+        buckets_by_key[b.participant_key].add(b.bucket30)
+    credit_by_key_bucket = {}
+    for _pkey, bset in buckets_by_key.items():
+        blist = sorted(bset)
+        for i, bk in enumerate(blist):
+            if i + 1 < len(blist):
+                gap = blist[i + 1] - bk
+                credit = gap if gap <= gap_buckets else 1
+            else:
+                credit = 1  # last observation: credit its own bucket only
+            credit_by_key_bucket[(_pkey, bk)] = credit * BUCKET_SECONDS
+
     intervals = []  # list of dicts ready for BQ insert
     intervals_by_participant = defaultdict(list)  # key -> [interval dict, ...]
 
@@ -14722,15 +14781,28 @@ def build_presence_intervals(date_str):
 
         for grp in groups:
             start_ts = grp[0].bucket_start
-            # End = last bucket end + BUCKET_SECONDS (the bucket covers up to its end)
-            end_ts = grp[-1].bucket_end + timedelta(seconds=BUCKET_SECONDS)
-            distinct_buckets = len({g.bucket30 for g in grp})
-            duration = distinct_buckets * BUCKET_SECONDS
+            # Duration = sum of per-bucket credits (each bucket counts until
+            # the participant's next observation in any room, capped at the
+            # gap threshold). This credits sub-threshold polling holes that
+            # the old `distinct_buckets * 30` formula silently discarded —
+            # the source of every view showing less time than the wall clock.
+            seen_buckets = {}
+            for g in grp:
+                seen_buckets.setdefault(g.bucket30, g)
+            duration = sum(
+                credit_by_key_bucket.get((pkey, bk), BUCKET_SECONDS)
+                for bk in seen_buckets
+            )
+            # End = start of last bucket + its credit, so end-start stays
+            # consistent with the credited duration in Day View room rows.
+            last_credit = credit_by_key_bucket.get((pkey, grp[-1].bucket30), BUCKET_SECONDS)
+            end_ts = grp[-1].bucket_start + timedelta(seconds=last_credit)
             # Alone seconds: 30 per bucket where occupant_count==1, excluding Main
             alone = 0
             if category != 'main':
                 alone = sum(
-                    BUCKET_SECONDS for g in grp if (g.occupant_count or 0) == 1
+                    BUCKET_SECONDS for g in seen_buckets.values()
+                    if (g.occupant_count or 0) == 1
                 )
             iv = {
                 'interval_id': str(uuid_lib.uuid4()),
@@ -14840,15 +14912,25 @@ def build_presence_intervals(date_str):
         # breakouts; we can't tell where they were, so don't credit anything.
         if (wh.breakout_webhook_count or 0) > 0:
             continue
-        if not wh.meeting_joined or not wh.meeting_left:
+        if not wh.meeting_joined:
             continue
-        meeting_left = wh.meeting_left
+        # Missing leave webhook (app/laptop closed, Zoom dropped the event):
+        # credit them until the end of the monitoring window instead of
+        # discarding the whole day — but capped at
+        # WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES, because monitoring_end is the
+        # MEETING's last activity, not this person's: an uncapped fill could
+        # credit someone 10h they never attended.
+        no_leave = wh.meeting_left is None
+        meeting_left = wh.meeting_left or monitoring_end
+        if not meeting_left:
+            continue
         if monitoring_end and meeting_left > monitoring_end:
             meeting_left = monitoring_end
         duration = (meeting_left - wh.meeting_joined).total_seconds()
         if duration <= 0:
             continue
-        duration = min(duration, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
+        cap_minutes = WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES if no_leave else MAIN_ROOM_SYNTH_CAP_MINUTES
+        duration = min(duration, cap_minutes * 60)
         intervals.append({
             'interval_id': str(uuid_lib.uuid4()),
             'event_date': date_str,
@@ -14865,7 +14947,8 @@ def build_presence_intervals(date_str):
             'alone_seconds': 0,
             'snapshot_count': 0,
             'source': 'webhook_fill',
-            'confidence': 0.5,
+            # 0.35 flags "leave webhook never arrived" fills for auditing
+            'confidence': 0.35 if no_leave else 0.5,
             'built_at': built_at_iso,
         })
 
@@ -14917,17 +15000,32 @@ def build_presence_intervals(date_str):
         kept_intervals = []
         dropped_n = 0
         dropped_secs = 0
+        clamped_n = 0
         for iv in intervals:
-            if _parse_ts(iv['start_ts']) < inherited_cutoff_utc:
+            iv_start = _parse_ts(iv['start_ts'])
+            iv_end = _parse_ts(iv['end_ts'])
+            if iv_end <= inherited_cutoff_utc:
+                # Entirely inside yesterday's tail — drop.
                 dropped_n += 1
                 dropped_secs += iv['duration_seconds']
+            elif iv_start < inherited_cutoff_utc:
+                # Spans the boundary: keep the post-cutoff remainder instead
+                # of throwing the whole interval away (which also destroyed
+                # its valid same-day time).
+                keep_secs = int((iv_end - inherited_cutoff_utc).total_seconds())
+                dropped_secs += max(0, iv['duration_seconds'] - keep_secs)
+                iv['start_ts'] = inherited_cutoff_utc.isoformat()
+                iv['duration_seconds'] = min(iv['duration_seconds'], keep_secs)
+                iv['alone_seconds'] = min(iv['alone_seconds'], iv['duration_seconds'])
+                clamped_n += 1
+                kept_intervals.append(iv)
             else:
                 kept_intervals.append(iv)
-        if dropped_n:
+        if dropped_n or clamped_n:
             ist_cut = inherited_cutoff_utc + timedelta(minutes=IST_OFFSET_MINUTES)
             print(f"[BuildIntervals {date_str}] inherited overnight meeting detected "
-                  f"(start_level={start_level}); dropped {dropped_n} intervals "
-                  f"({dropped_secs // 60} min) starting before {ist_cut.strftime('%H:%M')} IST")
+                  f"(start_level={start_level}); dropped {dropped_n}, clamped {clamped_n} "
+                  f"intervals ({dropped_secs // 60} min removed) before {ist_cut.strftime('%H:%M')} IST")
         intervals = kept_intervals
 
     # ----- Step 6: Atomic partition replace via load job -------------------
@@ -15133,7 +15231,7 @@ def team_attendance_v2(team_id, date):
         is_today = (report_date == get_ist_date())
         if is_today:
             try:
-                build_presence_intervals(report_date)
+                _rebuild_today_guarded(report_date)
             except Exception as e:
                 print(f"[TeamV2] Today auto-build failed for {report_date}: {e}")
         else:
@@ -15284,6 +15382,55 @@ def team_attendance_v2(team_id, date):
         for p in participants:
             p['status'] = _status(int(p.get('total_duration_mins') or 0))
 
+        # Name-drift detector: participants seen in the meeting today who
+        # match NO roster member of ANY team. These are the people whose
+        # hours silently vanish from Team View (nickname, typo, missing
+        # email) while Day View still shows them — surface them so an admin
+        # can fix the roster name instead of the person showing absent.
+        # Opt-in (?include_unmatched=1): the Dashboard fires this endpoint
+        # once per team, and the check is global — running it N times per
+        # page load would waste BigQuery scans for identical results.
+        unmatched = []
+        want_unmatched = request.args.get('include_unmatched') == '1'
+        if want_unmatched:
+          try:
+            norm_dk = _sql_normalize_name('dk.participant_name')
+            norm_am = _sql_normalize_name('am.member_name')
+            um_q = f"""
+            WITH all_members AS (
+                SELECT DISTINCT participant_name AS member_name,
+                                participant_email AS member_email
+                FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+            ),
+            dk AS (
+                SELECT DISTINCT participant_name, participant_email
+                FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+                WHERE event_date = @date
+                  AND participant_name IS NOT NULL AND participant_name != ''
+            )
+            SELECT dk.participant_name, dk.participant_email
+            FROM dk
+            LEFT JOIN all_members am
+              ON (
+                {norm_dk} = {norm_am}
+                OR (
+                  NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
+                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(am.member_email)), '')
+                )
+              )
+            WHERE am.member_name IS NULL
+            ORDER BY dk.participant_name
+            """
+            um_rows = client.query(um_q, job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
+            )).result()
+            unmatched = [
+                {'name': r.participant_name, 'email': r.participant_email or ''}
+                for r in um_rows
+            ]
+          except Exception as e:
+            print(f"[TeamV2] unmatched-participant check failed: {e}")
+
         return jsonify({
             'success': True,
             'team_id': team_id,
@@ -15292,6 +15439,7 @@ def team_attendance_v2(team_id, date):
             'date': report_date,
             'source': 'presence_intervals_v2',
             'participants': participants,
+            'unmatched_participants': unmatched,
         })
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -15415,7 +15563,12 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
     yesterday_ist = (get_ist_now() - timedelta(days=1)).strftime('%Y-%m-%d')
     settling = {d for d in (today_ist, yesterday_ist) if start_date <= d <= end_date}
 
-    # Per-date row count + freshness in one pass.
+    # Per-date row count + freshness + latest SOURCE activity in one pass.
+    # last_source lets past days self-heal: if a day's materialization is
+    # OLDER than the last snapshot/webhook observed for that day (e.g. the
+    # hourly job built it at 15:10 but the meeting ran to 18:30 and the
+    # nightly rebuild died), it is rebuilt instead of staying frozen short
+    # forever.
     q = f"""
     WITH wanted AS (
       SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(@start, @end)) AS day
@@ -15425,13 +15578,34 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
       FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
       WHERE event_date BETWEEN @start AND @end
       GROUP BY event_date
+    ),
+    snap_src AS (
+      SELECT event_date, MAX(snapshot_time) AS last_src
+      FROM `{dataset_ref}.room_snapshots_v2`
+      WHERE event_date BETWEEN @start AND @end
+      GROUP BY event_date
+    ),
+    evt_src AS (
+      SELECT event_date, MAX(CAST(event_timestamp AS TIMESTAMP)) AS last_src
+      FROM `{dataset_ref}.{BQ_EVENTS_TABLE}`
+      WHERE event_date BETWEEN @start AND @end
+      GROUP BY event_date
     )
     SELECT
       w.day,
       b.event_date IS NOT NULL AS has_rows,
-      TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), b.last_built, MINUTE) AS age_min
+      TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), b.last_built, MINUTE) AS age_min,
+      (
+        b.last_built IS NOT NULL AND
+        GREATEST(
+          COALESCE(s.last_src, TIMESTAMP('1970-01-01')),
+          COALESCE(e.last_src, TIMESTAMP('1970-01-01'))
+        ) > b.last_built
+      ) AS build_outdated
     FROM wanted w
     LEFT JOIN built b ON w.day = b.event_date
+    LEFT JOIN snap_src s ON w.day = s.event_date
+    LEFT JOIN evt_src e ON w.day = e.event_date
     ORDER BY w.day DESC
     """
     rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
@@ -15441,8 +15615,9 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
         ]
     )).result())
 
-    missing = []        # older dates never built
-    stale_settling = []  # today/yesterday whose materialization is stale
+    missing = []         # older dates never built
+    stale_settling = []  # today/yesterday needing a rebuild
+    outdated = []        # past dates whose build predates their latest source data
     for r in rows:
         d = r.day.isoformat()
         # NEVER build future dates: they have no source data yet, and an empty
@@ -15456,25 +15631,45 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
                 missing.append(d)
             else:
                 stale_settling.append(d)  # in window but never built -> build
+        elif d == today_ist:
+            # Rebuild today, matching Day View / attendance_v2. This was the
+            # Team-vs-Day discrepancy: Day View force-rebuilt today while the
+            # monthly/range pivot served up-to-90-min-stale data. The
+            # in-process guard skips it if a rebuild ran in the last ~3 min.
+            if (_TODAY_BUILD_GUARD['date'] != d
+                    or time.time() - _TODAY_BUILD_GUARD['ts'] >= TODAY_REBUILD_MIN_INTERVAL_S):
+                stale_settling.append(d)
         elif d in settling and (r.age_min is None or r.age_min >= SETTLING_STALE_MINUTES):
             stale_settling.append(d)
+        elif r.build_outdated:
+            outdated.append(d)
 
     built = 0
-    # 1. Refresh stale today/yesterday first (self-healing backstop).
+    # 1. Refresh today/yesterday first (self-healing backstop).
     for d in sorted(stale_settling, reverse=True):
         try:
-            build_presence_intervals(d)
-            built += 1
+            if d == today_ist:
+                if _rebuild_today_guarded(d):
+                    built += 1
+            else:
+                build_presence_intervals(d)
+                built += 1
         except Exception as e:
             print(f"[AutoBuildRange] settling-day {d} failed: {e}")
-    # 2. Build older never-built dates, capped.
-    for d in missing[:max_builds]:
+    # 2. Build never-built dates, then self-heal outdated ones, sharing the cap.
+    to_build = missing[:max_builds]
+    remaining_slots = max_builds - len(to_build)
+    to_build += sorted(outdated, reverse=True)[:remaining_slots]
+    for d in to_build:
         try:
             build_presence_intervals(d)
             built += 1
         except Exception as e:
             print(f"[AutoBuildRange] {d} failed: {e}")
-    return built, max(0, len(missing) - max_builds)
+    # Report BOTH kinds of leftover work so the UI's "unbuilt dates" count
+    # is honest: never-built dates and stale-but-built dates beyond the cap.
+    still_missing = max(0, len(missing) + len(outdated) - max_builds)
+    return built, still_missing
 
 
 @app.route('/teams/<team_id>/attendance/range_v2', methods=['GET'])
@@ -15547,7 +15742,10 @@ def team_attendance_range_v2(team_id):
             {_sql_whole_minutes('pd.breakout_seconds')} AS breakout_minutes,
             {_sql_whole_minutes('pd.break_seconds')} AS break_minutes,
             {_sql_whole_minutes('pd.isolation_seconds')} AS isolation_minutes,
-            {_sql_whole_minutes('pd.total_seconds')} AS active_minutes,
+            -- active = everything EXCEPT Break Time rooms (matches v1 and the
+            -- frontend's "active hours" labels); total keeps break included.
+            {_sql_whole_minutes('pd.total_seconds - pd.break_seconds')} AS active_minutes,
+            {_sql_whole_minutes('pd.total_seconds')} AS total_minutes,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
         FROM per_day pd
@@ -15580,14 +15778,15 @@ def team_attendance_range_v2(team_id):
 
         daily_data = []
         for r in rows:
-            total = int(r.active_minutes or 0)
+            total = int(r.total_minutes or 0)
             daily_data.append({
                 'date': r.date,
                 'name': r.name,
                 'email': r.email or '',
                 'first_seen_ist': r.first_seen_ist,
                 'last_seen_ist': r.last_seen_ist,
-                'active_minutes': total,
+                'active_minutes': int(r.active_minutes or 0),
+                'total_minutes': total,
                 'breakout_minutes': int(r.breakout_minutes or 0),
                 'main_room_minutes': int(r.main_room_minutes or 0),
                 'break_minutes': int(r.break_minutes or 0),
@@ -15619,12 +15818,15 @@ def team_attendance_range_v2(team_id):
             import csv, io
             output = io.StringIO()
             writer = csv.writer(output)
+            # Total_Minutes appended LAST to preserve column positions for
+            # existing consumers. NOTE: Active_Minutes now excludes break time
+            # (it previously included it — that was the bug).
             writer.writerow(['Date','Name','Email','Status','First_Seen_IST','Last_Seen_IST',
-                             'Active_Minutes','Break_Minutes','Isolation_Minutes'])
+                             'Active_Minutes','Break_Minutes','Isolation_Minutes','Total_Minutes'])
             for r in daily_data:
                 writer.writerow([r['date'], r['name'], r['email'], r['status'],
                                  r['first_seen_ist'], r['last_seen_ist'],
-                                 r['active_minutes'], r['break_minutes'], r['isolation_minutes']])
+                                 r['active_minutes'], r['break_minutes'], r['isolation_minutes'], r['total_minutes']])
             return Response(output.getvalue(), mimetype='text/csv',
                             headers={'Content-Disposition': f'attachment; filename=team_{team_name.replace(" ","_")}_{start_date}_to_{end_date}.csv'})
 
@@ -15726,7 +15928,10 @@ def team_monthly_report_v2(team_id):
             {_sql_whole_minutes('pd.breakout_seconds')} AS breakout_minutes,
             {_sql_whole_minutes('pd.break_seconds')} AS break_minutes,
             {_sql_whole_minutes('pd.isolation_seconds')} AS isolation_minutes,
-            {_sql_whole_minutes('pd.total_seconds')} AS active_minutes,
+            -- active = everything EXCEPT Break Time rooms (matches v1 and the
+            -- frontend's "active hours" labels); total keeps break included.
+            {_sql_whole_minutes('pd.total_seconds - pd.break_seconds')} AS active_minutes,
+            {_sql_whole_minutes('pd.total_seconds')} AS total_minutes,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pd.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
         FROM per_day pd
@@ -15752,14 +15957,15 @@ def team_monthly_report_v2(team_id):
 
         data = []
         for r in rows:
-            total = int(r.active_minutes or 0)
+            total = int(r.total_minutes or 0)
             data.append({
                 'date': r.date,
                 'name': r.name,
                 'email': r.email or '',
                 'first_seen_ist': r.first_seen_ist,
                 'last_seen_ist': r.last_seen_ist,
-                'active_minutes': total,
+                'active_minutes': int(r.active_minutes or 0),
+                'total_minutes': total,
                 'breakout_minutes': int(r.breakout_minutes or 0),
                 'main_room_minutes': int(r.main_room_minutes or 0),
                 'break_minutes': int(r.break_minutes or 0),
@@ -15772,12 +15978,14 @@ def team_monthly_report_v2(team_id):
             import csv, io
             output = io.StringIO()
             writer = csv.writer(output)
+            # Active_Minutes goes LAST: existing spreadsheets/scripts ingest
+            # this CSV by position, so new columns must only append.
             writer.writerow(['Date','Name','Email','Status','First_Seen_IST','Last_Seen_IST',
-                             'Total_Minutes','Breakout_Minutes','Main_Room_Minutes','Break_Minutes','Isolation_Minutes'])
+                             'Total_Minutes','Breakout_Minutes','Main_Room_Minutes','Break_Minutes','Isolation_Minutes','Active_Minutes'])
             for r in data:
                 writer.writerow([r['date'], r['name'], r['email'], r['status'],
-                                 r['first_seen_ist'], r['last_seen_ist'], r['active_minutes'],
-                                 r['breakout_minutes'], r['main_room_minutes'], r['break_minutes'], r['isolation_minutes']])
+                                 r['first_seen_ist'], r['last_seen_ist'], r['total_minutes'],
+                                 r['breakout_minutes'], r['main_room_minutes'], r['break_minutes'], r['isolation_minutes'], r['active_minutes']])
             return Response(output.getvalue(), mimetype='text/csv',
                             headers={'Content-Disposition': f'attachment; filename=team_{team_name.replace(" ","_")}_{year}_{month:02d}.csv'})
 
@@ -15849,7 +16057,7 @@ def attendance_summary_v2(date):
         is_today = (report_date == get_ist_date())
         if is_today:
             try:
-                build_presence_intervals(report_date)
+                _rebuild_today_guarded(report_date)
             except Exception as e:
                 print(f"[SummaryV2] Today auto-build failed for {report_date}: {e}")
         else:
@@ -15942,6 +16150,7 @@ def attendance_summary_v2(date):
                     'room_joined_ist':   _fmt_ist(iv.start_ts),
                     'room_left_ist':     _fmt_ist(iv.end_ts),
                     'room_duration_mins': _whole_minutes_from_seconds(iv.duration_seconds),
+                    'room_duration_seconds': int(iv.duration_seconds or 0),
                     'source':            iv.source,
                 })
             participants.append({
@@ -15950,6 +16159,7 @@ def attendance_summary_v2(date):
                 'first_seen_ist':      _fmt_ist(first_seen),
                 'last_seen_ist':       _fmt_ist(last_seen),
                 'total_duration_mins': _whole_minutes_from_seconds(total_seconds),
+                'total_duration_seconds': int(total_seconds),
                 'isolation_minutes':   _whole_minutes_from_seconds(isolation_seconds),
                 'room_visits':         room_visits,
             })

@@ -57,13 +57,21 @@ export function transformSummaryToEmployees(summaryData) {
         start: v.room_joined_ist || '',
         end: v.room_left_ist || '',
         duration: v.room_duration_mins || 0,
+        // Raw seconds (when backend provides them) so aggregations can sum
+        // precisely and round once, instead of summing pre-rounded minutes.
+        durationSeconds: v.room_duration_seconds != null
+          ? v.room_duration_seconds
+          : (v.room_duration_mins || 0) * 60,
         isNamed: v.room_name.includes(':') && !v.room_name.startsWith('Room-'),
         session: p.name,
       }));
 
-    // Use the backend aggregate total. Summing rounded room-visit minutes can
-    // lose time across several 30-second intervals and drift from Team View.
-    const totalMin = p.total_duration_mins || 0;
+    // Use the backend aggregate total. Prefer raw seconds when the backend
+    // sends them (rounded once, here) so the header matches the room rows;
+    // summing per-visit rounded minutes drifts from Team View.
+    const totalMin = p.total_duration_seconds != null
+      ? Math.round(p.total_duration_seconds / 60)
+      : (p.total_duration_mins || 0);
     const h = Math.floor(totalMin / 60);
     const m = Math.round(totalMin % 60);
 
@@ -198,10 +206,15 @@ export async function fetchParticipants() {
   return apiFetch('/teams/participants');
 }
 
-export async function fetchTeamAttendance(teamId, date) {
+export async function fetchTeamAttendance(teamId, date, includeUnmatched = false) {
   // v2: reads from presence_intervals (materialized single source of truth).
   // Backend auto-builds intervals on-demand if they don't exist for the date.
-  return apiFetch(`/teams/${teamId}/attendance_v2/${date}`);
+  // includeUnmatched: also return meeting participants who match no roster
+  // member (name drift) so Team View can warn instead of silently dropping
+  // them. Opt-in because the check is global — the Dashboard calls this once
+  // per team and must not repeat it N times.
+  const suffix = includeUnmatched ? '?include_unmatched=1' : '';
+  return apiFetch(`/teams/${teamId}/attendance_v2/${date}${suffix}`);
 }
 
 export async function fetchTeamAttendanceRange(teamId, startDate, endDate) {

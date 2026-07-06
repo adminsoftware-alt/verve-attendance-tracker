@@ -219,7 +219,9 @@ def generate_daily_report(report_date=None):
         ARRAY_AGG(NULLIF(participant_email, '') IGNORE NULLS ORDER BY end_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS Email,
         MIN(start_ts) AS first_seen_utc,
         MAX(end_ts) AS last_seen_utc,
-        CAST(FLOOR(SUM(COALESCE(duration_seconds, 0)) / 60.0) AS INT64) AS Total_Duration_Minutes
+        -- Round half-up (NOT floor) — must match app.py _sql_whole_minutes so
+        -- the emailed report agrees with Day View / Team View to the minute.
+        CAST(FLOOR((SUM(COALESCE(duration_seconds, 0)) + 30) / 60.0) AS INT64) AS Total_Duration_Minutes
       FROM intervals
       GROUP BY participant_key
     ),
@@ -232,7 +234,7 @@ def generate_daily_report(report_date=None):
             room_name,
             FORMAT_TIMESTAMP('%H:%M', start_ts, 'Asia/Kolkata'),
             FORMAT_TIMESTAMP('%H:%M', end_ts, 'Asia/Kolkata'),
-            CAST(FLOOR(COALESCE(duration_seconds, 0) / 60.0) AS INT64)
+            CAST(FLOOR((COALESCE(duration_seconds, 0) + 30) / 60.0) AS INT64)
           ),
           ' -> '
           ORDER BY start_ts

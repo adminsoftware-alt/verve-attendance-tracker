@@ -120,10 +120,13 @@ export default function ReportBuilder({ user }) {
     if (!data?.daily_data) return [];
 
     let rows = data.daily_data.map(d => {
-      const active = d.active_minutes || 0;
+      // Trust the backend status: it is computed from total_minutes (break
+      // included) — recomputing here from active_minutes (break EXCLUDED)
+      // made this view disagree with Team View for anyone with break time.
+      const total = d.total_minutes != null ? d.total_minutes : (d.active_minutes || 0);
       return {
         ...d,
-        status: active >= 300 ? 'present' : active >= 240 ? 'half_day' : 'absent',
+        status: d.status || (total >= 300 ? 'present' : total >= 240 ? 'half_day' : 'absent'),
       };
     });
 

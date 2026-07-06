@@ -15,17 +15,24 @@ export default function Rooms({ allData, uploadedDates: dates }) {
           if (!room.isNamed) continue;
           const rKey = room.name.toLowerCase();
           if (!map[rKey]) {
-            map[rKey] = { name: room.name, visits: 0, totalMinutes: 0, visitors: {}, dates: new Set() };
+            map[rKey] = { name: room.name, visits: 0, totalSeconds: 0, visitors: {}, dates: new Set() };
           }
           map[rKey].visits++;
-          map[rKey].totalMinutes += room.duration || 0;
+          // Sum seconds and round once at the end — summing per-visit
+          // rounded minutes under-counted rooms with many short visits.
+          map[rKey].totalSeconds += room.durationSeconds != null ? room.durationSeconds : (room.duration || 0) * 60;
           map[rKey].visitors[emp.name.toLowerCase()] = emp.name;
           map[rKey].dates.add(date);
         }
       }
     }
     return Object.values(map)
-      .map(r => ({ ...r, visitors: Object.values(r.visitors), dates: [...r.dates] }))
+      .map(r => ({
+        ...r,
+        totalMinutes: Math.round(r.totalSeconds / 60),
+        visitors: Object.values(r.visitors),
+        dates: [...r.dates],
+      }))
       .sort((a, b) => b.visits - a.visits);
   }, [allData, dates]);
 
