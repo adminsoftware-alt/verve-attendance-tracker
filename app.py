@@ -15492,23 +15492,30 @@ def team_attendance_v2(team_id, date):
                 {_sql_normalize_name('member_name')} AS member_key
             FROM `{dataset_ref}.participant_aliases`
         ),
+        member_keys AS (
+            -- Each roster member's set of acceptable name keys: their own
+            -- normalized name plus any aliased Zoom-name variants. Expanded
+            -- BEFORE the bridge join because BigQuery rejects EXISTS
+            -- subqueries inside join predicates.
+            SELECT member_name, member_email, {norm_tm} AS match_key
+            FROM team_members tm
+            UNION DISTINCT
+            SELECT tm.member_name, tm.member_email, al.alias_key AS match_key
+            FROM team_members tm
+            JOIN aliases al ON al.member_key = {norm_tm}
+        ),
         member_bridge AS (
             SELECT DISTINCT
-                tm.member_name,
-                tm.member_email,
+                mk.member_name,
+                mk.member_email,
                 dk.participant_key
-            FROM team_members tm
+            FROM member_keys mk
             JOIN distinct_keys dk
               ON (
-                {norm_pi} = {norm_tm}
+                {norm_pi} = mk.match_key
                 OR (
                   NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
-                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(tm.member_email)), '')
-                )
-                OR EXISTS (
-                  SELECT 1 FROM aliases al
-                  WHERE al.alias_key = dk.participant_key
-                    AND al.member_key = {norm_tm}
+                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(mk.member_email)), '')
                 )
               )
         ),
@@ -15958,22 +15965,29 @@ def team_attendance_range_v2(team_id):
                 {_sql_normalize_name('member_name')} AS member_key
             FROM `{dataset_ref}.participant_aliases`
         ),
+        member_keys AS (
+            -- Each roster member's set of acceptable name keys: their own
+            -- normalized name plus any aliased Zoom-name variants. Expanded
+            -- BEFORE the bridge join because BigQuery rejects EXISTS
+            -- subqueries inside join predicates.
+            SELECT member_name, member_email, {norm_tm} AS match_key
+            FROM team_members tm
+            UNION DISTINCT
+            SELECT tm.member_name, tm.member_email, al.alias_key AS match_key
+            FROM team_members tm
+            JOIN aliases al ON al.member_key = {norm_tm}
+        ),
         member_bridge AS (
             SELECT DISTINCT
-                tm.member_name, tm.member_email,
+                mk.member_name, mk.member_email,
                 dk.event_date, dk.participant_key
-            FROM team_members tm
+            FROM member_keys mk
             JOIN distinct_keys dk
               ON (
-                {norm_pi} = {norm_tm}
+                {norm_pi} = mk.match_key
                 OR (
                   NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
-                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(tm.member_email)), '')
-                )
-                OR EXISTS (
-                  SELECT 1 FROM aliases al
-                  WHERE al.alias_key = dk.participant_key
-                    AND al.member_key = {norm_tm}
+                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(mk.member_email)), '')
                 )
               )
         ),
@@ -16161,22 +16175,29 @@ def team_monthly_report_v2(team_id):
                 {_sql_normalize_name('member_name')} AS member_key
             FROM `{dataset_ref}.participant_aliases`
         ),
+        member_keys AS (
+            -- Each roster member's set of acceptable name keys: their own
+            -- normalized name plus any aliased Zoom-name variants. Expanded
+            -- BEFORE the bridge join because BigQuery rejects EXISTS
+            -- subqueries inside join predicates.
+            SELECT member_name, member_email, {norm_tm} AS match_key
+            FROM team_members tm
+            UNION DISTINCT
+            SELECT tm.member_name, tm.member_email, al.alias_key AS match_key
+            FROM team_members tm
+            JOIN aliases al ON al.member_key = {norm_tm}
+        ),
         member_bridge AS (
             SELECT DISTINCT
-                tm.member_name, tm.member_email,
+                mk.member_name, mk.member_email,
                 dk.event_date, dk.participant_key
-            FROM team_members tm
+            FROM member_keys mk
             JOIN distinct_keys dk
               ON (
-                {norm_pi} = {norm_tm}
+                {norm_pi} = mk.match_key
                 OR (
                   NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
-                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(tm.member_email)), '')
-                )
-                OR EXISTS (
-                  SELECT 1 FROM aliases al
-                  WHERE al.alias_key = dk.participant_key
-                    AND al.member_key = {norm_tm}
+                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(mk.member_email)), '')
                 )
               )
         ),
