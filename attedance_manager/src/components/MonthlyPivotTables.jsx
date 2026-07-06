@@ -213,9 +213,10 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
                           first_seen_ist: dayRow?.first_seen_ist || '',
                           last_seen_ist: dayRow?.last_seen_ist || '',
                           status: dayRow?.status?.toLowerCase() || (h >= 5 ? 'present' : h >= 4 ? 'half_day' : 'absent'),
-                          // total_minutes (break included) drives status;
-                          // active_minutes (the pivot's hours) excludes break.
-                          total_duration_mins: dayRow?.total_minutes ?? dayRow?.active_minutes ?? Math.round(h * 60),
+                          // The modal maps total_duration_mins into its "Active
+                          // Minutes" field and submits it as active_mins, so
+                          // prefill ACTIVE minutes (break excluded) here.
+                          total_duration_mins: dayRow?.active_minutes ?? Math.round(h * 60),
                           break_minutes: dayRow?.break_minutes || 0,
                           isolation_minutes: dayRow?.isolation_minutes || 0,
                         }, ds);
@@ -479,6 +480,7 @@ function LeavesTable({ dates, weekdays, names, lookup, holidayMap = {} }) {
   // Column totals: how many employees were on leave that day
   const colLeaveTotals = dates.map(ds => {
     if (holidayMap[ds]) return null; // holiday column
+    if (!weekdays.includes(ds)) return null; // weekend column — not counted in Leaves
     return names.reduce((acc, name) => {
       const entry = lookup[`${name}|${ds}`];
       const h = entry?.hours || 0;
@@ -549,6 +551,12 @@ function LeavesTable({ dates, weekdays, names, lookup, holidayMap = {} }) {
                           style={{ ...s.cellTd, background: '#e0e7ff', color: '#4338ca', fontWeight: 700 }}
                           title={holidayMap[ds]}
                         >H</td>
+                      );
+                    }
+                    if (!weekdays.includes(ds)) {
+                      // Weekend column — not a working day, so neither P nor L
+                      return (
+                        <td key={ds} style={{ ...s.cellTd, color: '#94a3b8' }}>–</td>
                       );
                     }
                     const entry = lookup[`${name}|${ds}`];

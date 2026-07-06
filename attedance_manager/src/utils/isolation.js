@@ -38,7 +38,8 @@ export function analyzeIsolation(employees) {
       if (!room.isNamed) return;
       const rName = room.name;
       const myStart = timeToMin(room.start);
-      const myEnd = timeToMin(room.end);
+      let myEnd = timeToMin(room.end);
+      if (myEnd < myStart) myEnd += 1440; // interval crosses midnight
       const myDur = Math.max(myEnd - myStart, 0);
       totalNamedMinutes += myDur;
 

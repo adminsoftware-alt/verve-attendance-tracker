@@ -186,7 +186,10 @@ function parseOldFormat(rows) {
           const rName = m[1].trim();
           const start = m[2];
           const end = m[3];
-          const durMins = timeToMin(end) - timeToMin(start);
+          const startMin = timeToMin(start);
+          let endMin = timeToMin(end);
+          if (endMin < startMin) endMin += 1440; // interval crosses midnight
+          const durMins = endMin - startMin;
           emp.rooms.push({
             name: rName,
             start,

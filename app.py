@@ -2862,9 +2862,27 @@ def monitor_snapshot():
         return jsonify({'error': 'meeting_id and rooms required'}), 400
 
     now = datetime.utcnow()
-    today = get_ist_date()
-    snapshot_time = now.isoformat()
-    bucket = _snapshot_bucket(now)
+    # Optional client capture timestamp: the monitor app queues snapshots it
+    # could not deliver (backend outage, Wi-Fi blip) and resends them later.
+    # Honoring the ORIGINAL capture time keeps those rows in their true 30s
+    # buckets instead of stamping them minutes late. Only accepted if it is
+    # in the past and less than 24h old — otherwise fall back to server now.
+    snap_dt = now
+    captured_at = data.get('captured_at')
+    if captured_at:
+        try:
+            from datetime import timezone as _tz
+            cand = datetime.fromisoformat(str(captured_at).replace('Z', '+00:00'))
+            if cand.tzinfo is not None:
+                cand = cand.astimezone(_tz.utc).replace(tzinfo=None)
+            age_s = (now - cand).total_seconds()
+            if 0 <= age_s <= 86400:
+                snap_dt = cand
+        except Exception:
+            pass
+    today = (snap_dt + timedelta(minutes=330)).strftime('%Y-%m-%d')  # IST date of capture
+    snapshot_time = snap_dt.isoformat()
+    bucket = _snapshot_bucket(snap_dt)
     _snapshot_cleanup()
 
     # Dedupe: one row per participant per snapshot. During room transitions
@@ -2920,6 +2938,7 @@ def monitor_snapshot():
     # instances at the source without affecting room-transition rows
     # (transitions have a different room_name → different key).
     deduped_rows = []
+    seen_keys = []
     skipped_dups = 0
     for r in by_participant.values():
         seen_key = (r['meeting_id'], r['participant_uuid'] or r['participant_name'].lower().strip(),
@@ -2927,7 +2946,7 @@ def monitor_snapshot():
         if seen_key in _snapshot_seen:
             skipped_dups += 1
             continue
-        _snapshot_seen[seen_key] = time.time()
+        seen_keys.append(seen_key)
         deduped_rows.append(r)
 
     rows = deduped_rows
@@ -2941,6 +2960,13 @@ def monitor_snapshot():
             if errors:
                 print(f"[Monitor] BigQuery insert errors: {errors[:3]}")
                 return jsonify({'success': False, 'error': str(errors[:3])}), 500
+            # Mark rows as seen only AFTER a successful insert. Marking them
+            # before poisoned the cache on failure: the client's retry of the
+            # same 30s bucket hit the cache and was silently dropped,
+            # permanently losing that window.
+            now_seen = time.time()
+            for sk in seen_keys:
+                _snapshot_seen[sk] = now_seen
             extra = f" (skipped {skipped_dups} dup)" if skipped_dups else ""
             print(f"[Monitor] Saved snapshot: {len(rooms)} rooms, {total_participants} participants{extra}")
         except Exception as e:
@@ -4009,22 +4035,38 @@ def calibration_start():
     if not meeting_id:
         return jsonify({'error': 'meeting_id required'}), 400
 
-    # CHECK FOR INCOMPLETE CALIBRATION (Auto-resume support)
+    # RESUME SUPPORT (positional matching seed)
+    # Frontend sends start_from_index (0 = fresh start). When provided it is
+    # authoritative: calibration_next_index is seeded with it so the FIRST
+    # webhook after resume matches room #start_from_index.
     resume_from = 0
-    existing_state = load_calibration_state(meeting_id)
-    if existing_state and not force_restart:
-        if existing_state.get('calibration_in_progress') and not existing_state.get('completed'):
-            # Incomplete calibration found - can resume
-            resume_from = existing_state.get('current_room_index', 0)
-            total_rooms = existing_state.get('total_rooms', 0)
-            print(f"[Calibration] RESUME available: {resume_from}/{total_rooms} rooms completed")
+    start_from_index = data.get('start_from_index')
+    if start_from_index is not None:
+        try:
+            resume_from = max(0, int(start_from_index))
+        except (TypeError, ValueError):
+            resume_from = 0
+        if room_sequence and resume_from >= len(room_sequence):
+            print(f"[Calibration] start_from_index {resume_from} out of range ({len(room_sequence)} rooms) - starting fresh")
+            resume_from = 0
+        elif resume_from > 0:
+            print(f"[Calibration] Frontend requested RESUME from room {resume_from + 1}")
+    else:
+        # Legacy clients: auto-resume from persisted state
+        existing_state = load_calibration_state(meeting_id)
+        if existing_state and not force_restart:
+            if existing_state.get('calibration_in_progress') and not existing_state.get('completed'):
+                # Incomplete calibration found - can resume
+                resume_from = existing_state.get('current_room_index', 0)
+                total_rooms = existing_state.get('total_rooms', 0)
+                print(f"[Calibration] RESUME available: {resume_from}/{total_rooms} rooms completed")
 
-            # If room sequence matches, we can resume
-            if len(room_sequence) == total_rooms:
-                print(f"[Calibration] Room count matches - resuming from room {resume_from + 1}")
-            else:
-                print(f"[Calibration] Room count changed ({len(room_sequence)} vs {total_rooms}) - starting fresh")
-                resume_from = 0
+                # If room sequence matches, we can resume
+                if len(room_sequence) == total_rooms:
+                    print(f"[Calibration] Room count matches - resuming from room {resume_from + 1}")
+                else:
+                    print(f"[Calibration] Room count changed ({len(room_sequence)} vs {total_rooms}) - starting fresh")
+                    resume_from = 0
 
     # Reset state for new calibration
     meeting_state.set_meeting(meeting_id, meeting_uuid)
@@ -14410,20 +14452,45 @@ IST_OFFSET_MINUTES = 330
 # TODAY_REBUILD_MIN_INTERVAL_S per process keeps every view fresh to within
 # ~3 minutes while cutting BQ query volume by the number of teams.
 _TODAY_BUILD_GUARD = {'date': None, 'ts': 0.0}
+_TODAY_BUILD_LOCK = threading.Lock()
 TODAY_REBUILD_MIN_INTERVAL_S = int(os.environ.get('TODAY_REBUILD_MIN_INTERVAL_S', '180'))
+# On build failure, retry sooner than the full interval but NOT immediately:
+# during a BQ incident every request would otherwise re-run the full 5-query
+# build, amplifying the outage.
+TODAY_REBUILD_FAILURE_BACKOFF_S = int(os.environ.get('TODAY_REBUILD_FAILURE_BACKOFF_S', '30'))
 
 
 def _rebuild_today_guarded(date_str):
-    """Rebuild today's partition unless this process already did within
-    TODAY_REBUILD_MIN_INTERVAL_S. Returns True if a rebuild actually ran.
-    Races between threads just cause one redundant (idempotent) rebuild."""
+    """Rebuild today's partition unless this process already did (or started
+    to) within TODAY_REBUILD_MIN_INTERVAL_S. Returns True if a rebuild ran.
+
+    The guard is CLAIMED before the build starts (under a lock): a dashboard
+    fires one attendance_v2 call per team in parallel, and a build takes many
+    seconds — claiming after completion let every parallel request start its
+    own full rebuild. Parallel callers now return immediately and serve the
+    existing (at most ~3 min old) data. On failure the claim is shortened to
+    a backoff so the next request retries soon without a failure storm."""
     now = time.time()
-    if (_TODAY_BUILD_GUARD['date'] == date_str
-            and now - _TODAY_BUILD_GUARD['ts'] < TODAY_REBUILD_MIN_INTERVAL_S):
-        return False
-    build_presence_intervals(date_str)
-    _TODAY_BUILD_GUARD['date'] = date_str
-    _TODAY_BUILD_GUARD['ts'] = time.time()
+    with _TODAY_BUILD_LOCK:
+        if (_TODAY_BUILD_GUARD['date'] == date_str
+                and now - _TODAY_BUILD_GUARD['ts'] < TODAY_REBUILD_MIN_INTERVAL_S):
+            return False
+        # Claim BEFORE building so concurrent requests don't duplicate it.
+        _TODAY_BUILD_GUARD['date'] = date_str
+        _TODAY_BUILD_GUARD['ts'] = now
+    try:
+        build_presence_intervals(date_str)
+    except Exception:
+        with _TODAY_BUILD_LOCK:
+            if _TODAY_BUILD_GUARD['date'] == date_str:
+                # Shorten the claim: retry after the backoff, not the full interval
+                _TODAY_BUILD_GUARD['ts'] = (
+                    time.time() - TODAY_REBUILD_MIN_INTERVAL_S + TODAY_REBUILD_FAILURE_BACKOFF_S
+                )
+        raise
+    with _TODAY_BUILD_LOCK:
+        _TODAY_BUILD_GUARD['date'] = date_str
+        _TODAY_BUILD_GUARD['ts'] = time.time()
     return True
 
 
@@ -14914,43 +14981,48 @@ def build_presence_intervals(date_str):
             continue
         if not wh.meeting_joined:
             continue
-        # Missing leave webhook (app/laptop closed, Zoom dropped the event):
-        # credit them until the end of the monitoring window instead of
-        # discarding the whole day — but capped at
-        # WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES, because monitoring_end is the
-        # MEETING's last activity, not this person's: an uncapped fill could
-        # credit someone 10h they never attended.
-        no_leave = wh.meeting_left is None
-        meeting_left = wh.meeting_left or monitoring_end
-        if not meeting_left:
-            continue
-        if monitoring_end and meeting_left > monitoring_end:
-            meeting_left = monitoring_end
-        duration = (meeting_left - wh.meeting_joined).total_seconds()
-        if duration <= 0:
-            continue
-        cap_minutes = WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES if no_leave else MAIN_ROOM_SYNTH_CAP_MINUTES
-        duration = min(duration, cap_minutes * 60)
-        intervals.append({
-            'interval_id': str(uuid_lib.uuid4()),
-            'event_date': date_str,
-            'meeting_id': wh.meeting_id,
-            'meeting_uuid': None,
-            'participant_key': pkey,
-            'participant_name': wh.participant_name,
-            'participant_email': wh.participant_email,
-            'room_name': '0.Main Room',
-            'room_category': 'main',
-            'start_ts': wh.meeting_joined.isoformat(),
-            'end_ts': (wh.meeting_joined + timedelta(seconds=duration)).isoformat(),
-            'duration_seconds': int(duration),
-            'alone_seconds': 0,
-            'snapshot_count': 0,
-            'source': 'webhook_fill',
-            # 0.35 flags "leave webhook never arrived" fills for auditing
-            'confidence': 0.35 if no_leave else 0.5,
-            'built_at': built_at_iso,
-        })
+        # Credit each PRESENCE WINDOW (join->leave pair) separately instead
+        # of the raw MIN(join)->MAX(leave) span: someone who attended
+        # 09:00-09:10 and 17:00-17:30 must get 40 min, not the whole day.
+        # A window with a missing leave (app/laptop closed, Zoom dropped the
+        # event) is credited until monitoring end but capped tighter
+        # (WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES) because monitoring_end is the
+        # MEETING's last activity, not this person's.
+        windows = presence_windows_by_key.get(pkey) or [(wh.meeting_joined, wh.meeting_left)]
+        for w_start, w_leave in windows:
+            if w_start is None:
+                continue
+            no_leave = w_leave is None
+            w_end = w_leave or monitoring_end
+            if not w_end:
+                continue
+            if monitoring_end and w_end > monitoring_end:
+                w_end = monitoring_end
+            duration = (w_end - w_start).total_seconds()
+            if duration <= 0:
+                continue
+            cap_minutes = WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES if no_leave else MAIN_ROOM_SYNTH_CAP_MINUTES
+            duration = min(duration, cap_minutes * 60)
+            intervals.append({
+                'interval_id': str(uuid_lib.uuid4()),
+                'event_date': date_str,
+                'meeting_id': wh.meeting_id,
+                'meeting_uuid': None,
+                'participant_key': pkey,
+                'participant_name': wh.participant_name,
+                'participant_email': wh.participant_email,
+                'room_name': '0.Main Room',
+                'room_category': 'main',
+                'start_ts': w_start.isoformat(),
+                'end_ts': (w_start + timedelta(seconds=duration)).isoformat(),
+                'duration_seconds': int(duration),
+                'alone_seconds': 0,
+                'snapshot_count': 0,
+                'source': 'webhook_fill',
+                # 0.35 flags "leave webhook never arrived" fills for auditing
+                'confidence': 0.35 if no_leave else 0.5,
+                'built_at': built_at_iso,
+            })
 
     # ----- Step 5b: drop the inherited (overnight) meeting block -----------
     # See the INHERITED_* constants above for the full rationale. We rebuild
@@ -15013,6 +15085,11 @@ def build_presence_intervals(date_str):
                 # of throwing the whole interval away (which also destroyed
                 # its valid same-day time).
                 keep_secs = int((iv_end - inherited_cutoff_utc).total_seconds())
+                if keep_secs <= 0:
+                    # Ends <1s past the cutoff — nothing meaningful to keep
+                    dropped_n += 1
+                    dropped_secs += iv['duration_seconds']
+                    continue
                 dropped_secs += max(0, iv['duration_seconds'] - keep_secs)
                 iv['start_ts'] = inherited_cutoff_utc.isoformat()
                 iv['duration_seconds'] = min(iv['duration_seconds'], keep_secs)
@@ -15344,10 +15421,12 @@ def team_attendance_v2(team_id, date):
         team_name = team_rows[0].team_name if team_rows else 'Unknown'
         manager_name = team_rows[0].manager_name if team_rows else ''
 
-        def _status(total):
-            if total >= 300:
+        def _status(active):
+            # Status is judged on break-EXCLUSIVE minutes, matching v1:
+            # 5h parked in the Break Time room must not count as 'present'.
+            if active >= 300:
                 return 'present'
-            if total >= 240:
+            if active >= 240:
                 return 'half_day'
             return 'absent'
 
@@ -15356,6 +15435,7 @@ def team_attendance_v2(team_id, date):
             display_name = r.participant_name or r.member_name
             display_email = r.participant_email or r.member_email or ''
             total = int(r.total_duration_mins or 0)
+            brk = int(r.break_minutes or 0)
             participants.append({
                 'name': display_name,
                 'email': display_email,
@@ -15364,9 +15444,9 @@ def team_attendance_v2(team_id, date):
                 'total_duration_mins': total,
                 'breakout_mins': int(r.breakout_mins or 0),
                 'main_room_mins': int(r.main_room_mins or 0),
-                'break_minutes': int(r.break_minutes or 0),
+                'break_minutes': brk,
                 'isolation_minutes': int(r.isolation_minutes or 0),
-                'status': _status(total),
+                'status': _status(total - brk),
             })
 
         # Match v1 post-processing: merge Zoom rejoin variants ("Aastha-1"
@@ -15380,7 +15460,9 @@ def team_attendance_v2(team_id, date):
         # Re-derive status from merged totals (statuses summed via mode='team'
         # but rank-merge happens during merge; recompute defensively).
         for p in participants:
-            p['status'] = _status(int(p.get('total_duration_mins') or 0))
+            p['status'] = _status(
+                int(p.get('total_duration_mins') or 0) - int(p.get('break_minutes') or 0)
+            )
 
         # Name-drift detector: participants seen in the meeting today who
         # match NO roster member of ANY team. These are the people whose
@@ -15586,7 +15668,12 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
       GROUP BY event_date
     ),
     evt_src AS (
-      SELECT event_date, MAX(CAST(event_timestamp AS TIMESTAMP)) AS last_src
+      -- Use DELIVERY time (inserted_at) when available: Zoom retries failed
+      -- webhooks for hours, so late-DELIVERED events with old event
+      -- timestamps must still mark the build as outdated.
+      SELECT event_date,
+             MAX(COALESCE(CAST(inserted_at AS TIMESTAMP),
+                          CAST(event_timestamp AS TIMESTAMP))) AS last_src
       FROM `{dataset_ref}.{BQ_EVENTS_TABLE}`
       WHERE event_date BETWEEN @start AND @end
       GROUP BY event_date
@@ -15594,6 +15681,7 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
     SELECT
       w.day,
       b.event_date IS NOT NULL AS has_rows,
+      (s.last_src IS NOT NULL OR e.last_src IS NOT NULL) AS has_source,
       TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), b.last_built, MINUTE) AS age_min,
       (
         b.last_built IS NOT NULL AND
@@ -15627,6 +15715,13 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
         if d > today_ist:
             continue
         if not r.has_rows:
+            # No source data at all (weekend/holiday/pre-deployment day):
+            # building it would produce 0 rows AGAIN, so it would look
+            # "missing" and be rebuilt on EVERY load — a permanent
+            # rebuild loop costing ~20s + several BQ queries per empty day
+            # per page view. Skip outright.
+            if not r.has_source:
+                continue
             if d not in settling:
                 missing.append(d)
             else:
@@ -15778,20 +15873,21 @@ def team_attendance_range_v2(team_id):
 
         daily_data = []
         for r in rows:
-            total = int(r.total_minutes or 0)
+            active = int(r.active_minutes or 0)
             daily_data.append({
                 'date': r.date,
                 'name': r.name,
                 'email': r.email or '',
                 'first_seen_ist': r.first_seen_ist,
                 'last_seen_ist': r.last_seen_ist,
-                'active_minutes': int(r.active_minutes or 0),
-                'total_minutes': total,
+                'active_minutes': active,
+                'total_minutes': int(r.total_minutes or 0),
                 'breakout_minutes': int(r.breakout_minutes or 0),
                 'main_room_minutes': int(r.main_room_minutes or 0),
                 'break_minutes': int(r.break_minutes or 0),
                 'isolation_minutes': int(r.isolation_minutes or 0),
-                'status': _status(total),
+                # Status on break-EXCLUSIVE minutes (matches v1 and Team View daily)
+                'status': _status(active),
             })
 
         # Member summary keyed by normalized name (collapses rejoin variants)
@@ -15957,20 +16053,21 @@ def team_monthly_report_v2(team_id):
 
         data = []
         for r in rows:
-            total = int(r.total_minutes or 0)
+            active = int(r.active_minutes or 0)
             data.append({
                 'date': r.date,
                 'name': r.name,
                 'email': r.email or '',
                 'first_seen_ist': r.first_seen_ist,
                 'last_seen_ist': r.last_seen_ist,
-                'active_minutes': int(r.active_minutes or 0),
-                'total_minutes': total,
+                'active_minutes': active,
+                'total_minutes': int(r.total_minutes or 0),
                 'breakout_minutes': int(r.breakout_minutes or 0),
                 'main_room_minutes': int(r.main_room_minutes or 0),
                 'break_minutes': int(r.break_minutes or 0),
                 'isolation_minutes': int(r.isolation_minutes or 0),
-                'status': _status(total),
+                # Status on break-EXCLUSIVE minutes (matches v1 and Team View daily)
+                'status': _status(active),
             })
         data.sort(key=lambda x: (x['name'].lower(), x['date']))
 

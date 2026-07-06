@@ -11,11 +11,19 @@ module.exports = function(app) {
     next();
   });
 
-  // Proxy API calls to backend server
+  // Proxy API calls to backend server (Flask app.py on :8080, same as apiService.js)
   app.use(
     '/calibration',
     createProxyMiddleware({
-      target: 'http://localhost:3001',
+      target: 'http://localhost:8080',
+      changeOrigin: true,
+    })
+  );
+
+  app.use(
+    '/monitor',
+    createProxyMiddleware({
+      target: 'http://localhost:8080',
       changeOrigin: true,
     })
   );

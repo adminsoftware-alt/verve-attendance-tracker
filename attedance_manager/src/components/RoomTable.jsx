@@ -16,11 +16,13 @@ export default function RoomTable({ rooms }) {
     return <div style={{ padding: 12, color: '#94a3b8', fontSize: 12 }}>No room data</div>;
   }
 
-  // Timeline
+  // Timeline — skip entirely when no room has a parseable time
+  // (Math.min/max on empty arrays would give Infinity → invalid CSS)
   const starts = rooms.map(r => timeToMin(r.start)).filter(t => t > 0);
   const ends = rooms.map(r => timeToMin(r.end)).filter(t => t > 0);
-  const minT = Math.min(...starts, ...ends);
-  const maxT = Math.max(...starts, ...ends);
+  const hasTimes = starts.length > 0 || ends.length > 0;
+  const minT = hasTimes ? Math.min(...starts, ...ends) : 0;
+  const maxT = hasTimes ? Math.max(...starts, ...ends) : 0;
   const range = Math.max(maxT - minT, 10);
 
   // Hour markers
@@ -33,6 +35,7 @@ export default function RoomTable({ rooms }) {
   return (
     <div>
       {/* Timeline bar */}
+      {hasTimes && (
       <div style={s.timelineWrap}>
         <div style={s.hourRow}>
           {hours.map(({ h, p }) => (
@@ -75,6 +78,7 @@ export default function RoomTable({ rooms }) {
           })}
         </div>
       </div>
+      )}
 
       {/* Legend */}
       <div style={s.legend}>

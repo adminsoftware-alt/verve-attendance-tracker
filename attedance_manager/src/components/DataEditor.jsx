@@ -142,7 +142,7 @@ export default function DataEditor({ user }) {
     if (!valid.length) return;
     setLoading(true);
     try {
-      await adminAddSnapshots(valid.map(r => ({ ...r, event_date: r.event_date || date })));
+      await adminAddSnapshots(valid.map(r => ({ ...r, event_date: date })));
       flash(`Added ${valid.length} snapshot rows`);
       setShowAdd(false);
       setAddRows([{ participant_name: '', room_name: 'Main Meeting', snapshot_time: '', event_date: date }]);

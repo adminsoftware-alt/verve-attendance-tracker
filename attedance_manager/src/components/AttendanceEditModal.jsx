@@ -40,6 +40,10 @@ export default function AttendanceEditModal({ member, date, onClose, onSave }) {
     setSaving(true);
     setError(null);
     try {
+      // NaN-safe parsing: `parseInt(x) || null` would turn a legitimate 0 into null
+      const activeN = parseInt(activeMins, 10);
+      const breakN = parseInt(breakMins, 10);
+      const isolationN = parseInt(isolationMins, 10);
       await addAttendanceOverride({
         employee_name: member.name,
         employee_id: member.employee_id || '',
@@ -47,9 +51,9 @@ export default function AttendanceEditModal({ member, date, onClose, onSave }) {
         first_seen_ist: firstSeen || null,
         last_seen_ist: lastSeen || null,
         status: status,
-        active_mins: parseInt(activeMins) || null,
-        break_mins: parseInt(breakMins) || null,
-        isolation_mins: parseInt(isolationMins) || null,
+        active_mins: Number.isNaN(activeN) ? null : activeN,
+        break_mins: Number.isNaN(breakN) ? null : breakN,
+        isolation_mins: Number.isNaN(isolationN) ? null : isolationN,
         notes: notes || '',
       });
       onSave && onSave();

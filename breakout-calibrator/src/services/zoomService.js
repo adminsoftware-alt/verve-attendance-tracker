@@ -165,14 +165,22 @@ async function verifyBotInRoom(getBreakoutRooms, expectedRoomName, botName = BOT
  */
 async function verifyBotInRoomWithPolling(getBreakoutRooms, expectedRoomName, timeoutMs = VERIFY_POLL_TIMEOUT_MS) {
   const startTime = Date.now();
+  let lastMismatchRoom = null;
 
   while (Date.now() - startTime < timeoutMs) {
     const result = await verifyBotInRoom(getBreakoutRooms, expectedRoomName);
 
     if (result.verified) return result;
-    if (result.mismatch) return result;
-
-    console.log(`[Verify] Bot not found yet, retrying in ${VERIFY_POLL_INTERVAL_MS}ms...`);
+    if (result.mismatch) {
+      // Require the SAME mismatch on 2 consecutive polls before failing.
+      // A single stale SDK read (bot mid-transit) followed by a match = success.
+      if (lastMismatchRoom === result.actualRoom) return result;
+      lastMismatchRoom = result.actualRoom;
+      console.log(`[Verify] Mismatch (bot in "${result.actualRoom}"), confirming on next poll...`);
+    } else {
+      lastMismatchRoom = null;
+      console.log(`[Verify] Bot not found yet, retrying in ${VERIFY_POLL_INTERVAL_MS}ms...`);
+    }
     await sleep(VERIFY_POLL_INTERVAL_MS);
   }
 
@@ -232,10 +240,26 @@ export async function runCalibration({
   onProgress,
   onRoomMapped,
   delayMs = DEFAULT_MOVE_DELAY_MS,
-  startFromRoom = 0
+  startFromRoom = 0,
+  abortRef = null
 }) {
   const roomMapping = [];
   const errors = [];
+
+  // Abort support: caller sets abortRef.aborted = true (e.g. Cancel button)
+  const isAborted = () => Boolean(abortRef && abortRef.aborted);
+  const abortedResult = (totalRooms) => {
+    console.log('[Calibration] Aborted by user - stopping cleanly');
+    onProgress?.({ step: 'aborted', message: 'Calibration cancelled' });
+    return {
+      success: false,
+      aborted: true,
+      roomMapping,
+      totalRooms,
+      mappedRooms: roomMapping.length,
+      errors
+    };
+  };
 
   // Step 1: Get all breakout rooms from SDK
   onProgress?.({ step: 'fetching_rooms', message: 'Fetching breakout rooms...' });
@@ -304,6 +328,8 @@ export async function runCalibration({
   }
 
   for (let i = startIndex; i < rooms.length; i++) {
+    if (isAborted()) return abortedResult(totalRooms);
+
     const room = rooms[i];
     const roomName = room.breakoutRoomName || room.name || `Room ${i + 1}`;
     const roomUUID = room.breakoutRoomId || room.breakoutRoomUUID || room.breakoutroomid || room.uuid || room.id;
@@ -358,6 +384,8 @@ export async function runCalibration({
     });
     await sleep(delayMs);
 
+    if (isAborted()) return abortedResult(totalRooms);
+
     // --- PHASE 2: Wait for webhook (BLOCKING) ---
     onProgress?.({
       step: 'waiting_webhook',
@@ -367,6 +395,8 @@ export async function runCalibration({
     });
 
     const webhookResult = await waitForWebhookConfirmation(roomName, WEBHOOK_TIMEOUT_MS, 1000);
+
+    if (isAborted()) return abortedResult(totalRooms);
 
     if (!webhookResult.confirmed) {
       // STOP - can't skip in position-based matching

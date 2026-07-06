@@ -24,14 +24,37 @@ export function useZoomSdk() {
 
   // Initialize SDK
   useEffect(() => {
+    let cancelled = false;
+
     async function initializeSdk() {
+      // Retry zoomSdk.config with backoff: a single transient failure here
+      // used to disable the app for the entire meeting (isConfigured stayed
+      // false forever -> auto-start and watchdog never ran -> zero snapshots).
+      const MAX_CONFIG_ATTEMPTS = 5;
+      const RETRY_DELAY_MS = 3000;
       try {
         console.log('Initializing Zoom SDK...');
 
-        // Configure the SDK - use installed version 0.16.x
-        const configResponse = await zoomSdk.config({
-          capabilities: CAPABILITIES
-        });
+        let configResponse = null;
+        let lastErr = null;
+        for (let attempt = 1; attempt <= MAX_CONFIG_ATTEMPTS; attempt++) {
+          if (cancelled) return;
+          try {
+            configResponse = await zoomSdk.config({
+              capabilities: CAPABILITIES
+            });
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            console.error(`zoomSdk.config attempt ${attempt}/${MAX_CONFIG_ATTEMPTS} failed:`, err);
+            if (attempt < MAX_CONFIG_ATTEMPTS) {
+              await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+            }
+          }
+        }
+        if (lastErr) throw lastErr;
+        if (cancelled) return;
 
         console.log('Zoom SDK configured:', configResponse);
         setIsConfigured(true);
@@ -82,11 +105,12 @@ export function useZoomSdk() {
 
       } catch (err) {
         console.error('Failed to initialize Zoom SDK:', err);
-        setError(err.message || 'Failed to initialize Zoom SDK');
+        if (!cancelled) setError(err.message || 'Failed to initialize Zoom SDK');
       }
     }
 
     initializeSdk();
+    return () => { cancelled = true; };
   }, []);
 
   // Get all breakout rooms with names

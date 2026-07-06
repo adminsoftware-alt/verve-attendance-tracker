@@ -45,13 +45,16 @@ const api = axios.create({
  * @param {string} calibrationParticipant.participantUUID - Participant UUID
  * @param {string} calibrationParticipant.mode - 'scout_bot' or 'self'
  * @param {Array} roomSequence - SEQUENCE-BASED MATCHING: Ordered array of rooms [{room_name, room_uuid}, ...]
+ * @param {number} startFromIndex - Resume index (0 = fresh start). Backend seeds its positional
+ *                                  webhook counter so webhook #1 after resume = room #startFromIndex
  */
-export async function notifyCalibrationStart(meetingId, meetingUUID, calibrationParticipant = null, roomSequence = []) {
+export async function notifyCalibrationStart(meetingId, meetingUUID, calibrationParticipant = null, roomSequence = [], startFromIndex = 0) {
   try {
     const payload = {
       meeting_id: meetingId,
       meeting_uuid: meetingUUID,
-      started_at: new Date().toISOString()
+      started_at: new Date().toISOString(),
+      start_from_index: startFromIndex
     };
 
     // Add calibration participant info if provided
@@ -185,6 +188,20 @@ export async function waitForWebhookConfirmation(roomName, timeoutMs = 15000, po
 
   console.warn(`Webhook timeout for room: ${roomName}`);
   return { confirmed: false, timeout: true };
+}
+
+/**
+ * Get current calibration status (resume support)
+ * @param {string} meetingId - Meeting ID
+ */
+export async function getCalibrationStatus(meetingId) {
+  try {
+    const response = await api.get(`/calibration/status?meeting_id=${encodeURIComponent(meetingId)}`);
+    return response.data;
+  } catch (err) {
+    console.error('[API] Failed to get calibration status:', err);
+    return null;
+  }
 }
 
 /**
@@ -339,6 +356,7 @@ export default {
   checkBackendHealth,
   checkRoomWebhookReceived,
   waitForWebhookConfirmation,
+  getCalibrationStatus,
   verifyRoomMapping,
   abortCalibration,
   resetCalibration,

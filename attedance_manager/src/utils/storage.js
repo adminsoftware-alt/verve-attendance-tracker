@@ -86,7 +86,9 @@ export async function getDayData(dateStr) {
     return null;
   } catch (err) {
     console.error('Day data API error:', err);
-    const all = await getAllData();
+    // Fallback: read localStorage directly (getAllData() is deprecated and returns {})
+    let all = {};
+    try { all = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { all = {}; }
     return all[dateStr] || null;
   }
 }
@@ -107,8 +109,9 @@ export async function saveDayData(dateStr, employees, uploadedBy) {
     return;
   } catch (err) {
     console.error('Save API error, using fallback:', err);
-    // Fallback: localStorage
-    const all = await getAllData();
+    // Fallback: read/merge/write localStorage directly (getAllData() is deprecated and returns {})
+    let all = {};
+    try { all = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { all = {}; }
     all[dateStr] = employees;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
   }
@@ -124,9 +127,13 @@ export async function deleteDayData(dateStr) {
     return;
   } catch (err) {
     console.error('Delete API error, using fallback:', err);
-    const all = await getAllData();
-    delete all[dateStr];
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+    try {
+      const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      delete all[dateStr];
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+    } catch (e) {
+      console.error('localStorage fallback failed:', e);
+    }
   }
 }
 
@@ -140,7 +147,12 @@ export async function getUploadedDates() {
     return [];
   } catch (err) {
     console.error('Dates API error, using fallback:', err);
-    const all = await getAllData();
-    return Object.keys(all).sort();
+    try {
+      const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      return Object.keys(all).sort();
+    } catch (e) {
+      console.error('localStorage fallback failed:', e);
+      return [];
+    }
   }
 }

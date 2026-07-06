@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import useZoomSdk from '../hooks/useZoomSdk';
 import { runCalibration } from '../services/zoomService';
 import {
@@ -7,6 +7,7 @@ import {
   abortCalibration,
   waitForWebhookConfirmation,
   resetCalibration,
+  getCalibrationStatus,
   getLiveRooms,
   getMappingSummary,
   prepareRoomRecalibration,
@@ -77,6 +78,9 @@ function CalibrationPanel() {
   // ETA
   const [estimatedTime, setEstimatedTime] = useState(null);
 
+  // Abort flag for the running calibration loop (Cancel / Full Reset)
+  const calibrationAbortRef = useRef({ aborted: false });
+
   // Calculate ETA when settings change
   useEffect(() => {
     if (rooms.length > 0) {
@@ -92,11 +96,10 @@ function CalibrationPanel() {
       const meetingId = meetingContext?.meetingID;
       if (!meetingId) return;
       try {
-        const response = await fetch(`/calibration/status?meeting_id=${meetingId}`);
-        const data = await response.json();
-        if (data.calibration_in_progress && data.current_room_index > 0) {
+        const data = await getCalibrationStatus(meetingId);
+        if (data && data.calibration_in_progress && data.current_room_index > 0) {
           setResumeFromRoom(data.current_room_index);
-          setTotalRooms(data.total_rooms || 66);
+          setTotalRooms(data.total_rooms || 0);
         }
       } catch (err) {
         console.error('Failed to check calibration progress:', err);
@@ -145,6 +148,7 @@ function CalibrationPanel() {
     }
 
     try {
+      calibrationAbortRef.current = { aborted: false };
       setUiState(UI_STATES.CHECKING);
       setStatusMessage(startFromRoom > 0 ? `Resuming from room ${startFromRoom + 1}...` : 'Initializing...');
       setMappedRooms([]);
@@ -187,11 +191,19 @@ function CalibrationPanel() {
         `ETA: ~${etaMins} minutes`
       ].filter(Boolean));
 
-      await notifyCalibrationStart(meetingId, meetingUUID, {
+      const startAck = await notifyCalibrationStart(meetingId, meetingUUID, {
         mode: 'scout_bot',
         name: 'Scout Bot',
         participantUUID: ''
-      }, breakoutRooms);
+      }, breakoutRooms, startFromRoom);
+
+      if (!startAck || !startAck.success) {
+        // Backend never got the room sequence - proceeding would desync positional matching
+        setErrorMessage('Backend did not acknowledge calibration start. Check connection and retry.');
+        setDebugLogs(prev => [...prev, 'ERROR: /calibration/start failed - aborting before moving bot']);
+        setUiState(UI_STATES.ERROR);
+        return;
+      }
 
       setUiState(UI_STATES.CALIBRATING);
 
@@ -202,6 +214,7 @@ function CalibrationPanel() {
         moveToMainRoom,
         delayMs: selectedDelay,
         startFromRoom: startFromRoom,
+        abortRef: calibrationAbortRef.current,
         onProgress: (progress) => {
           setStatusMessage(progress.message);
           if (progress.currentRoom !== undefined) {
@@ -245,6 +258,13 @@ function CalibrationPanel() {
           setMappedRooms(prev => [...prev, mapping]);
         }
       });
+
+      if (result.aborted) {
+        // User cancelled (Full Reset already cleaned up backend state) - not an error
+        setDebugLogs(prev => [...prev, '=== CALIBRATION CANCELLED ===']);
+        setCurrentRoom(-1);
+        return;
+      }
 
       if (result.success) {
         await notifyCalibrationComplete(meetingId, meetingUUID, result);
@@ -291,6 +311,7 @@ function CalibrationPanel() {
   const handleFullReset = useCallback(async () => {
     const meetingId = meetingContext?.meetingID;
     try {
+      calibrationAbortRef.current.aborted = true;
       setStatusMessage('Resetting...');
       if (meetingId) {
         await abortCalibration(meetingId);
@@ -496,7 +517,7 @@ function CalibrationPanel() {
           <>
             {resumeFromRoom > 0 && (
               <button style={styles.primaryButton} onClick={() => handleStartCalibration(resumeFromRoom)}>
-                Resume from Room {resumeFromRoom + 1}/{totalRooms}
+                Resume from Room {resumeFromRoom + 1}{totalRooms > 0 ? `/${totalRooms}` : ''}
               </button>
             )}
             <button style={resumeFromRoom > 0 ? styles.secondaryButton : styles.primaryButton} onClick={() => handleStartCalibration(0)}>

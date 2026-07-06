@@ -50,7 +50,7 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
       e.email.toLowerCase().includes(search.toLowerCase())
     );
     if (sortBy === 'name') list.sort((a, b) => a.name.localeCompare(b.name));
-    else if (sortBy === 'early') list.sort((a, b) => (timeToMin(a.joined) || 9999) - (timeToMin(b.joined) || 9999));
+    else if (sortBy === 'early') list.sort((a, b) => (a.joined ? timeToMin(a.joined) : 9999) - (b.joined ? timeToMin(b.joined) : 9999));
     else if (sortBy === 'late') list.sort((a, b) => (timeToMin(b.joined) || 0) - (timeToMin(a.joined) || 0));
     else if (sortBy === 'duration') list.sort((a, b) => (b.totalMinutes || 0) - (a.totalMinutes || 0));
     return list;
@@ -59,7 +59,7 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
   const stats = useMemo(() => {
     if (!employees.length) return null;
     const durs = employees.map(e => e.totalMinutes).filter(d => d > 0);
-    const joins = employees.map(e => timeToMin(e.joined)).filter(t => t > 0);
+    const joins = employees.filter(e => e.joined).map(e => timeToMin(e.joined));
     const leaves = employees.map(e => timeToMin(e.left)).filter(t => t > 0);
     return {
       count: employees.length,

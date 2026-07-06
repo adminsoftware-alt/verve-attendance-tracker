@@ -6,7 +6,15 @@ const POLL_INTERVAL_MS = 30000; // 30 seconds
 const START_RETRY_MS = 10000;
 const WATCHDOG_INTERVAL_MS = 15000;
 const STALE_AFTER_MS = POLL_INTERVAL_MS * 3;
-const ROOM_CACHE_TTL_MS = 300000; // 5 minutes - room names rarely change
+// Cache is a FALLBACK only (used when the live room fetch fails). It is
+// never the primary source: serving cached rooms (which embed participants)
+// as primary data recorded people in rooms they'd left minutes ago.
+const ROOM_CACHE_TTL_MS = 300000; // 5 minutes
+const MAX_PENDING_SNAPSHOTS = 20;  // ~10 min of queued failed uploads
+const MAX_SDK_FAILS_BEFORE_RELOAD = 4; // consecutive all-SDK-call failures
+const RELOAD_COOLDOWN_MS = 5 * 60 * 1000;
+const PENDING_STORAGE_KEY = 'monitor_pending_snapshots';
+const LAST_RELOAD_KEY = 'monitor_last_reload';
 
 const getBackendUrl = () => {
   if (process.env.REACT_APP_BACKEND_URL) return process.env.REACT_APP_BACKEND_URL;
@@ -41,6 +49,26 @@ function extractMeetingId(context) {
   return String(context.meetingID || context.meetingId || context.mid || context.meeting_id || '');
 }
 
+// EXACT bot-name match. The old substring/startsWith check ("scout ...")
+// silently excluded any real employee whose name starts with "Scout".
+const BOT_NAME = (process.env.REACT_APP_SCOUT_BOT_NAME || 'Scout Bot').trim().toLowerCase();
+function isScoutBot(name) {
+  const n = (name || '').trim().toLowerCase();
+  return n === BOT_NAME || n === 'scout bot' || n === 'scoutbot';
+}
+
+function loadPendingSnapshots() {
+  try {
+    const raw = sessionStorage.getItem(PENDING_STORAGE_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.slice(-MAX_PENDING_SNAPSHOTS) : [];
+  } catch { return []; }
+}
+
+function savePendingSnapshots(arr) {
+  try { sessionStorage.setItem(PENDING_STORAGE_KEY, JSON.stringify(arr.slice(-MAX_PENDING_SNAPSHOTS))); } catch { /* ignore */ }
+}
+
 function MonitorPanel() {
   const {
     isConfigured,
@@ -63,14 +91,20 @@ function MonitorPanel() {
   const [roomSummary, setRoomSummary] = useState([]);
 
   const intervalRef = useRef(null);
+  const pollWorkerRef = useRef(null);
   const watchdogRef = useRef(null);
+  const watchdogRestartRef = useRef(null);
   const meetingIdRef = useRef(null);
   const isMonitoringRef = useRef(false);
   const isStartingRef = useRef(false);
   const lastSuccessRef = useRef(null);
+  const userStoppedRef = useRef(false);       // Stop button = stay stopped
+  const pollInFlightRef = useRef(false);      // prevent overlapping polls
+  const sdkFailCountRef = useRef(0);          // consecutive all-SDK failures
+  const pendingSnapshotsRef = useRef(loadPendingSnapshots()); // failed uploads
 
-  // Room cache - room names rarely change during a meeting
-  const roomCacheRef = useRef({ rooms: [], roomMap: {}, timestamp: 0 });
+  // Room cache — FALLBACK ONLY when the live fetch fails (see constant note)
+  const roomCacheRef = useRef({ rooms: [], timestamp: 0 });
 
   const addLog = useCallback((msg) => {
     const time = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
@@ -94,107 +128,105 @@ function MonitorPanel() {
     }
   }, [addLog]);
 
+  // POST helper: throws on transport error AND on backend-reported failure,
+  // so callers treat both the same (queue for resend).
+  const postSnapshot = useCallback(async (payload) => {
+    const response = await api.post('/monitor/snapshot', payload);
+    if (!response.data?.success) {
+      throw new Error(response.data?.error || 'backend rejected snapshot');
+    }
+    return response;
+  }, []);
+
+  // After too many consecutive ALL-SDK-call failures the Zoom bridge is
+  // probably dead (client reconnected / session dropped) — a reload re-runs
+  // zoomSdk.config and recovers. Cooldown prevents a reload loop; queued
+  // snapshots survive in sessionStorage.
+  const maybeRecoverSdk = useCallback(() => {
+    if (sdkFailCountRef.current < MAX_SDK_FAILS_BEFORE_RELOAD) return;
+    let last = 0;
+    try { last = Number(sessionStorage.getItem(LAST_RELOAD_KEY) || 0); } catch { /* ignore */ }
+    if (Date.now() - last < RELOAD_COOLDOWN_MS) return;
+    try { sessionStorage.setItem(LAST_RELOAD_KEY, String(Date.now())); } catch { /* ignore */ }
+    savePendingSnapshots(pendingSnapshotsRef.current);
+    addLog('Zoom SDK unresponsive - reloading app to re-initialize');
+    setErrors(prev => [...prev.slice(-10), 'Zoom SDK unresponsive - auto-recovering (reload)']);
+    setTimeout(() => window.location.reload(), 1000);
+  }, [addLog]);
+
   // Single poll: get all rooms + participants, send to backend
   const doPoll = useCallback(async () => {
+    if (pollInFlightRef.current) return; // never overlap slow polls
+    pollInFlightRef.current = true;
     try {
       const now = Date.now();
-      const cache = roomCacheRef.current;
-      const cacheAge = now - cache.timestamp;
-      const cacheValid = cache.rooms.length > 0 && cacheAge < ROOM_CACHE_TTL_MS;
 
+      // ALWAYS fetch the room list fresh — it embeds each room's live
+      // participants, which is the primary attendance source. The cache is
+      // only a fallback when the live call fails.
       let rooms = [];
-      let roomMap = {};
-
-      // Use cached room list if still valid (room names rarely change)
-      if (cacheValid) {
-        rooms = cache.rooms;
-        roomMap = cache.roomMap;
-        // Only log occasionally to avoid spam
-        if (cacheAge < 60000) {
-          addLog(`Using cached room list (${rooms.length} rooms)`);
-        }
-      } else {
-        // Cache expired or empty - fetch fresh room list
-        try {
-          rooms = await withRetry(getBreakoutRooms, 'getBreakoutRoomList', 2);
-
-          // Build room UUID -> name mapping (normalized for consistent matching)
-          rooms.forEach(room => {
-            const rawUuid = room.breakoutRoomUUID || room.uuid || room.id || '';
-            const uuid = normalizeUUID(rawUuid);
-            const name = room.breakoutRoomName || room.name || 'Unknown';
-            if (uuid) roomMap[uuid] = name;
-          });
-
-          // Debug: log first few room UUIDs for troubleshooting
-          const sampleRooms = rooms.slice(0, 3).map(r => ({
-            raw: r.breakoutRoomUUID || r.uuid || r.id || '',
-            name: r.breakoutRoomName || r.name || ''
-          }));
-          console.log('Sample room UUIDs:', JSON.stringify(sampleRooms));
-
-          // Update cache
-          roomCacheRef.current = { rooms, roomMap, timestamp: now };
-          addLog(`Refreshed room list: ${rooms.length} rooms`);
-        } catch (roomErr) {
-          addLog(`getBreakoutRoomList failed: ${roomErr.message}`);
-          // Use stale cache if available
-          if (cache.rooms.length > 0) {
-            rooms = cache.rooms;
-            roomMap = cache.roomMap;
-            addLog(`Using stale cache (${rooms.length} rooms)`);
-          }
+      let roomsFetchFailed = false;
+      try {
+        rooms = await withRetry(getBreakoutRooms, 'getBreakoutRoomList', 2) || [];
+        roomCacheRef.current = { rooms, timestamp: now };
+      } catch (roomErr) {
+        roomsFetchFailed = true;
+        addLog(`getBreakoutRoomList failed: ${roomErr.message}`);
+        const cache = roomCacheRef.current;
+        if (cache.rooms.length > 0 && now - cache.timestamp < ROOM_CACHE_TTL_MS) {
+          rooms = cache.rooms;
+          addLog(`Using stale room cache (${rooms.length} rooms, ${Math.round((now - cache.timestamp) / 1000)}s old)`);
         }
       }
 
-      if (!rooms || rooms.length === 0) {
+      // Get all participants (for Main Room detection) with retry
+      let allParticipants = [];
+      let participantsFetchFailed = false;
+      try {
+        allParticipants = await withRetry(getParticipants, 'getMeetingParticipants', 2) || [];
+        addLog(`Got ${allParticipants.length} participants from SDK`);
+      } catch (pErr) {
+        participantsFetchFailed = true;
+        addLog(`getMeetingParticipants failed: ${pErr.message}`);
+      }
+
+      // If the room fetch THREW and no usable cache exists, skip the cycle:
+      // proceeding would misfile every breakout participant under Main Room.
+      if (roomsFetchFailed && rooms.length === 0) {
+        if (participantsFetchFailed) sdkFailCountRef.current += 1; else sdkFailCountRef.current += 1;
+        addLog('Room list unavailable (no fallback cache) - skipping this poll');
+        maybeRecoverSdk();
+        return;
+      }
+      if (rooms.length === 0 && allParticipants.length === 0) {
+        if (participantsFetchFailed) {
+          sdkFailCountRef.current += 1;
+          addLog('Both SDK calls failed - skipping this poll');
+          maybeRecoverSdk();
+        } else {
+          addLog('No rooms and no participants - nothing to record');
+        }
+        return;
+      }
+      // At least one SDK call worked with data — bridge is alive.
+      sdkFailCountRef.current = 0;
+
+      if (rooms.length === 0) {
         addLog('No breakout rooms - capturing Main Room only');
       }
 
-      // Get all participants (includes their current room) with retry
-      let allParticipants = [];
-      try {
-        allParticipants = await withRetry(getParticipants, 'getMeetingParticipants', 2);
-        addLog(`Got ${allParticipants.length} participants from SDK`);
-
-        // Debug: log first participant's fields to see what SDK returns
-        if (allParticipants.length > 0) {
-          const sample = allParticipants[0];
-          console.log('=== PARTICIPANT FIELDS DEBUG ===');
-          console.log('Full participant object:', JSON.stringify(sample, null, 2));
-          console.log('Available fields:', Object.keys(sample).join(', '));
-        }
-      } catch (pErr) {
-        addLog(`getMeetingParticipants failed: ${pErr.message}`);
-        // Fall back to room.participants if available
-      }
-
-      // If both SDK calls failed, skip this poll cycle
-      if (rooms.length === 0 && allParticipants.length === 0) {
-        addLog('Both SDK calls failed - skipping this poll');
-        return;
-      }
-
-      // Build snapshot data using BOTH approaches and merge them
-      // PRIMARY: getBreakoutRoomList() returns rooms WITH embedded participants (most reliable)
-      // SECONDARY: getMeetingParticipants() for Main Room participants (no breakout room)
+      // Build snapshot data using BOTH approaches and merge them.
+      // Dedup is keyed on participant UUID when available (falling back to
+      // name) so two different people who share a display name are BOTH
+      // recorded instead of one silently dropping the other.
       const roomData = [];
-      const seenParticipants = new Set(); // Track who we've seen in breakout rooms
+      const seenUuids = new Set();
+      const seenNames = new Set();
 
-      // Helper to check if name is Scout Bot
-      const isScoutBot = (name) => {
-        const pLower = name.toLowerCase();
-        return pLower.includes('scout bot') || pLower.includes('scoutbot') ||
-               pLower === 'scout s' || pLower.startsWith('scout ');
-      };
-
-      // APPROACH 1 (PRIMARY): Use room.participants from getBreakoutRoomList()
-      // This is the RELIABLE source - SDK embeds participants directly in each room
+      // APPROACH 1 (PRIMARY): room.participants from the FRESH getBreakoutRoomList()
       rooms.forEach(room => {
         const roomName = room.breakoutRoomName || room.name || 'Unknown';
         const roomParticipants = room.participants || room.members || room.attendees || [];
-
-        console.log(`Room "${roomName}" has ${roomParticipants.length} embedded participants`);
 
         const validParticipants = roomParticipants.map(p => {
           const pName = getParticipantName(p);
@@ -207,7 +239,9 @@ function MonitorPanel() {
         }).filter(p => {
           if (!p.name) return false;
           if (isScoutBot(p.name)) return false;
-          seenParticipants.add(p.name.toLowerCase()); // Track seen participants
+          const u = normalizeUUID(p.uuid);
+          if (u) seenUuids.add(u);
+          seenNames.add(p.name.toLowerCase());
           return true;
         });
 
@@ -216,8 +250,7 @@ function MonitorPanel() {
         }
       });
 
-      // APPROACH 2: Use getMeetingParticipants() for Main Room
-      // Anyone in allParticipants but NOT in a breakout room = Main Room
+      // APPROACH 2: getMeetingParticipants() minus breakout occupants = Main Room
       if (allParticipants.length > 0) {
         const mainRoomParticipants = [];
 
@@ -228,14 +261,18 @@ function MonitorPanel() {
           if (!pName) return;
           if (isScoutBot(pName)) return;
 
-          // If NOT already seen in a breakout room, they're in Main Room
-          if (!seenParticipants.has(pName.toLowerCase())) {
+          const u = normalizeUUID(p.participantUUID || p.uuid || p.id || '');
+          // Same UUID already seen in a breakout -> same person, skip.
+          // No UUID available -> fall back to name matching (old behavior).
+          const alreadySeen = u ? seenUuids.has(u) : seenNames.has(pName.toLowerCase());
+          if (!alreadySeen) {
             mainRoomParticipants.push({
               name: pName,
               email: pEmail,
               uuid: p.participantUUID || p.uuid || p.id || ''
             });
-            seenParticipants.add(pName.toLowerCase());
+            if (u) seenUuids.add(u);
+            seenNames.add(pName.toLowerCase());
           }
         });
 
@@ -244,42 +281,101 @@ function MonitorPanel() {
         }
       }
 
-      // Debug logging
-      console.log('=== ROOM DATA SUMMARY ===');
-      roomData.forEach(r => {
-        console.log(`${r.room_name}: ${r.participants.map(p => p.name).join(', ')}`);
-      });
-
       const totalParticipants = roomData.reduce((sum, r) => sum + r.participants.length, 0);
+      if (totalParticipants === 0) {
+        addLog('No participants captured this cycle');
+        return;
+      }
 
-      // Send to backend
+      // Refresh meeting id if it was unresolved when monitoring started
+      if (!meetingIdRef.current) {
+        const m = extractMeetingId(meetingContext);
+        if (m) meetingIdRef.current = m;
+      }
       const meetingId = meetingIdRef.current || extractMeetingId(meetingContext);
-      const response = await api.post('/monitor/snapshot', {
-        meeting_id: meetingId,
-        rooms: roomData
-      });
 
-      if (response.data.success) {
-        const now = new Date();
-        lastSuccessRef.current = now;
+      // captured_at lets the backend keep RESENT snapshots in their true
+      // 30s bucket instead of stamping them at arrival time.
+      const payload = {
+        meeting_id: meetingId,
+        rooms: roomData,
+        captured_at: new Date().toISOString()
+      };
+
+      try {
+        // Drain any queued failed uploads first (oldest first), then send
+        // the current snapshot. A failure re-queues and stops the drain.
+        while (pendingSnapshotsRef.current.length > 0) {
+          const queued = pendingSnapshotsRef.current[0];
+          await postSnapshot(queued);
+          pendingSnapshotsRef.current.shift();
+          savePendingSnapshots(pendingSnapshotsRef.current);
+          addLog(`Resent queued snapshot (${queued.captured_at})`);
+        }
+        await postSnapshot(payload);
+
+        const nowDate = new Date();
+        lastSuccessRef.current = nowDate;
         setPollCount(prev => prev + 1);
         setRoomCount(rooms.length);
         setParticipantCount(totalParticipants);
-        setLastPoll(now);
+        setLastPoll(nowDate);
         setRoomSummary(roomData.map(r => ({
           name: r.room_name,
           count: r.participants.length
         })));
         addLog(`OK: ${roomData.length} rooms, ${totalParticipants} participants`);
-      } else {
-        addLog(`ERROR: ${response.data.error}`);
-        setErrors(prev => [...prev.slice(-10), response.data.error]);
+      } catch (postErr) {
+        // Queue this snapshot for resend on a later cycle (capped)
+        pendingSnapshotsRef.current.push(payload);
+        if (pendingSnapshotsRef.current.length > MAX_PENDING_SNAPSHOTS) {
+          pendingSnapshotsRef.current = pendingSnapshotsRef.current.slice(-MAX_PENDING_SNAPSHOTS);
+        }
+        savePendingSnapshots(pendingSnapshotsRef.current);
+        addLog(`UPLOAD FAILED (queued for resend, ${pendingSnapshotsRef.current.length} pending): ${postErr.message}`);
+        setErrors(prev => [...prev.slice(-10), postErr.message]);
       }
     } catch (err) {
       addLog(`POLL FAILED: ${err.message}`);
       setErrors(prev => [...prev.slice(-10), err.message]);
+    } finally {
+      pollInFlightRef.current = false;
     }
-  }, [getBreakoutRooms, getParticipants, meetingContext, addLog]);
+  }, [getBreakoutRooms, getParticipants, meetingContext, addLog, withRetry, postSnapshot, maybeRecoverSdk]);
+
+  // Stop the poll timer (worker or interval), whichever is active
+  const stopPollTimer = useCallback(() => {
+    if (pollWorkerRef.current) {
+      try { pollWorkerRef.current.terminate(); } catch { /* ignore */ }
+      pollWorkerRef.current = null;
+    }
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
+
+  // Start the poll timer. Prefer a Web Worker tick: worker timers are NOT
+  // throttled when the panel is hidden/minimized, unlike page setInterval
+  // (Chromium throttles hidden pages to >=1/min, which both slowed polling
+  // to a crawl and made the watchdog constantly tear down the monitor).
+  const startPollTimer = useCallback(() => {
+    stopPollTimer();
+    try {
+      const blob = new Blob(
+        [`setInterval(function(){ postMessage('tick'); }, ${POLL_INTERVAL_MS});`],
+        { type: 'application/javascript' }
+      );
+      const url = URL.createObjectURL(blob);
+      const worker = new Worker(url);
+      URL.revokeObjectURL(url);
+      worker.onmessage = () => { doPoll(); };
+      pollWorkerRef.current = worker;
+    } catch (e) {
+      // CSP may block blob workers in some webviews — fall back to interval
+      intervalRef.current = setInterval(doPoll, POLL_INTERVAL_MS);
+    }
+  }, [doPoll, stopPollTimer]);
 
   // Start monitoring
   const startMonitoring = useCallback(async () => {
@@ -292,13 +388,8 @@ function MonitorPanel() {
       // Try multiple sources for meeting ID
       let mid = extractMeetingId(meetingContext);
 
-      // Debug: log the full context to see what fields are available
-      addLog(`Meeting context: ${JSON.stringify(meetingContext)}`);
-
-      // Fallback: try to get meeting ID from getMeetingUUID response (some SDK versions include it)
+      // Fallback: numeric meeting ID prefix inside the UUID (some SDK versions)
       if (!mid && uuid) {
-        // Some SDK versions return meeting ID as part of UUID or as separate field
-        // Also try extracting numeric part if UUID contains meeting ID
         const numericMatch = uuid.match(/^(\d{9,11})/);
         if (numericMatch) {
           mid = numericMatch[1];
@@ -306,69 +397,72 @@ function MonitorPanel() {
         }
       }
 
-      // Last resort: Use the configured meeting ID (from env or hardcoded)
-      if (!mid) {
-        mid = process.env.REACT_APP_MEETING_ID || '9034027764';  // Fallback to known meeting ID
-        addLog(`Using fallback meeting ID: ${mid}`);
+      // Env override, then the meeting UUID itself. NEVER a hardcoded ID:
+      // that silently filed a whole day's attendance under the wrong meeting.
+      // The UUID is unique and truthful; reports key on event_date anyway.
+      if (!mid) mid = process.env.REACT_APP_MEETING_ID || '';
+      if (!mid && uuid) {
+        mid = uuid;
+        addLog('No numeric meeting ID available - using meeting UUID as ID');
       }
 
       meetingIdRef.current = mid;
 
       if (!meetingIdRef.current) {
-        addLog('ERROR: Could not get meeting ID from any source');
-        setErrors(prev => [...prev, 'Meeting ID not available - check SDK permissions']);
-        return;
+        addLog('ERROR: Could not get meeting ID from any source - will retry');
+        setErrors(prev => [...prev.slice(-10), 'Meeting ID not available yet - retrying']);
+        return; // watchdog retries; doPoll also re-resolves the ID later
       }
 
       addLog(`Starting monitor for meeting ${meetingIdRef.current}`);
       addLog(`Meeting UUID: ${uuid}`);
 
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
+      stopPollTimer();
 
       isMonitoringRef.current = true;
       setIsMonitoring(true);
       setErrors([]);
 
       // Clear room cache to get fresh data on start
-      roomCacheRef.current = { rooms: [], roomMap: {}, timestamp: 0 };
+      roomCacheRef.current = { rooms: [], timestamp: 0 };
 
       // First poll immediately
       await doPoll();
 
       // Then poll every 30 seconds
-      intervalRef.current = setInterval(doPoll, POLL_INTERVAL_MS);
+      startPollTimer();
       addLog(`Polling every ${POLL_INTERVAL_MS / 1000}s`);
     } catch (err) {
       addLog(`Failed to start: ${err.message}`);
+      sdkFailCountRef.current += 1;
+      maybeRecoverSdk();
       isMonitoringRef.current = false;
       setIsMonitoring(false);
     } finally {
       isStartingRef.current = false;
     }
-  }, [getMeetingUUID, meetingContext, doPoll, addLog]);
+  }, [getMeetingUUID, meetingContext, doPoll, addLog, startPollTimer, stopPollTimer, maybeRecoverSdk]);
 
-  // Stop monitoring
+  // Stop monitoring — a USER stop stays stopped (the watchdog must not
+  // silently restart 25s later, which made this button a lie).
   const stopMonitoring = useCallback(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
+    userStoppedRef.current = true;
+    stopPollTimer();
     isMonitoringRef.current = false;
     isStartingRef.current = false;
     setIsMonitoring(false);
-    addLog('Monitoring stopped');
-  }, [addLog]);
+    addLog('Monitoring stopped by user (watchdog paused until Start is clicked)');
+  }, [addLog, stopPollTimer]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      stopPollTimer();
       if (watchdogRef.current) clearInterval(watchdogRef.current);
+      if (watchdogRestartRef.current) clearTimeout(watchdogRestartRef.current);
+      savePendingSnapshots(pendingSnapshotsRef.current);
     };
-  }, []);
+  }, [stopPollTimer]);
 
   // Background role refresh for logging only - does NOT gate monitoring.
   // Auto-start fires on SDK config regardless of detected role.
@@ -410,30 +504,47 @@ function MonitorPanel() {
     return () => window.removeEventListener('beforeunload', handler);
   }, []);
 
+  // Poll immediately when the panel becomes visible again — hidden webviews
+  // get throttled timers, so the first visible moment catches us up.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!isMonitoringRef.current || userStoppedRef.current) return;
+      const last = lastSuccessRef.current?.getTime?.() || 0;
+      if (Date.now() - last > POLL_INTERVAL_MS) doPoll();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [doPoll]);
+
   // WATCHDOG: keep monitoring alive while the Zoom App panel is loaded.
   useEffect(() => {
     if (!isConfigured) return;
 
     watchdogRef.current = setInterval(() => {
       if (isStartingRef.current) return;
+      if (userStoppedRef.current) return; // user pressed Stop — respect it
+      if (watchdogRestartRef.current) return; // restart already scheduled
 
       const lastSuccess = lastSuccessRef.current?.getTime?.() || 0;
       const stale = isMonitoringRef.current && lastSuccess > 0 && Date.now() - lastSuccess > STALE_AFTER_MS;
-      const missingTimer = isMonitoringRef.current && !intervalRef.current;
+      const missingTimer = isMonitoringRef.current && !intervalRef.current && !pollWorkerRef.current;
 
       if (!isMonitoringRef.current || stale || missingTimer) {
         if (stale) addLog('Watchdog: snapshot stale, restarting monitor');
         if (missingTimer) addLog('Watchdog: polling timer missing, restarting monitor');
         if (!isMonitoringRef.current) addLog('Watchdog: monitor is idle, starting monitor');
 
-        if (intervalRef.current) {
-          clearInterval(intervalRef.current);
-          intervalRef.current = null;
-        }
+        stopPollTimer();
         isMonitoringRef.current = false;
         setIsMonitoring(false);
         setAutoStarted(false);
-        setTimeout(() => startMonitoring(), START_RETRY_MS);
+        // Tracked so unmount/effect-cleanup can cancel it (an untracked
+        // timeout kept firing on dead components and leaked orphan pollers).
+        watchdogRestartRef.current = setTimeout(() => {
+          watchdogRestartRef.current = null;
+          if (!userStoppedRef.current) startMonitoring();
+        }, START_RETRY_MS);
       }
     }, WATCHDOG_INTERVAL_MS);
 
@@ -442,8 +553,12 @@ function MonitorPanel() {
         clearInterval(watchdogRef.current);
         watchdogRef.current = null;
       }
+      if (watchdogRestartRef.current) {
+        clearTimeout(watchdogRestartRef.current);
+        watchdogRestartRef.current = null;
+      }
     };
-  }, [isConfigured, startMonitoring, addLog]);
+  }, [isConfigured, startMonitoring, addLog, doPoll, stopPollTimer]);
 
   // Not configured
   if (!isConfigured) {
@@ -503,7 +618,7 @@ function MonitorPanel() {
       {/* Controls */}
       <div style={styles.actions}>
         {!isMonitoring ? (
-          <button style={styles.startButton} onClick={startMonitoring}>
+          <button style={styles.startButton} onClick={() => { userStoppedRef.current = false; startMonitoring(); }}>
             Start Monitoring
           </button>
         ) : (

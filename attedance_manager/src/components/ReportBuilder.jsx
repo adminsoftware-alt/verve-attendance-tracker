@@ -59,9 +59,10 @@ export default function ReportBuilder({ user }) {
   const [teams, setTeams] = useState([]);
   const [selectedTeam, setSelectedTeam] = useState('');
   const [startDate, setStartDate] = useState(() => {
-    const d = new Date();
-    d.setDate(1);
-    return d.toISOString().slice(0, 10);
+    // IST-safe month start: toISOString() on a local Date shifts to the
+    // previous month between 00:00-05:30 IST.
+    const ist = new Date(Date.now() + 330 * 60000);
+    return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, '0')}-01`;
   });
   const [endDate, setEndDate] = useState(istDate);
   const [columns, setColumns] = useState(['date', 'name', 'status', 'active_minutes', 'break_minutes', 'isolation_minutes']);
@@ -101,7 +102,15 @@ export default function ReportBuilder({ user }) {
   // Filters
   const addFilter = () => setFilters(prev => [...prev, { field: 'active_minutes', op: 'lt', value: '300', aggregate: false, days: 0 }]);
   const removeFilter = (i) => setFilters(prev => prev.filter((_, j) => j !== i));
-  const updateFilter = (i, key, val) => setFilters(prev => prev.map((f, j) => j === i ? { ...f, [key]: val } : f));
+  const updateFilter = (i, key, val) => setFilters(prev => prev.map((f, j) => {
+    if (j !== i) return f;
+    if (key === 'field') {
+      // Reset op/value so they stay valid for the new field type
+      if (val === 'status' && f.field !== 'status') return { ...f, field: val, op: 'eq', value: 'present' };
+      if (val !== 'status' && f.field === 'status') return { ...f, field: val, op: 'lt', value: '300' };
+    }
+    return { ...f, [key]: val };
+  }));
 
   // Generate report
   const generateReport = useCallback(async () => {
@@ -120,19 +129,23 @@ export default function ReportBuilder({ user }) {
     if (!data?.daily_data) return [];
 
     let rows = data.daily_data.map(d => {
-      // Trust the backend status: it is computed from total_minutes (break
-      // included) — recomputing here from active_minutes (break EXCLUDED)
-      // made this view disagree with Team View for anyone with break time.
-      const total = d.total_minutes != null ? d.total_minutes : (d.active_minutes || 0);
+      // Trust the backend status (computed on break-EXCLUSIVE active
+      // minutes, same rule as every other view). Fallback only for old
+      // cached responses that lack a status field.
+      const active = d.active_minutes || 0;
       return {
         ...d,
-        status: d.status || (total >= 300 ? 'present' : total >= 240 ? 'half_day' : 'absent'),
+        status: d.status || (active >= 300 ? 'present' : active >= 240 ? 'half_day' : 'absent'),
       };
     });
 
     // Simple filters (per-row)
     const simpleFilters = filters.filter(f => !f.aggregate);
     simpleFilters.forEach(f => {
+      if (f.field !== 'status') {
+        // Skip incomplete filters (empty or non-numeric value)
+        if (f.value === '' || Number.isNaN(parseFloat(f.value))) return;
+      }
       rows = rows.filter(r => {
         if (f.field === 'status') {
           return f.op === 'eq' ? r.status === f.value : r.status !== f.value;
@@ -164,6 +177,8 @@ export default function ReportBuilder({ user }) {
       Object.entries(nameGroups).forEach(([name, dayRows]) => {
         let allPass = true;
         aggFilters.forEach(f => {
+          // Skip incomplete filters (empty or non-numeric value)
+          if (f.value === '' || Number.isNaN(parseFloat(f.value))) return;
           const matchingDays = dayRows.filter(r => {
             const val = parseFloat(r[f.field] || 0);
             const target = parseFloat(f.value);
@@ -317,9 +332,9 @@ export default function ReportBuilder({ user }) {
                     <option value="neq">is not</option>
                   </select>
                   <select value={f.value} onChange={e => updateFilter(i, 'value', e.target.value)} style={s.filterSelect}>
-                    <option value="Present">Present</option>
-                    <option value="Half Day">Half Day</option>
-                    <option value="Absent">Absent</option>
+                    <option value="present">Present</option>
+                    <option value="half_day">Half Day</option>
+                    <option value="absent">Absent</option>
                   </select>
                 </>
               ) : (
