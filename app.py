@@ -7915,10 +7915,14 @@ def list_known_participants():
         # Allow custom lookback period (default 90 days, max 365)
         days = min(int(request.args.get('days', 90)), 365)
 
+        # event_date is a DATE column — compare directly. The previous
+        # SAFE.PARSE_DATE('%Y-%m-%d', event_date) treated it as a STRING,
+        # which BigQuery rejects at compile time (no DATE->STRING coercion),
+        # so this endpoint 500'd on every call.
         query = f"""
         SELECT DISTINCT participant_name, participant_email
         FROM `{dataset_ref}.room_snapshots_v2`
-        WHERE SAFE.PARSE_DATE('%Y-%m-%d', event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+        WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
           AND LOWER(participant_name) NOT LIKE '%scout%'
           AND participant_name IS NOT NULL AND participant_name != ''
         ORDER BY participant_name
