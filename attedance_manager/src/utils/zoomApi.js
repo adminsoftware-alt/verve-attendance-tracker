@@ -190,6 +190,17 @@ export async function addTeamMember(teamId, name, email) {
   return apiPost(`/teams/${teamId}/members`, { participant_name: name, participant_email: email });
 }
 
+export async function fetchAllTeamMembers() {
+  // Every roster member across all teams — used by the unmatched-participant
+  // banner's "link to member" dropdown.
+  return apiFetch('/teams/members/all');
+}
+
+export async function createParticipantAlias(aliasName, memberName, memberEmail = '') {
+  // Permanently link a Zoom display-name variant to a roster member.
+  return apiPost('/aliases', { alias_name: aliasName, member_name: memberName, member_email: memberEmail });
+}
+
 export async function bulkAddTeamMembers(teamId, members) {
   return apiPost(`/teams/${teamId}/members/bulk`, { members });
 }

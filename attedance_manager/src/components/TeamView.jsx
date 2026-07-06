@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   fetchTeams, fetchTeamAttendance, fetchTeamAttendanceRange,
-  fetchTeamMonthlyReport, getTeamRangeCsvUrl
+  fetchTeamMonthlyReport, getTeamRangeCsvUrl,
+  fetchAllTeamMembers, createParticipantAlias, addTeamMember
 } from '../utils/zoomApi';
 import { downloadTeamPivotExcel } from '../utils/teamPivotExcel';
 import MonthlyPivotTables from './MonthlyPivotTables';
@@ -56,6 +57,12 @@ export default function TeamView({ user }) {
   const [editModalMember, setEditModalMember] = useState(null);
   const [editModalDate, setEditModalDate] = useState(null);
 
+  // Unmatched-participant resolution (link alias / add to team)
+  const [allMembers, setAllMembers] = useState([]);        // roster across all teams
+  const [linkSelection, setLinkSelection] = useState({});  // zoomName -> member_name
+  const [resolvedNames, setResolvedNames] = useState({});  // zoomName -> 'linked'|'added'|error msg
+  const [resolveBusy, setResolveBusy] = useState('');      // zoomName in flight
+
   // Manager filtering
   const isManager = user?.role === 'manager';
 
@@ -99,6 +106,45 @@ export default function TeamView({ user }) {
   }, [selectedTeam, mode, date, startDate, endDate, year, month]);
 
   useEffect(() => { loadAttendance(); }, [loadAttendance]);
+
+  // Lazy-load the full roster (for the "link to member" dropdown) only when
+  // the banner actually has unmatched names to resolve.
+  const unmatchedList = attendance?.unmatched_participants || [];
+  useEffect(() => {
+    if (unmatchedList.length > 0 && allMembers.length === 0) {
+      fetchAllTeamMembers()
+        .then(d => setAllMembers(d.members || []))
+        .catch(e => console.error('Failed to load roster for alias linking:', e));
+    }
+  }, [unmatchedList.length, allMembers.length]);
+
+  // Link a Zoom display name to an existing roster member (creates an alias;
+  // takes effect on the next data load since today is always rebuilt).
+  const handleLinkAlias = async (zoomName, zoomEmail) => {
+    const memberName = linkSelection[zoomName];
+    if (!memberName) return;
+    setResolveBusy(zoomName);
+    try {
+      await createParticipantAlias(zoomName, memberName, zoomEmail || '');
+      setResolvedNames(prev => ({ ...prev, [zoomName]: `linked to ${memberName}` }));
+    } catch (e) {
+      setResolvedNames(prev => ({ ...prev, [zoomName]: `error: ${e.message}` }));
+    }
+    setResolveBusy('');
+  };
+
+  // Add the Zoom name as a brand-new member of the currently selected team.
+  const handleAddUnmatched = async (zoomName, zoomEmail) => {
+    if (!selectedTeam) return;
+    setResolveBusy(zoomName);
+    try {
+      await addTeamMember(selectedTeam, zoomName, zoomEmail || '');
+      setResolvedNames(prev => ({ ...prev, [zoomName]: 'added to this team' }));
+    } catch (e) {
+      setResolvedNames(prev => ({ ...prev, [zoomName]: `error: ${e.message}` }));
+    }
+    setResolveBusy('');
+  };
 
   // Daily stats
   const dailyStats = useMemo(() => {
@@ -228,18 +274,60 @@ export default function TeamView({ user }) {
             </div>
           )}
 
-          {/* Name-drift warning: people in the meeting whose Zoom name matches
-              no roster member anywhere — their hours are invisible in Team
-              View until an admin fixes the roster name or email. */}
-          {(attendance.unmatched_participants || []).length > 0 && (
+          {/* Name-drift resolver: people in the meeting whose Zoom name
+              matches no roster member anywhere. Each can be LINKED to an
+              existing member (permanent alias) or ADDED to this team. */}
+          {unmatchedList.length > 0 && (
             <div style={{
               margin: '0 0 12px', padding: '10px 14px', borderRadius: 8,
               background: '#fef3c7', border: '1px solid #f59e0b', fontSize: 12.5, color: '#92400e',
             }}>
-              <strong>⚠ {attendance.unmatched_participants.length} participant(s) in the meeting don't match any team roster</strong>
-              {' — their hours are NOT counted in any team: '}
-              {attendance.unmatched_participants.map(u => u.name).join(', ')}
-              {'. Fix their name/email in the team roster to include them.'}
+              <strong>⚠ {unmatchedList.length} participant(s) in the meeting don't match any team roster</strong>
+              {' — their hours are not counted in any team. Link each to an existing member, or add them to this team:'}
+              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {unmatchedList.map(u => (
+                  <div key={u.name} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ fontWeight: 600, minWidth: 180 }}>{u.name}</span>
+                    {resolvedNames[u.name] ? (
+                      <span style={{ color: resolvedNames[u.name].startsWith('error') ? '#dc2626' : '#15803d' }}>
+                        ✓ {resolvedNames[u.name]}
+                      </span>
+                    ) : (
+                      <>
+                        <select
+                          value={linkSelection[u.name] || ''}
+                          onChange={e => setLinkSelection(prev => ({ ...prev, [u.name]: e.target.value }))}
+                          style={{ fontSize: 12, padding: '3px 6px', borderRadius: 5, border: '1px solid #d1d5db', maxWidth: 240 }}
+                        >
+                          <option value="">Link to existing member…</option>
+                          {allMembers.map((m, i) => (
+                            <option key={`${m.member_name}|${m.team_id}|${i}`} value={m.member_name}>
+                              {m.member_name} [{m.team_name}]
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          disabled={!linkSelection[u.name] || resolveBusy === u.name}
+                          onClick={() => handleLinkAlias(u.name, u.email)}
+                          style={{ fontSize: 12, padding: '3px 10px', borderRadius: 5, border: 'none', background: '#2563eb', color: '#fff', cursor: 'pointer', opacity: (!linkSelection[u.name] || resolveBusy === u.name) ? 0.5 : 1 }}
+                        >
+                          {resolveBusy === u.name ? '…' : 'Link'}
+                        </button>
+                        <button
+                          disabled={resolveBusy === u.name}
+                          onClick={() => handleAddUnmatched(u.name, u.email)}
+                          style={{ fontSize: 12, padding: '3px 10px', borderRadius: 5, border: '1px solid #059669', background: '#fff', color: '#059669', cursor: 'pointer' }}
+                        >
+                          Add to this team
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 8, fontSize: 11.5 }}>
+                Linking/adding takes effect on the next refresh for today; run a backfill to fix past days.
+              </div>
             </div>
           )}
 

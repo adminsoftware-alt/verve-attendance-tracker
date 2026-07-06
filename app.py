@@ -7377,6 +7377,21 @@ def ensure_team_tables():
     """
     client.query(registry_sql).result()
 
+    # Participant aliases - maps a Zoom display name variant to a roster
+    # member, so "Anurag_Accurest" links to team member "Anurag Gaigowal"
+    # without renaming either. Used by the v2 team identity bridge.
+    aliases_sql = f"""
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.participant_aliases` (
+        alias_id STRING NOT NULL,
+        alias_name STRING NOT NULL,
+        member_name STRING NOT NULL,
+        member_email STRING,
+        created_by STRING,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    client.query(aliases_sql).result()
+
     # Team holidays - per-team holiday dates (so different teams can have
     # different holiday calendars)
     holidays_sql = f"""
@@ -7733,6 +7748,119 @@ def remove_team_member(team_id, member_id):
         return jsonify({'success': True})
     except Exception as e:
         print(f"[Teams] Remove member error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/teams/members/all', methods=['GET'])
+def list_all_team_members():
+    """Every roster member across every team — feeds the 'link alias to
+    member' dropdown in the Team View unmatched-participants banner."""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        q = f"""
+        SELECT tm.participant_name AS member_name,
+               tm.participant_email AS member_email,
+               tm.team_id,
+               ANY_VALUE(t.team_name) AS team_name
+        FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
+        LEFT JOIN `{dataset_ref}.{BQ_TEAMS_TABLE}` t ON t.team_id = tm.team_id
+        GROUP BY tm.participant_name, tm.participant_email, tm.team_id
+        ORDER BY member_name
+        """
+        rows = list(client.query(q).result())
+        members = [{'member_name': r.member_name,
+                    'member_email': r.member_email or '',
+                    'team_id': r.team_id,
+                    'team_name': r.team_name or ''} for r in rows]
+        return jsonify({'success': True, 'members': members})
+    except Exception as e:
+        print(f"[Teams] all-members error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/aliases', methods=['GET'])
+def list_aliases():
+    """List participant aliases (Zoom name variant -> roster member)."""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        rows = list(client.query(
+            f"SELECT alias_id, alias_name, member_name, member_email FROM `{dataset_ref}.participant_aliases` ORDER BY alias_name"
+        ).result())
+        return jsonify({'success': True, 'aliases': [
+            {'alias_id': r.alias_id, 'alias_name': r.alias_name,
+             'member_name': r.member_name, 'member_email': r.member_email or ''}
+            for r in rows
+        ]})
+    except Exception as e:
+        print(f"[Aliases] list error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/aliases', methods=['POST'])
+def create_alias():
+    """Link a Zoom display-name variant to a roster member.
+    Body: {"alias_name": "Anurag_Accurest", "member_name": "Anurag Gaigowal",
+           "member_email": "" (optional)}
+    Takes effect for TODAY on the next view load (today is always rebuilt);
+    past days pick it up when rebuilt/backfilled."""
+    try:
+        ensure_team_tables_once()
+        data = request.json or {}
+        alias_name = (data.get('alias_name') or '').strip()
+        member_name = (data.get('member_name') or '').strip()
+        member_email = (data.get('member_email') or '').strip()
+        if not alias_name or not member_name:
+            return jsonify({'success': False, 'error': 'alias_name and member_name are required'}), 400
+        if alias_name.lower() == member_name.lower():
+            return jsonify({'success': False, 'error': 'alias and member name are identical — no alias needed'}), 400
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        alias_id = str(uuid_lib.uuid4())
+        # DML insert (not streaming) so a later DELETE works immediately —
+        # streaming-buffer rows cannot be deleted for ~90 minutes.
+        q = f"""
+        INSERT INTO `{dataset_ref}.participant_aliases`
+            (alias_id, alias_name, member_name, member_email, created_at)
+        VALUES (@alias_id, @alias_name, @member_name, @member_email, CURRENT_TIMESTAMP())
+        """
+        client.query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("alias_id", "STRING", alias_id),
+            bigquery.ScalarQueryParameter("alias_name", "STRING", alias_name),
+            bigquery.ScalarQueryParameter("member_name", "STRING", member_name),
+            bigquery.ScalarQueryParameter("member_email", "STRING", member_email),
+        ])).result()
+        print(f"[Aliases] Linked '{alias_name}' -> '{member_name}'")
+        return jsonify({'success': True, 'alias_id': alias_id})
+    except Exception as e:
+        print(f"[Aliases] create error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/aliases/<alias_id>', methods=['DELETE'])
+def delete_alias(alias_id):
+    """Remove an alias link."""
+    try:
+        ensure_team_tables_once()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        client.query(
+            f"DELETE FROM `{dataset_ref}.participant_aliases` WHERE alias_id = @alias_id",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("alias_id", "STRING", alias_id),
+            ])
+        ).result()
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[Aliases] delete error: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -15356,6 +15484,14 @@ def team_attendance_v2(team_id, date):
             WHERE event_date = @date
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
+        aliases AS (
+            -- Admin-confirmed links: Zoom display-name variant -> roster
+            -- member. participant_key is already the normalized name.
+            SELECT DISTINCT
+                {_sql_normalize_name('alias_name')} AS alias_key,
+                {_sql_normalize_name('member_name')} AS member_key
+            FROM `{dataset_ref}.participant_aliases`
+        ),
         member_bridge AS (
             SELECT DISTINCT
                 tm.member_name,
@@ -15368,6 +15504,11 @@ def team_attendance_v2(team_id, date):
                 OR (
                   NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
                   AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(tm.member_email)), '')
+                )
+                OR EXISTS (
+                  SELECT 1 FROM aliases al
+                  WHERE al.alias_key = dk.participant_key
+                    AND al.member_key = {norm_tm}
                 )
               )
         ),
@@ -15487,6 +15628,11 @@ def team_attendance_v2(team_id, date):
                 SELECT DISTINCT participant_name AS member_name,
                                 participant_email AS member_email
                 FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+                UNION DISTINCT
+                -- Aliased Zoom names are matched, not drift — exclude them
+                SELECT alias_name AS member_name,
+                       member_email
+                FROM `{dataset_ref}.participant_aliases`
             ),
             dk AS (
                 SELECT DISTINCT participant_name, participant_email
@@ -15803,6 +15949,15 @@ def team_attendance_range_v2(team_id):
             WHERE event_date BETWEEN @start AND @end
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
+        aliases AS (
+            -- Admin-confirmed links: Zoom display-name variant -> roster
+            -- member. participant_key is already the normalized name, so
+            -- alias_key compares against it directly.
+            SELECT DISTINCT
+                {_sql_normalize_name('alias_name')} AS alias_key,
+                {_sql_normalize_name('member_name')} AS member_key
+            FROM `{dataset_ref}.participant_aliases`
+        ),
         member_bridge AS (
             SELECT DISTINCT
                 tm.member_name, tm.member_email,
@@ -15814,6 +15969,11 @@ def team_attendance_range_v2(team_id):
                 OR (
                   NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
                   AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(tm.member_email)), '')
+                )
+                OR EXISTS (
+                  SELECT 1 FROM aliases al
+                  WHERE al.alias_key = dk.participant_key
+                    AND al.member_key = {norm_tm}
                 )
               )
         ),
@@ -15992,6 +16152,15 @@ def team_monthly_report_v2(team_id):
             WHERE event_date BETWEEN @start AND @end
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
+        aliases AS (
+            -- Admin-confirmed links: Zoom display-name variant -> roster
+            -- member. participant_key is already the normalized name, so
+            -- alias_key compares against it directly.
+            SELECT DISTINCT
+                {_sql_normalize_name('alias_name')} AS alias_key,
+                {_sql_normalize_name('member_name')} AS member_key
+            FROM `{dataset_ref}.participant_aliases`
+        ),
         member_bridge AS (
             SELECT DISTINCT
                 tm.member_name, tm.member_email,
@@ -16003,6 +16172,11 @@ def team_monthly_report_v2(team_id):
                 OR (
                   NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
                   AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(tm.member_email)), '')
+                )
+                OR EXISTS (
+                  SELECT 1 FROM aliases al
+                  WHERE al.alias_key = dk.participant_key
+                    AND al.member_key = {norm_tm}
                 )
               )
         ),
