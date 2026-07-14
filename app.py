@@ -2861,6 +2861,18 @@ def monitor_snapshot():
     if not meeting_id or not rooms:
         return jsonify({'error': 'meeting_id and rooms required'}), 400
 
+    # When the monitor starts while Scout Bot is inside a breakout room, the
+    # SDK has no numeric meeting ID and sends the meeting UUID instead. The
+    # BigQuery meeting_id column is INTEGER, so those inserts fail. Substitute
+    # the numeric ID the server already learned from webhooks.
+    if not str(meeting_id).strip().isdigit():
+        fallback = str(meeting_state.meeting_id or os.environ.get('FIXED_MEETING_ID', '')).strip()
+        if fallback.isdigit():
+            print(f"[Monitor] Non-numeric meeting_id '{meeting_id}' from SDK - using {fallback}")
+            meeting_id = fallback
+        else:
+            return jsonify({'error': f'meeting_id must be numeric, got: {meeting_id}'}), 400
+
     now = datetime.utcnow()
     # Optional client capture timestamp: the monitor app queues snapshots it
     # could not deliver (backend outage, Wi-Fi blip) and resends them later.
