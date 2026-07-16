@@ -7,8 +7,10 @@ const ZOOM_API_BASE = 'https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app'
 
 // ─── FETCH HELPERS ─────────────────────────────────────
 
+import { authHeaders } from './storage';
+
 async function apiFetch(path) {
-  const res = await fetch(`${ZOOM_API_BASE}${path}`);
+  const res = await fetch(`${ZOOM_API_BASE}${path}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
   const data = await res.json();
   if (data.success === false) throw new Error(data.error || 'API returned failure');
@@ -137,7 +139,7 @@ export async function fetchMonitorHealth() {
 async function apiPost(path, body) {
   const res = await fetch(`${ZOOM_API_BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body)
   });
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
@@ -149,7 +151,7 @@ async function apiPost(path, body) {
 async function apiPut(path, body) {
   const res = await fetch(`${ZOOM_API_BASE}${path}`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body)
   });
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
@@ -159,7 +161,7 @@ async function apiPut(path, body) {
 }
 
 async function apiDelete(path) {
-  const res = await fetch(`${ZOOM_API_BASE}${path}`, { method: 'DELETE' });
+  const res = await fetch(`${ZOOM_API_BASE}${path}`, { method: 'DELETE', headers: authHeaders() });
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
   const data = await res.json();
   if (data.success === false) throw new Error(data.error || 'API returned failure');
@@ -380,7 +382,7 @@ export async function fetchUnrecognizedMonthly(year, month) {
 export async function sendChatPrompt({ prompt, user, role, confirmToken, history } = {}) {
   const res = await fetch(`${ZOOM_API_BASE}/chat`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({
       prompt: prompt || '',
       user: user || '',
@@ -467,7 +469,7 @@ export async function adminEditSnapshots(snapshotIds, fields) {
 export async function adminDeleteSnapshots(snapshotIds) {
   const res = await fetch(`${ZOOM_API_BASE}/admin/snapshots/delete`, {
     method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ snapshot_ids: snapshotIds })
   });
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
@@ -491,7 +493,7 @@ export async function adminEditEvents(eventIds, fields) {
 export async function adminDeleteEvents(eventIds) {
   const res = await fetch(`${ZOOM_API_BASE}/admin/events/delete`, {
     method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ event_ids: eventIds })
   });
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);

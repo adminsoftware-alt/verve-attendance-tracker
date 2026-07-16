@@ -390,15 +390,14 @@ src/
 
 These are tracked from a project-wide audit. Each touches surface area that affects production data or auth flow, so they were not changed without explicit approval.
 
-- **Plaintext passwords in `app_users` BigQuery table.** Login query does `WHERE TRIM(password) = @password` (app.py:10827). Needs bcrypt/argon2 migration.
-- **`DEFAULT_USERS` fallback in the JS bundle** (`attedance_manager/src/utils/storage.js:14-32`). Plaintext credentials shipped to every browser. Should be deleted.
-- **Webhook signature can be bypassed** by omitting `x-zm-signature` / `x-zm-request-timestamp` (app.py:3583). Should only allow the no-signature path for `endpoint.url_validation` events.
-- **`/chat` accepts client-supplied `role`** (app.py:2757-2758). Pulls role from request JSON instead of server-side session.
-- **All POST/PUT/DELETE endpoints unauthenticated.** `/teams`, `/employees`, `/qos/*`, `/calibration/*`, `/report/generate`, `/auth/users` GET — no auth checks. Needs a `require_auth` decorator pass.
-- **Session in `sessionStorage`** instead of httpOnly cookie. XSS = account takeover.
-- **Test/debug endpoints exposed in prod** (`/debug/reset`, `/test/webhook-insert`, `/test/qos-insert`).
+- **Plaintext passwords in `app_users` BigQuery table.** Login query does `WHERE TRIM(password) = @password`. Needs bcrypt/argon2 migration.
+- ~~`DEFAULT_USERS` fallback in the JS bundle~~ **FIXED 2026-07-16**: removed; login is server-side only.
+- ~~Webhook signature can be bypassed by omitting headers~~ **FIXED 2026-07-16**: missing `x-zm-signature`/`x-zm-request-timestamp` now 401s; only `endpoint.url_validation` is exempt.
+- ~~`/chat` accepts client-supplied `role`~~ **FIXED 2026-07-16**: role/user come from the verified auth token when present.
+- ~~All POST/PUT/DELETE endpoints unauthenticated~~ **FIXED 2026-07-16**: `require_auth` (HMAC-signed Bearer token from `/auth/login`) on 45 mutating routes; admin/superadmin roles enforced on user-management + `/admin/*` + test/debug endpoints. Deliberately left open: `/webhook` (Zoom-signed), `/monitor/snapshot` + `/calibration/*` (bot/SDK app, no login context), scheduler-called builders (`/intervals/*`, `/qos/scheduled`, `/report/generate`, `/reconcile/zoom`), and `/admin/ops/partition-events` (temporary — DELETE after the 2026-07-17 partition swap completes).
+- **Session + auth token in `sessionStorage`** instead of httpOnly cookie. XSS = account takeover. (Token expires after 12h, limiting blast radius.)
 - **IST midnight timezone drift** on multi-meeting day boundaries (deferred — touches date math used by every report query).
-- **Scout Bot detection is substring match** (`app.py:2047`). "Real Person Scout Bot" bypasses tracking. Should be exact match.
+- **Scout Bot detection is substring match**. "Real Person Scout Bot" bypasses tracking. Should be exact match.
 
 ## graphify
 

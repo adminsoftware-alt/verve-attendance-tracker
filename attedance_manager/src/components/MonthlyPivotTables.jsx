@@ -81,6 +81,7 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
         isolationHours: isoMins / 60,
         breakHours: brkMins / 60,
         status: r.status || null,
+        estimated: !!r.estimated,      // >50% webhook-estimated (low confidence)
       };
     });
 
@@ -234,9 +235,18 @@ function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap
                     let cellStyle = s.cellTd;
                     if (h > 0 && h < EARLY_LOGOUT_MAX_HOURS) cellStyle = { ...s.cellTd, background: '#ffedd5', color: '#9a3412', fontWeight: 600 };
                     else if (h > OVERTIME_MIN_HOURS) cellStyle = { ...s.cellTd, background: '#fef9c3', color: '#854d0e', fontWeight: 600 };
+                    const est = lookup[`${name}|${ds}`]?.estimated;
+                    const cellTitle = est
+                      ? 'Estimated from webhook data (bot coverage missing)' + (editProps.title ? ' — ' + editProps.title : '')
+                      : editProps.title;
                     return (
-                      <td key={ds} {...editProps} style={{ ...cellStyle, ...(editProps.style || {}) }}>
-                        {h > 0 ? fmtHoursDecimal(h) : canEdit ? <span style={{ color: '#cbd5e1' }}>·</span> : ''}
+                      <td key={ds} {...editProps} style={{ ...cellStyle, ...(editProps.style || {}) }} title={cellTitle}>
+                        {h > 0 ? (
+                          <>
+                            {est && <span style={{ color: '#d97706', marginRight: 2 }}>⚠</span>}
+                            {fmtHoursDecimal(h)}
+                          </>
+                        ) : canEdit ? <span style={{ color: '#cbd5e1' }}>·</span> : ''}
                       </td>
                     );
                   })}

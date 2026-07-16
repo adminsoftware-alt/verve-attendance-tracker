@@ -8,29 +8,19 @@ const API_BASE = 'https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app';
 const STORAGE_KEY = 'verve_attendance_data';
 
 // ─── AUTH ───────────────────────────────────────────────
+// (DEFAULT_USERS local fallback removed: it shipped plaintext credentials in
+// the JS bundle and bypassed the server. Login is server-side only now.)
 
-const DEFAULT_USERS = [
-  // Superadmin
-  { username: 'dev@verveadvisory.in', password: 'verve2026', name: 'Developer', role: 'superadmin', email: 'dev@verveadvisory.in' },
-  // Admin accounts
-  { username: 'admin', password: 'verve2026', name: 'Admin', role: 'admin', email: '' },
-  { username: 'shashank', password: 'verve2026', name: 'Shashank Channawar', role: 'admin', email: 'shashank.channawar@verveadvisory.com' },
-  { username: 'harsh', password: 'verve2026', name: 'Harsh Jain', role: 'admin', email: 'harsh.jain@verveadvisory.com' },
-  // Manager accounts (name matches team manager_name for filtering)
-  { username: 'teaminfrbeat@', password: 'verve2026', name: 'Team Infrabeat', role: 'manager', email: '' },
-  { username: 'teamharshal@', password: 'verve2026', name: 'Team Harshal', role: 'manager', email: '' },
-  { username: 'teamaccounts@', password: 'verve2026', name: 'Team Accounts', role: 'manager', email: '' },
-  { username: 'teamatish@', password: 'verve2026', name: 'Team Atish', role: 'manager', email: '' },
-  { username: 'teamunimed@', password: 'verve2026', name: 'Team Unimed', role: 'manager', email: '' },
-  { username: 'teamaaron@', password: 'verve2026', name: 'Team Aaron', role: 'manager', email: '' },
-  { username: 'teampriya@', password: 'verve2026', name: 'Team Priya', role: 'manager', email: '' },
-  { username: 'infrabeatclient@', password: 'verve2026', name: 'Infrabeat Client', role: 'manager', email: '' },
-  { username: 'vridam@', password: 'verve2026', name: 'Vridam', role: 'manager', email: '' },
-  { username: 'accurestclient@', password: 'verve2026', name: 'Accurest Client', role: 'manager', email: '' },
-  { username: 'kprckuldeep@', password: 'verve2026', name: 'KPRC Client-Kuldeep Sir', role: 'manager', email: '' },
-  { username: 'kprcpawan@', password: 'verve2026', name: 'KPRC Client-Pawan Sir', role: 'manager', email: '' },
-  { username: 'kprcyogendra@', password: 'verve2026', name: 'KPRC Client-Yogendra Sir', role: 'manager', email: '' },
-];
+const TOKEN_KEY = 'verve_token';
+
+export function getAuthToken() {
+  try { return sessionStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; }
+}
+
+export function authHeaders() {
+  const t = getAuthToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
 
 export async function validateLogin(username, password) {
   try {
@@ -41,13 +31,15 @@ export async function validateLogin(username, password) {
     });
     const data = await res.json();
     if (data.success && data.user) {
+      if (data.token) {
+        try { sessionStorage.setItem(TOKEN_KEY, data.token); } catch { /* ignore */ }
+      }
       return data.user;
     }
     return null;
   } catch (err) {
-    console.error('Login API error, using fallback:', err);
-    // Fallback: local
-    return DEFAULT_USERS.find(u => u.username === username && u.password === password) || null;
+    console.error('Login API error:', err);
+    return null;
   }
 }
 
@@ -64,6 +56,7 @@ export function setSession(user) {
 
 export function clearSession() {
   sessionStorage.removeItem('verve_session');
+  try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
 }
 
 // ─── ATTENDANCE DATA ────────────────────────────────────
@@ -97,7 +90,7 @@ export async function saveDayData(dateStr, employees, uploadedBy) {
   try {
     const res = await fetch(`${API_BASE}/data/attendance`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         report_date: dateStr,
         employees: employees,
@@ -120,7 +113,8 @@ export async function saveDayData(dateStr, employees, uploadedBy) {
 export async function deleteDayData(dateStr) {
   try {
     const res = await fetch(`${API_BASE}/data/attendance/${dateStr}`, {
-      method: 'DELETE'
+      method: 'DELETE',
+      headers: authHeaders()
     });
     const data = await res.json();
     if (!data.success) console.error('Delete API error:', data.error);

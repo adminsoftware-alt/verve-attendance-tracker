@@ -361,6 +361,7 @@ export default function TeamView({ user }) {
                       <td style={s.td}>{m.first_seen_ist || '-'}</td>
                       <td style={s.td}>{m.last_seen_ist || '-'}</td>
                       <td style={{ ...s.td, fontWeight: 600, color: m.total_duration_mins >= 300 ? '#10b981' : m.total_duration_mins >= 240 ? '#f59e0b' : m.total_duration_mins > 0 ? '#ef4444' : '#94a3b8' }}>
+                        {m.estimated && <span title="Estimated from webhook data (bot coverage missing)" style={{ color: '#d97706', marginRight: 3 }}>⚠</span>}
                         {fmtMins(m.total_duration_mins)}
                       </td>
                       <td style={{ ...s.td, color: '#3b82f6' }}>{fmtMins(m.breakout_mins)}</td>
@@ -450,7 +451,10 @@ export default function TeamView({ user }) {
                         <td style={s.td}>{d.name}</td>
                         <td style={s.td}>{d.first_seen_ist || '-'}</td>
                         <td style={s.td}>{d.last_seen_ist || '-'}</td>
-                        <td style={{ ...s.td, color: '#10b981', fontWeight: 600 }}>{fmtMins(d.active_minutes)}</td>
+                        <td style={{ ...s.td, color: '#10b981', fontWeight: 600 }}>
+                          {d.estimated && <span title="Estimated from webhook data (bot coverage missing)" style={{ color: '#d97706', marginRight: 3 }}>⚠</span>}
+                          {fmtMins(d.active_minutes)}
+                        </td>
                         <td style={{ ...s.td, color: '#f97316' }}>{fmtMins(d.break_minutes)}</td>
                         <td style={{ ...s.td, color: '#64748b' }}>{fmtMins(d.isolation_minutes)}</td>
                       </tr>

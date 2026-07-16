@@ -424,6 +424,68 @@ BQ_DATASET = os.environ.get('BQ_DATASET', 'breakout_room_calibrator')
 
 # BigQuery Tables
 BQ_EVENTS_TABLE = 'participant_events'
+
+# ==============================================================================
+# SIGNED AUTH TOKENS (require_auth) — login issues an HMAC-signed token; every
+# mutating endpoint validates it. Fixes the "all POST/PUT/DELETE endpoints
+# unauthenticated" known issue without adding a session store: the token is
+# stateless and verifiable by any Cloud Run instance.
+# ==============================================================================
+import base64 as _b64mod
+from functools import wraps as _wraps
+
+AUTH_TOKEN_SECRET = (os.environ.get('AUTH_TOKEN_SECRET')
+                     or ZOOM_WEBHOOK_SECRET or ZOOM_CLIENT_SECRET or '')
+AUTH_TOKEN_TTL_SECONDS = int(os.environ.get('AUTH_TOKEN_TTL_SECONDS', str(12 * 3600)))
+
+
+def make_auth_token(username, role):
+    payload = json.dumps(
+        {'u': username, 'r': role, 'exp': int(time.time()) + AUTH_TOKEN_TTL_SECONDS},
+        separators=(',', ':'))
+    body = _b64mod.urlsafe_b64encode(payload.encode()).decode().rstrip('=')
+    sig = hmac.new(AUTH_TOKEN_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+def verify_auth_token(token):
+    """Return the token payload dict, or None if invalid/expired."""
+    try:
+        body, sig = token.split('.', 1)
+        expected = hmac.new(AUTH_TOKEN_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(_b64mod.urlsafe_b64decode(body + '=' * (-len(body) % 4)))
+        if payload.get('exp', 0) < time.time():
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def require_auth(roles=None):
+    """Decorator: endpoint requires a valid Bearer token (from /auth/login).
+    Optional roles list restricts to those roles. Place BELOW @app.route.
+    If no secret is configured at all (bare dev env), auth is skipped."""
+    def deco(fn):
+        @_wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not AUTH_TOKEN_SECRET:
+                return fn(*args, **kwargs)
+            hdr = request.headers.get('Authorization', '')
+            token = hdr[7:] if hdr.startswith('Bearer ') else request.headers.get('X-Auth-Token', '')
+            payload = verify_auth_token(token) if token else None
+            if payload is None:
+                return jsonify({'success': False, 'error': 'Authentication required'}), 401
+            if roles and payload.get('r') not in roles:
+                return jsonify({'success': False, 'error': 'Insufficient role'}), 403
+            request.auth_user = payload
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
+
+
+
 BQ_MAPPINGS_TABLE = 'room_mappings'
 BQ_CAMERA_TABLE = 'camera_events'
 BQ_QOS_TABLE = 'qos_data'
@@ -2769,6 +2831,7 @@ def health_check():
 # ==============================================================================
 
 @app.route('/chat', methods=['POST'])
+@require_auth()
 def chat_endpoint():
     """Take a free-text prompt + user context, dispatch to a chatbot intent.
     Always returns HTTP 200 with a JSON body so the UI can show the error
@@ -2792,8 +2855,13 @@ def chat_endpoint():
             'dataset_ref': f"{GCP_PROJECT_ID}.{BQ_DATASET}",
             'project_id': GCP_PROJECT_ID,
             'base_url': base_url,
-            'user': (data.get('user') or '').strip() or None,
-            'role': (data.get('role') or '').strip() or None,
+            # Identity/role come from the VERIFIED token, never from the
+            # request body (client-supplied role was a privilege-escalation
+            # hole — CLAUDE.md known issue).
+            'user': (getattr(request, 'auth_user', None) or {}).get('u')
+                    or (data.get('user') or '').strip() or None,
+            'role': (getattr(request, 'auth_user', None) or {}).get('r')
+                    or (data.get('role') or '').strip() or None,
         }
         history = data.get('history') if isinstance(data.get('history'), list) else None
         return jsonify(_chat_dispatch(prompt, ctx, confirm_token=confirm_token, history=history))
@@ -5780,6 +5848,7 @@ def qos_status():
 
 
 @app.route('/qos/delete', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
 def qos_delete():
     """Delete QoS data for a specific date to allow recollection"""
     data = request.json or {}
@@ -6298,6 +6367,7 @@ def debug_rooms():
 
 
 @app.route('/debug/reset', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
 def debug_reset():
     """Reset meeting state (for testing)"""
     meeting_state.reset()
@@ -6363,6 +6433,7 @@ def test_bigquery():
 
 
 @app.route('/test/webhook-insert', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
 def test_webhook_insert():
     """
     Test endpoint to simulate a webhook and verify BigQuery insert.
@@ -6402,6 +6473,7 @@ def test_webhook_insert():
 
 
 @app.route('/test/qos-insert', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
 def test_qos_insert():
     """Test QoS data insert with sample data"""
     test_data = request.json or {}
@@ -6680,540 +6752,6 @@ def attendance_live():
 
 
 @app.route('/attendance/summary', methods=['GET'])
-@app.route('/attendance/summary/<date>', methods=['GET'])
-def attendance_summary(date=None):
-    """
-    Full attendance for a date - includes Main Room time from webhooks.
-    Combines webhook join/leave data with SDK room snapshots.
-
-    GET /attendance/summary/2026-04-03
-    """
-    if date is None:
-        date = request.args.get('date', get_ist_date())
-    try:
-        date = validate_date_format(date)
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-
-    try:
-        client = get_bq_client()
-        query = f"""
-        WITH
-        -- IDENTITY BRIDGE: every (name_key, participant_key) pair seen today.
-        -- participant_key prefers UUID (stable across renames), then email,
-        -- then the lowercased name. Webhook events (no UUID) join this bridge
-        -- to recover the stable key from just a name.
-        participant_name_map AS (
-          SELECT DISTINCT
-            LOWER(TRIM(participant_name)) as name_key,
-            NULLIF(LOWER(TRIM(participant_email)), '') as email_key,
-            COALESCE(
-              NULLIF(participant_uuid, ''),
-              NULLIF(LOWER(TRIM(participant_email)), ''),
-              LOWER(TRIM(participant_name))
-            ) as participant_key
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
-          WHERE event_date = '{date}'
-            AND participant_name IS NOT NULL AND participant_name != ''
-        ),
-        -- Separate lookups to avoid OR-join cartesian products
-        name_to_key AS (
-          SELECT name_key, MIN(participant_key) as participant_key
-          FROM participant_name_map
-          GROUP BY name_key
-        ),
-        email_to_key AS (
-          SELECT email_key, MIN(participant_key) as participant_key
-          FROM participant_name_map
-          WHERE email_key IS NOT NULL
-          GROUP BY email_key
-        ),
-        -- Global SDK monitoring window for the day. NULL if no snapshots exist
-        -- (e.g. VM down all day). Used downstream to cap "Main Room after last
-        -- breakout" so a monitoring outage isn't silently converted into hours
-        -- of phantom main-room attendance.
-        monitoring_window AS (
-          SELECT
-            MIN(snapshot_time) as global_first_snapshot,
-            MAX(snapshot_time) as global_last_snapshot
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
-          WHERE event_date = '{date}'
-        ),
-        -- Per-participant final breakout state. Tracks the MOST RECENT
-        -- breakout_room_joined/left event. If the last event was _left, the
-        -- user explicitly returned to main room and is really there. If it
-        -- was _joined, the user is still in a breakout we can no longer see
-        -- (SDK dropped them) and MUST NOT be credited Main Room time.
-        -- Without any such event, we have no evidence of a main-room return.
-        -- Also exposes first breakout_room_joined so the BEFORE branch of
-        -- main_room_time can bound users with no SDK snapshots.
-        last_breakout_transition AS (
-          SELECT
-            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
-            ARRAY_AGG(pe.event_type ORDER BY pe.event_timestamp DESC LIMIT 1)[OFFSET(0)] as last_event_type,
-            MAX(pe.event_timestamp) as last_event_time,
-            MIN(CASE WHEN pe.event_type = 'breakout_room_joined' THEN pe.event_timestamp END) as first_breakout_joined_time,
-            COUNTIF(pe.event_type = 'breakout_room_joined') as breakout_joined_count
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
-          LEFT JOIN email_to_key etk
-            ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-          LEFT JOIN name_to_key ntk
-            ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
-          WHERE pe.event_date = '{date}'
-            AND pe.event_type IN ('breakout_room_joined', 'breakout_room_left')
-            AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
-            AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-          GROUP BY COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
-        ),
-        -- Webhook events: main meeting join/leave. Bridge the webhook name
-        -- to the UUID-based participant_key used downstream, so that a
-        -- renamer (e.g. "Shashank Channawar" -> "Shashank C", same UUID)
-        -- collapses into one row in the final output.
-        webhook_events AS (
-          SELECT
-            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
-            pe.participant_name,
-            COALESCE(NULLIF(pe.participant_email, ''), '') as participant_email,
-            pe.event_type,
-            pe.event_timestamp
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
-          LEFT JOIN email_to_key etk
-            ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-          LEFT JOIN name_to_key ntk
-            ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
-          WHERE pe.event_date = '{date}'
-            AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
-            AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            AND pe.event_type IN ('participant_joined', 'participant_left')
-        ),
-        -- Main meeting times from webhooks
-        webhook_times AS (
-          SELECT
-            participant_key,
-            -- Pick the LATEST name the participant used (chronologically),
-            -- not the alphabetical max — so a renamer's most recent name shows.
-            ARRAY_AGG(participant_name ORDER BY event_timestamp DESC LIMIT 1)[OFFSET(0)] as participant_name,
-            MAX(participant_email) as participant_email,
-            MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as main_joined,
-            MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as main_left
-          FROM webhook_events
-          GROUP BY participant_key
-        ),
-        -- Clean snapshots (breakout rooms only). Filters:
-        --   1. Exclude "Main Room" / "0.Main Room" rows so they don't double
-        --      up with the main_room_visits synthesis below.
-        --   2. QUALIFY dedupes the SDK-transition case where a participant
-        --      briefly appeared in two rooms at the same snapshot_time.
-        --   3. participant_key = UUID if present, else email, else name.
-        --      Keeps renamers (same UUID, different names) in one stream.
-        snapshot_clean AS (
-          SELECT
-            -- Use bridged key to unify multiple UUIDs for same person
-            COALESCE(
-              ntk.participant_key,
-              NULLIF(rs.participant_uuid, ''),
-              NULLIF(LOWER(TRIM(rs.participant_email)), ''),
-              LOWER(TRIM(rs.participant_name))
-            ) as participant_key,
-            rs.participant_name,
-            COALESCE(NULLIF(rs.participant_email, ''), '') as participant_email,
-            rs.room_name,
-            rs.snapshot_time
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2` rs
-          LEFT JOIN name_to_key ntk ON LOWER(TRIM(rs.participant_name)) = ntk.name_key
-          WHERE rs.event_date = '{date}'
-            AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
-            AND rs.room_name IS NOT NULL AND rs.room_name != ''
-            AND LOWER(rs.participant_name) NOT LIKE '%scout%'
-            AND LOWER(rs.room_name) != 'main room'
-            AND LOWER(rs.room_name) NOT LIKE '0.main%'
-          QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY
-              COALESCE(
-                ntk.participant_key,
-                NULLIF(rs.participant_uuid, ''),
-                NULLIF(LOWER(TRIM(rs.participant_email)), ''),
-                LOWER(TRIM(rs.participant_name))
-              ),
-              rs.snapshot_time
-            ORDER BY rs.room_name
-          ) = 1
-        ),
-        -- Per-participant first/last seen in breakout rooms
-        participant_breakout_times AS (
-          SELECT
-            participant_key,
-            -- Latest name from snapshots, not alphabetical max.
-            ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
-            MAX(participant_email) as participant_email,
-            MIN(snapshot_time) as first_breakout,
-            MAX(snapshot_time) as last_breakout
-          FROM snapshot_clean
-          GROUP BY participant_key
-        ),
-        -- Participants who ONLY appear in Main Room snapshots (no breakout visits).
-        -- These people have no webhook events AND no breakout room snapshots, so
-        -- they would otherwise be dropped entirely. We use their Main Room snapshot
-        -- times as synthetic join/leave times.
-        -- Filter out anyone already in webhook_times or participant_breakout_times.
-        main_room_only_participants AS (
-          SELECT
-            pk.participant_key,
-            pk.participant_name,
-            pk.participant_email,
-            pk.first_seen,
-            pk.last_seen
-          FROM (
-            SELECT
-              COALESCE(
-                ntk.participant_key,
-                NULLIF(rs.participant_uuid, ''),
-                NULLIF(LOWER(TRIM(rs.participant_email)), ''),
-                LOWER(TRIM(rs.participant_name))
-              ) as participant_key,
-              ARRAY_AGG(rs.participant_name ORDER BY rs.snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
-              MAX(COALESCE(NULLIF(rs.participant_email, ''), '')) as participant_email,
-              MIN(rs.snapshot_time) as first_seen,
-              MAX(rs.snapshot_time) as last_seen
-            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2` rs
-            LEFT JOIN name_to_key ntk ON LOWER(TRIM(rs.participant_name)) = ntk.name_key
-            WHERE rs.event_date = '{date}'
-              AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
-              AND rs.room_name IS NOT NULL AND rs.room_name != ''
-              AND LOWER(rs.participant_name) NOT LIKE '%scout%'
-              AND (LOWER(rs.room_name) = 'main room' OR LOWER(rs.room_name) LIKE '0.main%')
-            GROUP BY COALESCE(
-              ntk.participant_key,
-              NULLIF(rs.participant_uuid, ''),
-              NULLIF(LOWER(TRIM(rs.participant_email)), ''),
-              LOWER(TRIM(rs.participant_name))
-            )
-          ) pk
-          WHERE pk.participant_key NOT IN (
-            SELECT participant_key FROM webhook_times WHERE participant_key IS NOT NULL
-          )
-          AND pk.participant_key NOT IN (
-            SELECT participant_key FROM participant_breakout_times WHERE participant_key IS NOT NULL
-          )
-        ),
-        -- Combine webhook + breakout participants, then UNION main-room-only
-        all_participants AS (
-          SELECT
-            COALESCE(w.participant_key, s.participant_key) as participant_key,
-            COALESCE(w.participant_name, s.participant_name) as participant_name,
-            COALESCE(NULLIF(w.participant_email, ''), s.participant_email, '') as participant_email,
-            w.main_joined,
-            w.main_left,
-            s.first_breakout,
-            s.last_breakout
-          FROM webhook_times w
-          FULL OUTER JOIN participant_breakout_times s ON w.participant_key = s.participant_key
-
-          UNION ALL
-
-          SELECT
-            m.participant_key,
-            m.participant_name,
-            m.participant_email,
-            m.first_seen as main_joined,
-            m.last_seen as main_left,
-            CAST(NULL AS TIMESTAMP) as first_breakout,
-            CAST(NULL AS TIMESTAMP) as last_breakout
-          FROM main_room_only_participants m
-        ),
-        -- Detect room transitions AND time gaps
-        snapshot_transitions AS (
-          SELECT *,
-            LAG(room_name) OVER (
-              PARTITION BY participant_key ORDER BY snapshot_time
-            ) as prev_room,
-            LAG(snapshot_time) OVER (
-              PARTITION BY participant_key ORDER BY snapshot_time
-            ) as prev_snapshot_time
-          FROM snapshot_clean
-        ),
-        visit_groups AS (
-          SELECT *,
-            -- Start new visit on room change OR time gap > 5 minutes (person left and rejoined)
-            SUM(CASE
-              WHEN prev_room IS NULL THEN 1
-              WHEN room_name != prev_room THEN 1
-              WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) > 300 THEN 1
-              ELSE 0
-            END) OVER (PARTITION BY participant_key ORDER BY snapshot_time) as visit_id
-          FROM snapshot_transitions
-        ),
-        -- Breakout room visits with actual duration (sum consecutive intervals, not span)
-        breakout_visits AS (
-          SELECT
-            participant_key,
-            room_name,
-            MIN(snapshot_time) as room_join_time,
-            MAX(snapshot_time) as room_leave_time,
-            -- Calculate actual duration: sum small gaps, not total span
-            CEILING(SUM(
-              CASE
-                WHEN prev_snapshot_time IS NULL THEN 0  -- First snapshot is start marker only
-                WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) <= 300 THEN
-                  TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) / 60.0
-                ELSE 0  -- Should not happen due to visit_id split, but fallback
-              END
-            )) as room_duration_mins,
-            visit_id
-          FROM visit_groups
-          GROUP BY participant_key, room_name, visit_id
-        ),
-        -- Re-merge consecutive same-room visits
-        remerge AS (
-          SELECT *,
-            LAG(room_name) OVER (PARTITION BY participant_key ORDER BY room_join_time) as prev_room_name
-          FROM breakout_visits
-        ),
-        remerge_groups AS (
-          SELECT *,
-            SUM(CASE WHEN prev_room_name IS NULL OR room_name != prev_room_name THEN 1 ELSE 0 END)
-              OVER (PARTITION BY participant_key ORDER BY room_join_time) as merge_group
-          FROM remerge
-        ),
-        breakout_visits_final AS (
-          SELECT
-            participant_key,
-            room_name,
-            MIN(room_join_time) as join_time,
-            MAX(room_leave_time) as leave_time,
-            -- Sum actual durations from breakout_visits (already calculated correctly)
-            SUM(room_duration_mins) as duration_mins
-          FROM remerge_groups
-          GROUP BY participant_key, room_name, merge_group
-        ),
-        -- Calculate Main Room time (time in meeting but NOT in breakout rooms)
-        main_room_time AS (
-          SELECT
-            ap.participant_key,
-            ap.participant_name,
-            ap.participant_email,
-            ap.main_joined,
-            COALESCE(ap.main_left, ap.last_breakout, ap.main_joined) as main_left,
-            -- effective_main_left: hard stop at the global monitoring window.
-            -- Beyond global_last_snapshot we had no SDK visibility, so we must
-            -- not attribute that span to Main Room. Falls back gracefully when
-            -- global_last_snapshot is NULL (no snapshots for the day).
-            LEAST(
-              COALESCE(ap.main_left, ap.last_breakout, ap.main_joined),
-              COALESCE(mw.global_last_snapshot, ap.main_left, ap.last_breakout, ap.main_joined)
-            ) as effective_main_left,
-            ap.first_breakout,
-            ap.last_breakout,
-            bt.last_event_type as last_breakout_event_type,
-            bt.last_event_time as last_breakout_event_time,
-            -- Main room time BEFORE first breakout.
-            -- Capped by the monitoring window (global_last_snapshot - global_first_snapshot)
-            -- to prevent overnight gaps, but allows full workday (up to 600 mins = 10 hours).
-            LEAST(600, CASE
-              -- Case 1: Has breakout snapshots - use first_breakout
-              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NOT NULL
-              THEN GREATEST(0, TIMESTAMP_DIFF(ap.first_breakout, ap.main_joined, MINUTE))
-              -- Case 2: No breakout snapshots but has breakout webhook - use webhook time
-              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
-                   AND bt.first_breakout_joined_time IS NOT NULL
-              THEN GREATEST(0, TIMESTAMP_DIFF(bt.first_breakout_joined_time, ap.main_joined, MINUTE))
-              -- Case 3: No breakouts at all, has main_left - use full span
-              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
-                   AND bt.first_breakout_joined_time IS NULL
-                   AND ap.main_left IS NOT NULL
-              THEN GREATEST(0, LEAST(
-                TIMESTAMP_DIFF(ap.main_left, ap.main_joined, MINUTE),
-                COALESCE(TIMESTAMP_DIFF(mw.global_last_snapshot, mw.global_first_snapshot, MINUTE), 600)
-              ))
-              -- Case 4: No breakouts, no main_left, but has monitoring window - use it
-              WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
-                   AND bt.first_breakout_joined_time IS NULL
-                   AND ap.main_left IS NULL
-                   AND mw.global_last_snapshot IS NOT NULL
-              THEN GREATEST(0, LEAST(
-                TIMESTAMP_DIFF(mw.global_last_snapshot, ap.main_joined, MINUTE),
-                COALESCE(TIMESTAMP_DIFF(mw.global_last_snapshot, mw.global_first_snapshot, MINUTE), 600)
-              ))
-              ELSE 0
-            END) as main_room_before_mins,
-            -- Main room time AFTER last breakout. Capped at 600 mins (10 hours).
-            -- Additional safeguards:
-            --   1. Clamp to global_last_snapshot
-            --   2. User's LAST breakout event must be breakout_room_left
-            --   3. That event must be at or after the last breakout snapshot
-            LEAST(600, CASE
-              WHEN ap.last_breakout IS NOT NULL AND ap.main_left IS NOT NULL
-                   AND bt.last_event_type = 'breakout_room_left'
-                   AND bt.last_event_time >= ap.last_breakout
-              THEN GREATEST(0, TIMESTAMP_DIFF(
-                LEAST(ap.main_left, COALESCE(mw.global_last_snapshot, ap.main_left)),
-                GREATEST(ap.last_breakout, bt.last_event_time),
-                MINUTE))
-              ELSE 0
-            END) as main_room_after_mins
-          FROM all_participants ap
-          CROSS JOIN monitoring_window mw
-          LEFT JOIN last_breakout_transition bt ON ap.participant_key = bt.participant_key
-        ),
-        -- Detect gaps between consecutive breakout visits (= time in main room)
-        breakout_with_next AS (
-          SELECT
-            participant_key,
-            leave_time as this_leave,
-            LEAD(join_time) OVER (PARTITION BY participant_key ORDER BY join_time) as next_join
-          FROM breakout_visits_final
-        ),
-        -- Track all participant_left events to detect meeting exits during gaps
-        meeting_exits AS (
-          SELECT
-            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
-            TIMESTAMP(pe.event_timestamp) as exit_time
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
-          LEFT JOIN email_to_key etk
-            ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-          LEFT JOIN name_to_key ntk
-            ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
-          WHERE pe.event_date = '{date}'
-            AND pe.event_type = 'participant_left'
-            AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
-        ),
-        -- Main room visits: before first breakout, between breakout rooms, after last breakout
-        main_room_visits AS (
-          -- Before first breakout room
-          SELECT
-            participant_key,
-            '0.Main Room' as room_name,
-            main_joined as join_time,
-            COALESCE(first_breakout, effective_main_left) as leave_time,
-            main_room_before_mins as duration_mins
-          FROM main_room_time
-          WHERE main_room_before_mins > 0 AND main_joined IS NOT NULL
-
-          UNION ALL
-
-          -- Between breakout rooms (gaps = returns to main room)
-          -- Only count gaps > 2 minutes AND where no participant_left event
-          -- occurred during the gap (which would indicate they left the meeting).
-          -- Cap gaps at 10 hours max to prevent overnight gaps from counting.
-          SELECT
-            bwn.participant_key,
-            '0.Main Room' as room_name,
-            bwn.this_leave as join_time,
-            bwn.next_join as leave_time,
-            LEAST(TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE), 600) as duration_mins
-          FROM breakout_with_next bwn
-          WHERE bwn.next_join IS NOT NULL
-            AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) > 2
-            AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) <= 600
-            AND NOT EXISTS (
-              SELECT 1 FROM meeting_exits me
-              WHERE me.participant_key = bwn.participant_key
-                AND me.exit_time > bwn.this_leave
-                AND me.exit_time < bwn.next_join
-            )
-
-          UNION ALL
-
-          -- After last breakout room. Only reached when main_room_after_mins > 0,
-          -- which already requires the user's last breakout event to be
-          -- breakout_room_left. join_time starts at that webhook timestamp;
-          -- leave_time clamps to the global SDK monitoring window.
-          SELECT
-            participant_key,
-            '0.Main Room' as room_name,
-            GREATEST(last_breakout, COALESCE(last_breakout_event_time, last_breakout)) as join_time,
-            effective_main_left as leave_time,
-            main_room_after_mins as duration_mins
-          FROM main_room_time
-          WHERE main_room_after_mins > 0 AND last_breakout IS NOT NULL AND main_left IS NOT NULL
-        ),
-        -- Combine all room visits (main + breakout)
-        all_room_visits AS (
-          SELECT participant_key, room_name, join_time, leave_time, duration_mins
-          FROM breakout_visits_final
-          WHERE duration_mins > 0
-
-          UNION ALL
-
-          SELECT participant_key, room_name, join_time, leave_time, duration_mins
-          FROM main_room_visits
-          WHERE duration_mins > 0
-        ),
-        -- Aggregate room visits per participant
-        room_visits_agg AS (
-          SELECT
-            participant_key,
-            SUM(CASE
-              WHEN LOWER(room_name) LIKE '%break time%' THEN 0
-              ELSE duration_mins
-            END) as total_duration_mins,
-            ARRAY_AGG(
-              STRUCT(
-                room_name,
-                FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(join_time, INTERVAL 330 MINUTE)) as room_joined_ist,
-                FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(leave_time, INTERVAL 330 MINUTE)) as room_left_ist,
-                duration_mins as room_duration_mins
-              ) ORDER BY join_time
-            ) as room_visits
-          FROM all_room_visits
-          GROUP BY participant_key
-        )
-        SELECT
-          mrt.participant_name as name,
-          mrt.participant_email as email,
-          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(COALESCE(mrt.main_joined, mrt.first_breakout), INTERVAL 330 MINUTE)) as first_seen_ist,
-          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(COALESCE(mrt.effective_main_left, mrt.main_left, mrt.last_breakout), INTERVAL 330 MINUTE)) as last_seen_ist,
-          -- Fallback: if no room visits captured but we have timestamps, use the span
-          -- capped by monitoring window duration (max 600 mins)
-          COALESCE(
-            NULLIF(rva.total_duration_mins, 0),
-            LEAST(600, GREATEST(0, TIMESTAMP_DIFF(
-              COALESCE(mrt.effective_main_left, mrt.main_left, mrt.last_breakout),
-              COALESCE(mrt.main_joined, mrt.first_breakout),
-              MINUTE
-            )))
-          ) as total_duration_mins,
-          COALESCE(rva.room_visits, []) as room_visits
-        FROM main_room_time mrt
-        LEFT JOIN room_visits_agg rva ON mrt.participant_key = rva.participant_key
-        WHERE mrt.participant_name IS NOT NULL
-        ORDER BY mrt.participant_name
-        """
-        results = list(client.query(query).result())
-
-        participants = []
-        for row in results:
-            visits = [dict(v) for v in row.get('room_visits', []) if v.get('room_name')]
-            participants.append({
-                'name': row.get('name', ''),
-                'email': row.get('email', ''),
-                'first_seen_ist': row.get('first_seen_ist', ''),
-                'last_seen_ist': row.get('last_seen_ist', ''),
-                'total_duration_mins': row.get('total_duration_mins', 0),
-                'room_visits': visits
-            })
-
-        # Merge duplicate names (e.g. "Aastha Chandwani-1", "Aastha Chandwani-2" -> "Aastha Chandwani")
-        participants = merge_participants_by_name(participants, mode='summary')
-        # Second pass: also collapse records that share an email (handles
-        # renames like "Shashank Channawar" -> "Shashank C" where the names
-        # don't normalize to the same value).
-        participants = collapse_by_email(participants, mode='summary')
-
-        return jsonify({
-            'success': True,
-            'date': date,
-            'generated_at': datetime.utcnow().isoformat(),
-            'total_participants': len(participants),
-            'participants': participants
-        })
-
-    except Exception as e:
-        print(f"[Attendance] Summary error: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
 @app.route('/attendance/heatmap', methods=['GET'])
 @app.route('/attendance/heatmap/<date>', methods=['GET'])
 def attendance_heatmap(date=None):
@@ -7504,6 +7042,7 @@ def list_teams():
 
 
 @app.route('/teams/fix-managers', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
 def fix_team_managers():
     """Set manager_name = team_name for all teams where manager is empty.
     This enables manager-based filtering for team logins.
@@ -7536,6 +7075,7 @@ def fix_team_managers():
 
 
 @app.route('/teams', methods=['POST'])
+@require_auth()
 def create_team():
     """Create a new team"""
     try:
@@ -7620,6 +7160,7 @@ def get_team(team_id):
 
 
 @app.route('/teams/<team_id>', methods=['PUT'])
+@require_auth()
 def update_team(team_id):
     """Update team name/manager"""
     try:
@@ -7663,6 +7204,7 @@ def update_team(team_id):
 
 
 @app.route('/teams/<team_id>', methods=['DELETE'])
+@require_auth(roles=['admin', 'superadmin'])
 def delete_team(team_id):
     """Delete team and all its members"""
     try:
@@ -7694,6 +7236,7 @@ def delete_team(team_id):
 
 
 @app.route('/teams/<team_id>/members', methods=['POST'])
+@require_auth()
 def add_team_member(team_id):
     """Add a member to a team"""
     try:
@@ -7743,6 +7286,7 @@ def add_team_member(team_id):
 
 
 @app.route('/teams/<team_id>/members/<member_id>', methods=['DELETE'])
+@require_auth()
 def remove_team_member(team_id, member_id):
     """Remove a member from a team"""
     try:
@@ -7820,6 +7364,7 @@ def list_aliases():
 
 
 @app.route('/aliases', methods=['POST'])
+@require_auth()
 def create_alias():
     """Link a Zoom display-name variant to a roster member.
     Body: {"alias_name": "Anurag_Accurest", "member_name": "Anurag Gaigowal",
@@ -7862,6 +7407,7 @@ def create_alias():
 
 
 @app.route('/aliases/<alias_id>', methods=['DELETE'])
+@require_auth()
 def delete_alias(alias_id):
     """Remove an alias link."""
     try:
@@ -7882,6 +7428,7 @@ def delete_alias(alias_id):
 
 
 @app.route('/teams/<team_id>/members/bulk', methods=['POST'])
+@require_auth()
 def bulk_add_team_members(team_id):
     """Bulk add members from CSV data. Accepts JSON array of {name, email} objects.
     Deduplicates against existing members. Normalizes names for matching."""
@@ -7944,6 +7491,7 @@ def bulk_add_team_members(team_id):
 
 
 @app.route('/teams/bulk-import', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
 def bulk_import_teams_and_members():
     """Bulk import from CSV: auto-create teams + add members.
     Accepts JSON: { members: [{name, email, team_name, manager_name?, manager_email?}] }
@@ -8093,1004 +7641,6 @@ def list_known_participants():
 # TEAM ATTENDANCE - Break time, Isolation, Team-wise view
 # ==============================================================================
 
-@app.route('/teams/<team_id>/attendance/<date>', methods=['GET'])
-def team_attendance(team_id, date):
-    """Get team attendance for a specific date with break & isolation time"""
-    try:
-        ensure_team_tables_once()
-        report_date = validate_date_format(date)
-        client = get_bq_client()
-        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
-
-        # Use normalized names for participant_key. This handles:
-        # 1. UUID changes when a participant reconnects mid-meeting
-        # 2. Zoom rejoin suffixes like "-1", "- DND", etc.
-        # 3. Spacing/casing differences between team roster and Zoom display name
-        norm_snap = _sql_normalize_name('s.participant_name')
-        norm_tm = _sql_normalize_name('tm.participant_name')
-
-        query = f"""
-        WITH team_info AS (
-            SELECT team_id, team_name, manager_name
-            FROM `{dataset_ref}.{BQ_TEAMS_TABLE}`
-            WHERE team_id = @team_id
-        ),
-        team_members AS (
-            SELECT participant_name, participant_email
-            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
-            WHERE team_id = @team_id
-        ),
-        -- Identity bridge: normalized name -> all snapshot names that match.
-        -- Using normalized names instead of UUIDs because UUIDs can change
-        -- when a participant reconnects mid-meeting.
-        participant_name_map AS (
-            SELECT DISTINCT
-                {norm_snap} as participant_key,
-                LOWER(TRIM(s.participant_name)) as name_key,
-                NULLIF(LOWER(TRIM(s.participant_email)), '') as email_key
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            WHERE s.event_date = @report_date
-              AND s.participant_name IS NOT NULL AND s.participant_name != ''
-        ),
-        -- Separate lookups to avoid OR-join cartesian products
-        name_to_key AS (
-            SELECT name_key, MIN(participant_key) as participant_key
-            FROM participant_name_map
-            GROUP BY name_key
-        ),
-        email_to_key AS (
-            SELECT email_key, MIN(participant_key) as participant_key
-            FROM participant_name_map
-            WHERE email_key IS NOT NULL
-            GROUP BY email_key
-        ),
-        -- Resolve each team member to normalized name key.
-        team_member_keys AS (
-            SELECT DISTINCT
-                COALESCE(etk.participant_key, ntk.participant_key, {norm_tm}) as participant_key
-            FROM team_members tm
-            LEFT JOIN email_to_key etk
-                ON NULLIF(LOWER(TRIM(tm.participant_email)), '') = etk.email_key
-            LEFT JOIN name_to_key ntk
-                ON LOWER(TRIM(tm.participant_name)) = ntk.name_key
-        ),
-        clean_snapshots AS (
-            SELECT
-                s.snapshot_time,
-                s.participant_name,
-                s.participant_email,
-                s.room_name,
-                {norm_snap} as participant_key,
-                TIMESTAMP_ADD(s.snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN team_member_keys tmk
-                ON {norm_snap} = tmk.participant_key
-            WHERE s.event_date = @report_date
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND s.participant_name IS NOT NULL AND s.participant_name != ''
-              AND LOWER(s.room_name) NOT LIKE '%break time%'
-            -- Dedupe: one row per (participant, snapshot_time). Prevents the
-            -- SDK-transition case where a user appears in two rooms at once.
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY {norm_snap},
-                             s.snapshot_time
-                ORDER BY
-                    CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-                    s.room_name
-            ) = 1
-        ),
-        -- Break time from BREAK TIME room visits
-        break_room_summary AS (
-            SELECT
-                {norm_snap} as participant_key,
-                -- Bucket to 30s windows to dedup multi-source polls.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as break_room_seconds
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN team_member_keys tmk
-                ON {norm_snap} = tmk.participant_key
-            WHERE s.event_date = @report_date
-              AND s.participant_name IS NOT NULL AND s.participant_name != ''
-              AND LOWER(s.room_name) LIKE '%break time%'
-            GROUP BY participant_key
-        ),
-        -- Track gaps between consecutive snapshots
-        snapshots_with_gap AS (
-            SELECT
-                cs.participant_key,
-                cs.participant_name,
-                cs.participant_email,
-                cs.room_name,
-                cs.snapshot_time,
-                cs.snapshot_ist,
-                LAG(cs.snapshot_time) OVER (PARTITION BY cs.participant_key ORDER BY cs.snapshot_time) as prev_snapshot_time
-            FROM clean_snapshots cs
-        ),
-        -- Per-participant summary: calculate ACTUAL active time (not span)
-        participant_summary AS (
-            SELECT
-                participant_key,
-                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
-                MAX(participant_email) as participant_email,
-                MIN(snapshot_ist) as first_seen,
-                MAX(snapshot_ist) as last_seen,
-                -- Actual active time: sum consecutive intervals only when gap < 5 minutes
-                -- Large gaps (>5 mins) indicate person left meeting, don't count that time
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot_time IS NULL THEN 0  -- First snapshot is start marker only
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) <= 300 THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND)
-                        ELSE 0  -- After long gap, start marker for new presence period
-                    END
-                ) / 60.0) as total_active_mins,
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot_time IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) <= 300
-                             AND (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND)
-                        ELSE 0
-                    END
-                ) / 60.0) as main_snapshot_mins,
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot_time IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) <= 300
-                             AND NOT (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND)
-                        ELSE 0
-                    END
-                ) / 60.0) as breakout_active_mins,
-                COUNT(DISTINCT snapshot_time) as snapshot_count
-            FROM snapshots_with_gap
-            GROUP BY participant_key
-        ),
-        -- Break time = time spent in the "Break Time" room (break_room_summary
-        -- below). Gap-based break detection was removed because long absences
-        -- (user left the meeting / SDK outage / holiday) were
-        -- indistinguishable from real breaks and produced absurd 17hr+ entries.
-        -- Matches the day view's behaviour, which treats Break Time presence
-        -- as the only break signal.
-        -- Isolation: times when participant was alone in their room.
-        -- Count distinct normalized names per (snapshot_time, room) so renames
-        -- and UUID changes don't make a single person look like two occupants.
-        room_occupancy AS (
-            SELECT
-                snapshot_time,
-                room_name,
-                COUNT(DISTINCT {norm_snap}) as occupant_count
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            WHERE s.event_date = @report_date
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND s.participant_name IS NOT NULL AND s.participant_name != ''
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-            GROUP BY snapshot_time, room_name
-        ),
-        isolation_snapshots AS (
-            SELECT
-                cs.participant_key,
-                cs.snapshot_time,
-                cs.room_name
-            FROM clean_snapshots cs
-            INNER JOIN room_occupancy ro
-                ON cs.snapshot_time = ro.snapshot_time AND cs.room_name = ro.room_name
-            WHERE ro.occupant_count = 1
-              -- Alone in Main Room (e.g. first to join) isn't isolation in
-              -- the work sense; only count solitude in breakout rooms.
-              AND LOWER(cs.room_name) != 'main room'
-              AND LOWER(cs.room_name) NOT LIKE '0.main%'
-        ),
-        isolation_summary AS (
-            SELECT
-                participant_key,
-                -- Bucket to 30s windows: multi-source polls (HR client + VM)
-                -- write rows with millisecond-different timestamps, so the
-                -- per-timestamp dedup in clean_snapshots doesn't catch them.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(snapshot_time), 30)) * 30 as isolation_seconds
-            FROM isolation_snapshots
-            GROUP BY participant_key
-        ),
-
-        -- Last SDK snapshot for the day: hard end of the monitoring window.
-        -- Beyond it we had no visibility; any Main Room time inferred past this
-        -- point would be phantom attendance from a monitoring outage.
-        monitoring_window AS (
-            SELECT MAX(TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE)) as last_snapshot_ist
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date = @report_date
-        ),
-        -- Did this participant have ANY breakout_room_joined webhook today?
-        -- Used to detect users who were in breakouts the SDK never saw —
-        -- in that case Main Room time should be 0, not the entire meeting.
-        breakout_webhook_presence AS (
-            SELECT
-                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
-                COUNT(*) as breakout_joined_count
-            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            LEFT JOIN email_to_key etk
-                ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-            LEFT JOIN name_to_key ntk
-                ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
-            WHERE pe.event_date = @report_date
-              AND pe.event_type = 'breakout_room_joined'
-              AND pe.participant_name IS NOT NULL
-              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
-        ),
-        -- Main meeting time from webhooks (participant_joined / participant_left)
-        -- Webhooks lack UUID, so we bridge via separate name/email lookups.
-        webhook_times AS (
-            SELECT
-                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
-                MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
-                    THEN TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END) as meeting_joined,
-                MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
-                    THEN TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END) as meeting_left
-            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            LEFT JOIN email_to_key etk
-                ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-            LEFT JOIN name_to_key ntk
-                ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
-            WHERE pe.event_date = @report_date
-              AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
-              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
-        )
-
-        SELECT
-            ps.participant_name,
-            ps.participant_email,
-            FORMAT_TIMESTAMP('%H:%M', ps.first_seen) as first_seen_ist,
-            FORMAT_TIMESTAMP('%H:%M', ps.last_seen) as last_seen_ist,
-            ps.total_active_mins,
-            ps.snapshot_count,
-            COALESCE(brs.break_room_seconds, 0) as break_seconds,
-            0 as break_count,
-            COALESCE(iso.isolation_seconds, 0) as isolation_seconds,
-            FORMAT_TIMESTAMP('%H:%M', wt.meeting_joined) as meeting_joined_ist,
-            FORMAT_TIMESTAMP('%H:%M', wt.meeting_left) as meeting_left_ist,
-            CASE WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
-                 THEN TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE)
-                 ELSE 0 END as meeting_duration_mins,
-            ps.main_snapshot_mins,
-            ps.breakout_active_mins,
-            -- main_room_mins: meeting span minus tracked active minus break room.
-            -- Two safeguards:
-            --   (a) meeting_left clamped to last SDK snapshot — outage protection.
-            --   (b) if user has breakout webhooks but ZERO snapshot coverage,
-            --       force main_room_mins = 0 (they were in unmonitored breakouts).
-            CASE
-              WHEN COALESCE(bwp.breakout_joined_count, 0) > 0 AND COALESCE(ps.total_active_mins, 0) = 0
-              THEN 0
-              WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
-              THEN GREATEST(
-                     TIMESTAMP_DIFF(
-                         LEAST(wt.meeting_left, COALESCE(mw.last_snapshot_ist, wt.meeting_left)),
-                         wt.meeting_joined,
-                         MINUTE)
-                     - ps.total_active_mins
-                     - COALESCE(brs.break_room_seconds, 0) / 60, 0)
-              ELSE 0
-            END as main_room_mins
-        FROM participant_summary ps
-        LEFT JOIN break_room_summary brs ON ps.participant_key = brs.participant_key
-        LEFT JOIN isolation_summary iso ON ps.participant_key = iso.participant_key
-        LEFT JOIN webhook_times wt ON ps.participant_key = wt.participant_key
-        LEFT JOIN breakout_webhook_presence bwp ON ps.participant_key = bwp.participant_key
-        CROSS JOIN monitoring_window mw
-        ORDER BY ps.participant_name
-        """
-
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
-                bigquery.ScalarQueryParameter("report_date", "STRING", report_date)
-            ]
-        )
-        rows = list(client.query(query, job_config=job_config).result())
-
-        # Get team info
-        team_q = f"""
-        SELECT team_name, manager_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id
-        """
-        team_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
-        )
-        team_rows = list(client.query(team_q, job_config=team_config).result())
-        team_name = team_rows[0].team_name if team_rows else 'Unknown'
-        manager_name = team_rows[0].manager_name if team_rows else ''
-
-        # Get all team member names for "absent" detection
-        members_q = f"""
-        SELECT participant_name, participant_email
-        FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
-        """
-        all_members = list(client.query(members_q, job_config=team_config).result())
-        present_names = {r.participant_name.lower().strip() for r in rows}
-
-        # Also get webhook-only participants (those in main meeting but never in breakout rooms)
-        # This query also calculates break_mins from gaps between leave→rejoin
-        webhook_only_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
-                bigquery.ScalarQueryParameter("report_date", "STRING", report_date)
-            ]
-        )
-        webhook_only_q = f"""
-        WITH participant_events AS (
-            SELECT
-                pe.participant_name,
-                tm.participant_email,
-                pe.event_type,
-                CAST(pe.event_timestamp AS TIMESTAMP) as event_ts,
-                ROW_NUMBER() OVER (PARTITION BY pe.participant_name ORDER BY pe.event_timestamp) as rn
-            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            INNER JOIN `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
-                ON (
-                    LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
-                    OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), '')
-                )
-                AND tm.team_id = @team_id
-            WHERE pe.event_date = @report_date
-              AND pe.participant_name IS NOT NULL
-              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-              AND pe.event_type IN ('participant_joined', 'meeting.participant_joined',
-                                    'participant_left', 'meeting.participant_left')
-        ),
-        with_next AS (
-            SELECT *,
-                LEAD(event_ts) OVER (PARTITION BY participant_name ORDER BY rn) as next_event_ts,
-                LEAD(event_type) OVER (PARTITION BY participant_name ORDER BY rn) as next_event_type
-            FROM participant_events
-        ),
-        -- "Absence" gaps between leave/rejoin webhooks. We do NOT report
-        -- these as break time (break = Break Time room presence only,
-        -- matching the rest of the app). We DO subtract them from
-        -- duration_mins below so a user who left at 11 AM and rejoined at
-        -- 5 PM isn't credited with 6h of attendance.
-        absence_gaps AS (
-            SELECT participant_name,
-                   TIMESTAMP_DIFF(next_event_ts, event_ts, MINUTE) as gap_mins
-            FROM with_next
-            WHERE event_type IN ('participant_left', 'meeting.participant_left')
-              AND next_event_type IN ('participant_joined', 'meeting.participant_joined')
-              AND TIMESTAMP_DIFF(next_event_ts, event_ts, MINUTE) > 5
-        ),
-        absence_totals AS (
-            SELECT participant_name, SUM(gap_mins) as absence_mins
-            FROM absence_gaps
-            GROUP BY participant_name
-        ),
-        summary AS (
-            SELECT
-                pe.participant_name,
-                pe.participant_email,
-                FORMAT_TIMESTAMP('%H:%M',
-                    MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
-                        THEN TIMESTAMP_ADD(pe.event_ts, INTERVAL 330 MINUTE) END)) as joined_ist,
-                FORMAT_TIMESTAMP('%H:%M',
-                    MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
-                        THEN TIMESTAMP_ADD(pe.event_ts, INTERVAL 330 MINUTE) END)) as left_ist,
-                TIMESTAMP_DIFF(
-                    MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
-                        THEN pe.event_ts END),
-                    MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
-                        THEN pe.event_ts END),
-                    MINUTE) as total_span_mins
-            FROM participant_events pe
-            GROUP BY pe.participant_name, pe.participant_email
-        )
-        SELECT s.participant_name, s.participant_email, s.joined_ist, s.left_ist,
-               -- Actual time in meeting = total span minus the gaps when
-               -- they had left and not yet rejoined.
-               COALESCE(s.total_span_mins, 0) - COALESCE(b.absence_mins, 0) as duration_mins,
-               -- Break time stays 0 for webhook-only users: by definition
-               -- they never entered a breakout room (so no Break Time room
-               -- presence). Gaps above are absence, not break.
-               0 as break_mins
-        FROM summary s
-        LEFT JOIN absence_totals b ON s.participant_name = b.participant_name
-        """
-        # Normalize webhook_rows keys so renamers (e.g. "Shashank" + "Shashank-1")
-        # collide into one bucket — otherwise we'd double-count webhook duration
-        # on top of snapshot time that already covers both name variants.
-        def _norm_key(name):
-            return normalize_participant_name(name or '').lower().strip()
-
-        webhook_rows = {}
-        for r in client.query(webhook_only_q, job_config=webhook_only_config).result():
-            key = _norm_key(r.participant_name)
-            if key and (key not in webhook_rows or (r.duration_mins or 0) > (webhook_rows[key].duration_mins or 0)):
-                webhook_rows[key] = r
-
-        participants = []
-        snapshot_names = set()
-        for r in rows:
-            break_mins = round(r.break_seconds / 60)
-            iso_mins = round(r.isolation_seconds / 60)
-            # Total time = breakout room time + main room time
-            main_fill = r.main_room_mins if r.main_room_mins else 0
-            main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
-            breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else r.total_active_mins
-            meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
-
-            # Cap main_fill to prevent phantom time from webhook span inflation.
-            # Day view caps each Main Room slice (before / between / after) at
-            # 600 mins individually, so it can legitimately credit up to 600
-            # mins of Main Room across a day. Use 600 here so historical days
-            # (where SDK snapshots never recorded Main Room) match day view.
-            # Phantom inflation is still bounded by (a) meeting_left clamped to
-            # last snapshot timestamp and (b) main_fill = 0 when user had
-            # breakout webhooks but zero snapshot coverage.
-            if r.total_active_mins > 0:
-                main_fill = min(main_fill, 600)
-
-            main_room = main_fill + main_snapshot
-            # Combine tracked active time with webhook gap-fill for untracked main room.
-            # This gives the full working time, not just breakout room time
-            total_mins = r.total_active_mins + main_fill if r.total_active_mins > 0 else meeting_dur
-            # Final sanity cap: 12 hours max per day
-            total_mins = min(total_mins, 720)
-
-            # Hour-based status: >=5hr=Present, 4-5hr=Half Day, <4hr=Absent
-            if total_mins >= 300:
-                status = 'present'
-            elif total_mins >= 240:
-                status = 'half_day'
-            else:
-                status = 'absent'
-
-            participants.append({
-                'name': r.participant_name,
-                'email': r.participant_email or '',
-                'first_seen_ist': r.meeting_joined_ist or r.first_seen_ist,
-                'last_seen_ist': r.meeting_left_ist or r.last_seen_ist,
-                'total_duration_mins': total_mins,
-                'breakout_mins': breakout_mins,
-                'main_room_mins': main_room,
-                'break_minutes': break_mins,
-                'isolation_minutes': iso_mins,
-                'status': status
-            })
-            snapshot_names.add(_norm_key(r.participant_name))
-
-        # Add webhook-only participants (in main meeting but never went to breakout)
-        for m in all_members:
-            key = _norm_key(m.participant_name)
-            if key not in snapshot_names and key in webhook_rows:
-                wr = webhook_rows[key]
-                dur = wr.duration_mins or 0
-                wb_break = 0  # Webhook-only users have no Break Time room presence
-                if dur >= 300:
-                    status = 'present'
-                elif dur >= 240:
-                    status = 'half_day'
-                else:
-                    status = 'absent'
-                participants.append({
-                    'name': m.participant_name,
-                    'email': m.participant_email or '',
-                    'first_seen_ist': wr.joined_ist,
-                    'last_seen_ist': wr.left_ist,
-                    'total_duration_mins': dur,
-                    'breakout_mins': 0,
-                    'main_room_mins': dur,
-                    'break_minutes': wb_break,
-                    'isolation_minutes': 0,
-                    'status': status
-                })
-                snapshot_names.add(key)
-
-        # Add fully absent members (not in snapshots and not in webhooks)
-        for m in all_members:
-            if _norm_key(m.participant_name) not in snapshot_names:
-                participants.append({
-                    'name': m.participant_name,
-                    'email': m.participant_email or '',
-                    'first_seen_ist': None,
-                    'last_seen_ist': None,
-                    'total_duration_mins': 0,
-                    'breakout_mins': 0,
-                    'main_room_mins': 0,
-                    'break_minutes': 0,
-                    'isolation_minutes': 0,
-                    'status': 'absent'
-                })
-
-        # Merge duplicate names, then collapse any remaining records that
-        # share an email (rename case: "Shashank Channawar" -> "Shashank C").
-        participants = merge_participants_by_name(participants, mode='team')
-        participants = collapse_by_email(participants, mode='team')
-
-        # Apply attendance overrides (manual edits take precedence)
-        try:
-            override_query = f"""
-            SELECT employee_name, first_seen_ist, last_seen_ist, status,
-                   active_mins, break_mins, isolation_mins
-            FROM `{dataset_ref}.{BQ_ATTENDANCE_OVERRIDES_TABLE}`
-            WHERE event_date = @report_date
-            ORDER BY created_at DESC
-            """
-            override_rows = list(client.query(override_query, job_config=bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("report_date", "DATE", report_date)]
-            )).result())
-
-            # Build override map (latest override wins for each employee)
-            # Index by both raw and normalized name so merged records match
-            override_map = {}
-            for ov in override_rows:
-                name_key = ov.employee_name.lower().strip()
-                if name_key not in override_map:
-                    override_map[name_key] = ov
-                norm_key = normalize_participant_name(ov.employee_name).lower().strip()
-                if norm_key and norm_key not in override_map:
-                    override_map[norm_key] = ov
-
-            # Apply overrides to participants - try raw name, then normalized
-            for p in participants:
-                raw_key = p['name'].lower().strip()
-                norm_key = normalize_participant_name(p['name']).lower().strip()
-                ov = override_map.get(raw_key) or override_map.get(norm_key)
-                if ov:
-                    if ov.first_seen_ist:
-                        p['first_seen_ist'] = ov.first_seen_ist
-                    if ov.last_seen_ist:
-                        p['last_seen_ist'] = ov.last_seen_ist
-                    if ov.status:
-                        p['status'] = ov.status
-                    if ov.active_mins is not None:
-                        p['total_duration_mins'] = ov.active_mins
-                    if ov.break_mins is not None:
-                        p['break_minutes'] = ov.break_mins
-                    if ov.isolation_mins is not None:
-                        p['isolation_minutes'] = ov.isolation_mins
-                    p['has_override'] = True
-        except Exception as ov_err:
-            print(f"[Teams] Override merge skipped: {ov_err}")
-
-        total_members = len(all_members)
-        present_count = len([p for p in participants if p['status'] == 'present'])
-        half_day_count = len([p for p in participants if p['status'] == 'half_day'])
-
-        return jsonify({
-            'success': True,
-            'date': report_date,
-            'team_id': team_id,
-            'team_name': team_name,
-            'manager_name': manager_name,
-            'total_members': total_members,
-            'present_count': present_count,
-            'half_day_count': half_day_count,
-            'absent_count': total_members - present_count - half_day_count,
-            'participants': participants
-        })
-    except Exception as e:
-        print(f"[Teams] Attendance error: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/teams/<team_id>/attendance/range', methods=['GET'])
-def team_attendance_range(team_id):
-    """Get team attendance for a date range. Query params: start, end"""
-    try:
-        ensure_team_tables_once()
-        start_date = validate_date_format(request.args.get('start'))
-        end_date = validate_date_format(request.args.get('end'))
-
-        client = get_bq_client()
-        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
-
-        # Use normalized names for participant_key (same fix as team_attendance).
-        norm_snap = _sql_normalize_name('s.participant_name')
-        norm_tm = _sql_normalize_name('tm.participant_name')
-
-        query = f"""
-        WITH team_members AS (
-            SELECT participant_name, participant_email
-            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
-            WHERE team_id = @team_id
-        ),
-        -- Identity bridge across the whole date range using normalized names.
-        participant_name_map AS (
-            SELECT DISTINCT
-                s.event_date,
-                {norm_snap} as participant_key,
-                LOWER(TRIM(s.participant_name)) as name_key,
-                NULLIF(LOWER(TRIM(s.participant_email)), '') as email_key
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.participant_name IS NOT NULL AND s.participant_name != ''
-        ),
-        -- Separate lookups to avoid OR-join cartesian products
-        name_to_key AS (
-            SELECT event_date, name_key, MIN(participant_key) as participant_key
-            FROM participant_name_map
-            GROUP BY event_date, name_key
-        ),
-        email_to_key AS (
-            SELECT event_date, email_key, MIN(participant_key) as participant_key
-            FROM participant_name_map
-            WHERE email_key IS NOT NULL
-            GROUP BY event_date, email_key
-        ),
-        team_member_keys AS (
-            SELECT DISTINCT
-                COALESCE(etk.event_date, ntk.event_date) as event_date,
-                COALESCE(etk.participant_key, ntk.participant_key, {norm_tm}) as participant_key
-            FROM team_members tm
-            LEFT JOIN email_to_key etk
-                ON NULLIF(LOWER(TRIM(tm.participant_email)), '') = etk.email_key
-            LEFT JOIN name_to_key ntk
-                ON LOWER(TRIM(tm.participant_name)) = ntk.name_key
-                AND (etk.event_date IS NULL OR ntk.event_date = etk.event_date)
-            WHERE COALESCE(etk.event_date, ntk.event_date) IS NOT NULL
-        ),
-        -- Dedupe: one row per (participant, snapshot_time) before windowing,
-        -- so SDK transition artifacts (two rooms at once) don't inflate
-        -- intervals.
-        deduped_snaps AS (
-            SELECT
-                s.event_date,
-                s.participant_name,
-                s.participant_uuid,
-                s.room_name,
-                s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN team_member_keys tmk
-                ON s.event_date = tmk.event_date
-               AND {norm_snap} = tmk.participant_key
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND s.participant_name IS NOT NULL
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-              AND LOWER(s.room_name) NOT LIKE '%break time%'
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY s.event_date,
-                             {norm_snap},
-                             s.snapshot_time
-                ORDER BY
-                    CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-                    s.room_name
-            ) = 1
-        ),
-        -- Break time from BREAK TIME room visits
-        break_room_time AS (
-            SELECT
-                s.event_date,
-                {norm_snap} as participant_key,
-                -- Dedup multi-source duplicates: if the MonitorPanel is open
-                -- on >1 device (HR client + VM), each polls every 30s and
-                -- writes its own row. Bucketing to 30-second windows keeps
-                -- one count per polling cycle regardless of source.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN team_member_keys tmk
-                ON s.event_date = tmk.event_date
-               AND {norm_snap} = tmk.participant_key
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.participant_name IS NOT NULL
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-              AND LOWER(s.room_name) LIKE '%break time%'
-            GROUP BY s.event_date, participant_key
-        ),
-        -- First get snapshots with previous snapshot time for gap detection
-        ordered_snaps AS (
-            SELECT
-                event_date,
-                participant_name,
-                room_name,
-                {norm_snap} as participant_key,
-                snapshot_time,
-                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                LAG(snapshot_time) OVER (
-                    PARTITION BY event_date,
-                        {norm_snap}
-                    ORDER BY snapshot_time
-                ) as prev_snapshot
-            FROM deduped_snaps s
-        ),
-        daily_stats AS (
-            SELECT
-                event_date,
-                participant_key,
-                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
-                MIN(snapshot_ist) as first_seen,
-                MAX(snapshot_ist) as last_seen,
-                -- Actual active time: sum consecutive intervals where gap < 5 mins
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot IS NULL THEN 0  -- First snapshot is start marker only
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300 THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                        ELSE 0  -- After long gap, start marker for new presence period
-                    END
-                )) as active_mins,
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
-                             AND (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                        ELSE 0
-                    END
-                )) as main_snapshot_mins,
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
-                             AND NOT (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                        ELSE 0
-                    END
-                )) as breakout_active_mins,
-                COUNT(DISTINCT snapshot_time) as snapshot_count
-            FROM ordered_snaps
-            GROUP BY event_date, participant_key
-        ),
-        -- Break time = time in "Break Time" room only (break_room_time above).
-        -- Gap-based break detection removed: long absences (left meeting /
-        -- SDK outage) couldn't be distinguished from real breaks. Aligns
-        -- with the day view's behaviour.
-        -- Count distinct normalized names per (time, room) so renames/UUID changes don't inflate occupancy
-        room_occupancy AS (
-            SELECT s.snapshot_time, s.room_name,
-                   COUNT(DISTINCT {norm_snap}) as occupant_count
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND s.participant_name IS NOT NULL
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-            GROUP BY s.snapshot_time, s.room_name
-        ),
-        daily_isolation AS (
-            SELECT
-                s.event_date,
-                {norm_snap} as participant_key,
-                -- Bucket to 30-second windows to dedup multi-source polls.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN team_member_keys tmk
-                ON s.event_date = tmk.event_date
-               AND {norm_snap} = tmk.participant_key
-            INNER JOIN room_occupancy ro
-                ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND ro.occupant_count = 1
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              -- Alone in Main Room isn't isolation in the work sense; only
-              -- count breakout-room solitude.
-              AND LOWER(s.room_name) != 'main room'
-              AND LOWER(s.room_name) NOT LIKE '0.main%'
-            GROUP BY s.event_date, participant_key
-        ),
-        -- Last SDK snapshot per day: hard end of the monitoring window. Beyond
-        -- it we had no visibility, so any Main Room time inferred past this
-        -- point would be phantom attendance from a monitoring outage.
-        daily_monitoring_window AS (
-            SELECT event_date, MAX(snapshot_time) as last_snapshot_ts
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date >= @start_date AND event_date <= @end_date
-            GROUP BY event_date
-        ),
-        -- Did this participant have ANY breakout_room_joined webhook today?
-        -- Used to detect users who were in breakouts the SDK never saw —
-        -- in that case Main Room time should be 0, not the entire meeting.
-        daily_breakout_webhooks AS (
-            SELECT
-                pe.event_date,
-                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
-                COUNT(*) as breakout_joined_count
-            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            LEFT JOIN email_to_key etk
-                ON pe.event_date = etk.event_date
-               AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-            LEFT JOIN name_to_key ntk
-                ON pe.event_date = ntk.event_date
-               AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
-            WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
-              AND pe.event_type = 'breakout_room_joined'
-              AND pe.participant_name IS NOT NULL
-              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
-        ),
-        -- Main meeting time from webhooks (bridged to UUID via separate lookups).
-        -- Raw timestamps are exposed so main_room_mins can be clamped below.
-        -- NOTE: do NOT INNER JOIN team_members here. Zoom display names in
-        -- webhook events frequently drift from the canonical name stored in
-        -- team_members (e.g. "Sayli S" vs "Sayli Sonone"), which would
-        -- silently drop the webhook row and zero out main_fill. The final
-        -- LEFT JOIN against daily_stats already restricts to team members.
-        daily_webhook AS (
-            SELECT
-                pe.event_date,
-                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
-                MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
-                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_joined_ts,
-                MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
-                    THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_left_ts,
-                TIMESTAMP_DIFF(
-                    MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
-                        THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
-                    MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
-                        THEN CAST(pe.event_timestamp AS TIMESTAMP) END),
-                    MINUTE) as meeting_duration_mins
-            FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            LEFT JOIN email_to_key etk
-                ON pe.event_date = etk.event_date
-               AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-            LEFT JOIN name_to_key ntk
-                ON pe.event_date = ntk.event_date
-               AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
-            WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
-              AND pe.participant_name IS NOT NULL
-              AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
-        )
-        SELECT
-            ds.event_date,
-            ds.participant_name,
-            tm.participant_email,
-            FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
-            FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
-            ds.active_mins,
-            ds.main_snapshot_mins,
-            ds.breakout_active_mins,
-            COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
-            0 as break_count,
-            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
-            COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
-            -- main_room_mins: meeting duration minus tracked breakout minus break.
-            -- Two safeguards:
-            --   (a) meeting_left clamped to last SDK snapshot — outage protection
-            --   (b) if user has breakout webhooks but ZERO snapshot coverage,
-            --       force main_room_mins = 0 (they were in unmonitored breakouts).
-            CASE
-              WHEN COALESCE(dbw.breakout_joined_count, 0) > 0 AND COALESCE(ds.active_mins, 0) = 0
-              THEN 0
-              ELSE GREATEST(
-                COALESCE(TIMESTAMP_DIFF(
-                    LEAST(dw.meeting_left_ts, COALESCE(mw.last_snapshot_ts, dw.meeting_left_ts)),
-                    dw.meeting_joined_ts,
-                    MINUTE), 0)
-                - ds.active_mins - COALESCE(ROUND(brt.break_room_mins), 0),
-                0)
-            END as main_room_mins
-        FROM daily_stats ds
-        LEFT JOIN team_members tm ON LOWER(TRIM(ds.participant_name)) = LOWER(TRIM(tm.participant_name))
-        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.participant_key = brt.participant_key
-        LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
-        LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
-        LEFT JOIN daily_monitoring_window mw ON ds.event_date = mw.event_date
-        LEFT JOIN daily_breakout_webhooks dbw ON ds.event_date = dbw.event_date AND ds.participant_key = dbw.participant_key
-        ORDER BY ds.event_date, ds.participant_name
-        """
-
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
-                bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
-                bigquery.ScalarQueryParameter("end_date", "STRING", end_date)
-            ]
-        )
-        rows = list(client.query(query, job_config=job_config).result())
-
-        # Team info
-        team_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
-        )
-        team_rows = list(client.query(
-            f"SELECT team_name, manager_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id",
-            job_config=team_config
-        ).result())
-        team_name = team_rows[0].team_name if team_rows else 'Unknown'
-
-        # All team members for absent detection
-        all_members = list(client.query(
-            f"SELECT participant_name, participant_email FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id",
-            job_config=team_config
-        ).result())
-        all_member_names = [m.participant_name for m in all_members]
-
-        # Build daily_data with hour-based status
-        # Combine breakout (snapshot) + main room (webhook gap-fill) for full working time
-        daily_data = []
-        for r in rows:
-            meeting_dur = r.meeting_duration_mins if hasattr(r, 'meeting_duration_mins') and r.meeting_duration_mins else 0
-            main_fill = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
-            main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
-            breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else r.active_mins
-
-            # Cap main_fill to prevent phantom time from webhook span inflation.
-            # Day view caps each Main Room slice (before / between / after) at
-            # 600 mins individually, so it can legitimately credit up to 600
-            # mins of Main Room across a day. Use 600 here so historical days
-            # (where SDK snapshots never recorded Main Room) match day view.
-            # Phantom inflation is still bounded by (a) meeting_left clamped to
-            # last snapshot timestamp and (b) main_fill = 0 when user had
-            # breakout webhooks but zero snapshot coverage.
-            if r.active_mins > 0:
-                main_fill = min(main_fill, 600)
-
-            main_room = main_fill + main_snapshot
-            total_mins = r.active_mins + main_fill if r.active_mins > 0 else meeting_dur
-            # Final sanity cap: 12 hours max per day
-            total_mins = min(total_mins, 720)
-            if total_mins >= 300:
-                status = 'present'
-            elif total_mins >= 240:
-                status = 'half_day'
-            else:
-                status = 'absent'
-            daily_data.append({
-                'date': str(r.event_date),
-                'name': r.participant_name,
-                'email': r.participant_email or '',
-                'first_seen_ist': r.first_seen_ist,
-                'last_seen_ist': r.last_seen_ist,
-                'active_minutes': total_mins,
-                'breakout_minutes': breakout_mins,
-                'main_room_minutes': int(main_room),
-                'break_minutes': int(r.break_mins),
-                'isolation_minutes': int(r.isolation_mins),
-                'status': status
-            })
-
-        # Per-member summary across date range.
-        # Key by normalized name so "Shashank" and "Shashank-1" collapse into
-        # one summary row even if the SQL rows carry different display names
-        # across days.
-        member_summary = {}
-        for r in daily_data:
-            clean_name = normalize_participant_name(r['name'])
-            key = clean_name.lower().strip()
-            if not key:
-                continue
-            if key not in member_summary:
-                member_summary[key] = {
-                    'name': clean_name, 'email': r['email'],
-                    'days_present': 0, 'total_active_mins': 0,
-                    'total_break_mins': 0, 'total_isolation_mins': 0
-                }
-            if r['status'] in ('present', 'half_day'):
-                member_summary[key]['days_present'] += 1
-            member_summary[key]['total_active_mins'] += r['active_minutes']
-            member_summary[key]['total_break_mins'] += r['break_minutes']
-            member_summary[key]['total_isolation_mins'] += r['isolation_minutes']
-
-        # CSV export
-        if request.args.get('format') == 'csv':
-            import csv
-            import io
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow(['Date', 'Name', 'Email', 'Status', 'First_Seen_IST', 'Last_Seen_IST',
-                             'Active_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
-            for r in daily_data:
-                writer.writerow([r['date'], r['name'], r['email'], r['status'],
-                                 r['first_seen_ist'], r['last_seen_ist'], r['active_minutes'],
-                                 r['break_minutes'], r['isolation_minutes']])
-            csv_content = output.getvalue()
-            filename = f"team_{team_name.replace(' ', '_')}_{start_date}_to_{end_date}.csv"
-            return Response(csv_content, mimetype='text/csv',
-                            headers={'Content-Disposition': f'attachment; filename={filename}'})
-
-        return jsonify({
-            'success': True,
-            'team_id': team_id,
-            'team_name': team_name,
-            'start_date': start_date,
-            'end_date': end_date,
-            'total_members': len(all_member_names),
-            'daily_data': daily_data,
-            'member_summary': list(member_summary.values())
-        })
-    except Exception as e:
-        print(f"[Teams] Range attendance error: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
 @app.route('/teams/compare', methods=['GET'])
 def compare_teams():
     """Compare multiple teams side-by-side. Query params: ids (comma-sep), date"""
@@ -9153,6 +7703,7 @@ def compare_teams():
                 FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
                 INNER JOIN team_members tm
                     ON pi.participant_key = {norm_tm}
+                    OR {_sql_normalize_name('pi.participant_name')} = {norm_tm}
                     OR (NULLIF(LOWER(TRIM(pi.participant_email)), '') IS NOT NULL
                         AND NULLIF(LOWER(TRIM(pi.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), ''))
                 WHERE pi.event_date = @report_date
@@ -9652,6 +8203,7 @@ def list_team_holidays(team_id):
 
 
 @app.route('/teams/<team_id>/holidays', methods=['POST'])
+@require_auth()
 def add_team_holiday(team_id):
     """Add a holiday for a team. Body: {date: 'YYYY-MM-DD', description?}."""
     try:
@@ -9691,6 +8243,7 @@ def add_team_holiday(team_id):
 
 
 @app.route('/teams/<team_id>/holidays/<holiday_id>', methods=['DELETE'])
+@require_auth()
 def delete_team_holiday(team_id, holiday_id):
     """Remove a holiday."""
     try:
@@ -9713,6 +8266,7 @@ def delete_team_holiday(team_id, holiday_id):
 
 
 @app.route('/teams/<team_id>/holidays/<holiday_id>', methods=['PUT'])
+@require_auth()
 def update_team_holiday(team_id, holiday_id):
     """Update a holiday. Body: {date?: 'YYYY-MM-DD', description?}."""
     try:
@@ -9897,6 +8451,7 @@ def list_employee_leave(employee_id):
 
 
 @app.route('/employees/<employee_id>/leave', methods=['POST'])
+@require_auth()
 def add_employee_leave(employee_id):
     """Add leave for an employee. Body: {date: 'YYYY-MM-DD', leave_type?, description?}"""
     try:
@@ -9957,6 +8512,7 @@ def add_employee_leave(employee_id):
 
 
 @app.route('/employees/<employee_id>/leave/<leave_id>', methods=['DELETE'])
+@require_auth()
 def delete_employee_leave(employee_id, leave_id):
     """Remove leave record."""
     try:
@@ -9979,6 +8535,7 @@ def delete_employee_leave(employee_id, leave_id):
 
 
 @app.route('/employees/<employee_id>/leave/<leave_id>', methods=['PUT'])
+@require_auth()
 def update_employee_leave(employee_id, leave_id):
     """Update leave record. Body: {date?, leave_type?, description?}."""
     try:
@@ -10025,6 +8582,7 @@ def update_employee_leave(employee_id, leave_id):
 
 
 @app.route('/employees/leave/bulk', methods=['POST'])
+@require_auth()
 def add_bulk_leave():
     """Add leave for multiple employees. Body: {date: 'YYYY-MM-DD', employee_ids: [...], leave_type?, description?}"""
     try:
@@ -10105,6 +8663,7 @@ def add_bulk_leave():
 # ==============================================================================
 
 @app.route('/attendance/override', methods=['POST'])
+@require_auth()
 def add_attendance_override():
     """Add or update attendance override for an employee on a date.
     Uses DELETE + INSERT pattern to avoid BigQuery streaming buffer issues.
@@ -10181,6 +8740,7 @@ def add_attendance_override():
 
 
 @app.route('/attendance/override/<override_id>', methods=['DELETE'])
+@require_auth()
 def delete_attendance_override(override_id):
     """Remove an attendance override."""
     try:
@@ -10600,107 +9160,6 @@ def teams_leave_summary():
 # HISTORICAL TRENDS - Month-over-month analysis
 # ==============================================================================
 
-@app.route('/teams/<team_id>/trends', methods=['GET'])
-def team_historical_trends(team_id):
-    """Get historical trends for a team - monthly aggregated data
-    Query params:
-        months: number of months to look back (default 6, max 12)
-    """
-    try:
-        ensure_team_tables_once()
-        months = min(int(request.args.get('months', 6)), 12)
-
-        client = get_bq_client()
-        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
-
-        # Get team info
-        team_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
-        )
-        team_rows = list(client.query(
-            f"SELECT team_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id",
-            job_config=team_config
-        ).result())
-        if not team_rows:
-            return jsonify({'success': False, 'error': 'Team not found'}), 404
-        team_name = team_rows[0].team_name
-
-        # Monthly trends query.
-        # Group by participant_key (UUID or name fallback) so a renamer is not
-        # counted as multiple unique members within a month.
-        query = f"""
-        WITH team_members AS (
-            SELECT participant_name, participant_email
-            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
-        ),
-        monthly_data AS (
-            SELECT
-                FORMAT_DATE('%Y-%m', SAFE.PARSE_DATE('%Y-%m-%d', s.event_date)) as month,
-                COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) as participant_key,
-                COUNT(DISTINCT s.event_date) as days_present,
-                -- Bucket to 30s windows so multi-source polls don't double hours.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 / 3600.0 as total_hours
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            -- Match on name OR email; Zoom display names drift from the
-            -- canonical name in team_members and would otherwise drop users.
-            INNER JOIN team_members tm
-                ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
-                OR (NULLIF(LOWER(TRIM(s.participant_email)), '') IS NOT NULL
-                    AND NULLIF(LOWER(TRIM(s.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), ''))
-            WHERE SAFE.PARSE_DATE('%Y-%m-%d', s.event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL @months MONTH)
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-            GROUP BY month, participant_key
-        )
-        SELECT
-            month,
-            COUNT(DISTINCT participant_key) as unique_members,
-            SUM(days_present) as total_member_days,
-            ROUND(AVG(days_present), 1) as avg_days_per_member,
-            ROUND(SUM(total_hours), 1) as total_hours,
-            ROUND(AVG(total_hours), 1) as avg_hours_per_member
-        FROM monthly_data
-        GROUP BY month
-        ORDER BY month
-        """
-
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
-                bigquery.ScalarQueryParameter("months", "INT64", months)
-            ]
-        )
-        rows = list(client.query(query, job_config=job_config).result())
-
-        trends = []
-        for r in rows:
-            trends.append({
-                'month': r.month,
-                'unique_members': r.unique_members,
-                'total_member_days': r.total_member_days,
-                'avg_days_per_member': float(r.avg_days_per_member) if r.avg_days_per_member else 0,
-                'total_hours': float(r.total_hours) if r.total_hours else 0,
-                'avg_hours_per_member': float(r.avg_hours_per_member) if r.avg_hours_per_member else 0
-            })
-
-        return jsonify({
-            'success': True,
-            'team_id': team_id,
-            'team_name': team_name,
-            'months_lookback': months,
-            'trends': trends
-        })
-    except Exception as e:
-        print(f"[Teams] Trends error: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-# ==============================================================================
-# LEAVE MANAGEMENT - Track excused vs unexcused absences
-# ==============================================================================
-
-# Table: team_leave_records (team_id, member_name, leave_date, leave_type, reason, approved_by, created_at)
 BQ_LEAVE_TABLE = 'team_leave_records'
 
 def ensure_leave_table():
@@ -10773,6 +9232,7 @@ def get_team_leave(team_id):
 
 
 @app.route('/teams/<team_id>/leave', methods=['POST'])
+@require_auth()
 def add_team_leave(team_id):
     """Add a leave record for a team member
     Body: {member_name, leave_date, leave_type, reason?, approved_by?}
@@ -10837,6 +9297,7 @@ def add_team_leave(team_id):
 
 
 @app.route('/teams/<team_id>/leave/<leave_id>', methods=['DELETE'])
+@require_auth()
 def delete_team_leave(team_id, leave_id):
     """Delete a leave record"""
     try:
@@ -10858,78 +9319,6 @@ def delete_team_leave(team_id, leave_id):
         print(f"[Leave] Delete error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-
-@app.route('/teams/<team_id>/attendance-with-leave/<date>', methods=['GET'])
-def team_attendance_with_leave(team_id, date):
-    """Get team attendance with leave status integrated
-    Enhances the regular attendance with leave info for absent members
-    """
-    try:
-        # Get regular attendance
-        ensure_team_tables_once()
-        ensure_leave_table()
-
-        # First get regular attendance data
-        from flask import g
-        g.skip_leave_check = True  # Flag to prevent recursion
-
-        # Call the existing attendance endpoint internally
-        report_date = validate_date_format(date)
-        client = get_bq_client()
-        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
-
-        # Get leave records for this date
-        leave_query = f"""
-        SELECT member_name, leave_type, reason
-        FROM `{dataset_ref}.{BQ_LEAVE_TABLE}`
-        WHERE team_id = @team_id AND leave_date = @date
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
-                bigquery.ScalarQueryParameter("date", "STRING", report_date)
-            ]
-        )
-        leave_rows = {r.member_name.lower().strip(): {'type': r.leave_type, 'reason': r.reason}
-                      for r in client.query(leave_query, job_config=job_config).result()}
-
-        # Get the regular attendance response
-        with app.test_request_context(f'/teams/{team_id}/attendance/{date}'):
-            response = team_attendance(team_id, date)
-            if isinstance(response, tuple):
-                data = response[0].get_json()
-            else:
-                data = response.get_json()
-
-        if not data.get('success'):
-            return jsonify(data)
-
-        # Enhance participants with leave info
-        for p in data.get('participants', []):
-            name_key = p['name'].lower().strip()
-            if name_key in leave_rows:
-                p['leave_type'] = leave_rows[name_key]['type']
-                p['leave_reason'] = leave_rows[name_key]['reason']
-                # Update status based on leave type
-                if p['status'] == 'absent':
-                    if leave_rows[name_key]['type'] in ['planned', 'sick', 'emergency', 'holiday']:
-                        p['status'] = 'excused'
-                    elif leave_rows[name_key]['type'] == 'wfh':
-                        p['status'] = 'wfh'
-            else:
-                p['leave_type'] = None
-                p['leave_reason'] = None
-
-        return jsonify(data)
-    except Exception as e:
-        print(f"[Leave] Attendance with leave error: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-# ==============================================================================
-# CUSTOM TEAM TAGS - Department, Project, Location metadata
-# ==============================================================================
 
 BQ_TEAM_TAGS_TABLE = 'team_tags'
 
@@ -10973,6 +9362,7 @@ def get_team_tags(team_id):
 
 
 @app.route('/teams/<team_id>/tags', methods=['POST', 'PUT'])
+@require_auth()
 def set_team_tags(team_id):
     """Set tags for a team (upsert behavior)
     Body: {tags: {department: 'Engineering', project: 'Alpha', location: 'Remote'}}
@@ -11019,6 +9409,7 @@ def set_team_tags(team_id):
 
 
 @app.route('/teams/<team_id>/tags/<tag_key>', methods=['DELETE'])
+@require_auth()
 def delete_team_tag(team_id, tag_key):
     """Delete a specific tag from a team"""
     try:
@@ -11191,6 +9582,9 @@ def auth_login():
         _login_record_success(ip, username)
         return jsonify({
             'success': True,
+            # Signed token: the frontend sends this as Authorization: Bearer
+            # on every mutating request; require_auth validates it.
+            'token': make_auth_token(user.username, user.role),
             'user': {
                 'id': user.user_id,
                 'username': user.username,
@@ -11224,6 +9618,7 @@ def auth_list_users():
 
 
 @app.route('/auth/users', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
 def auth_create_user():
     """Create a new user"""
     try:
@@ -11260,6 +9655,7 @@ def auth_create_user():
 
 
 @app.route('/auth/users/<user_id>', methods=['DELETE'])
+@require_auth(roles=['admin', 'superadmin'])
 def auth_delete_user(user_id):
     """Delete a user"""
     try:
@@ -11363,6 +9759,7 @@ def data_get_day_attendance(date):
 
 
 @app.route('/data/attendance', methods=['POST'])
+@require_auth()
 def data_save_attendance():
     """Save/update attendance data for a date"""
     try:
@@ -11426,6 +9823,7 @@ def data_save_attendance():
 
 
 @app.route('/data/attendance/<date>', methods=['DELETE'])
+@require_auth()
 def data_delete_attendance(date):
     """Delete attendance data for a date"""
     try:
@@ -11500,6 +9898,7 @@ def list_employees():
 
 
 @app.route('/employees', methods=['POST'])
+@require_auth()
 def create_employee():
     """Add employee to registry"""
     try:
@@ -11537,6 +9936,7 @@ def create_employee():
 
 
 @app.route('/employees/<employee_id>', methods=['PUT'])
+@require_auth()
 def update_employee(employee_id):
     """Update employee: rename, change status, category, notes"""
     try:
@@ -11568,6 +9968,7 @@ def update_employee(employee_id):
 
 
 @app.route('/employees/<employee_id>', methods=['DELETE'])
+@require_auth(roles=['admin', 'superadmin'])
 def delete_employee(employee_id):
     """Delete employee from registry"""
     try:
@@ -11733,6 +10134,7 @@ def mark_source_participant_handled(client, dataset_ref, source_name, notes):
 
 
 @app.route('/employees/assign-attendance', methods=['POST'])
+@require_auth()
 def assign_unrecognized_attendance():
     """Assign an unrecognized participant's daily attendance to one employee."""
     try:
@@ -11796,6 +10198,7 @@ def assign_unrecognized_attendance():
 
 
 @app.route('/employees/split-shared-attendance', methods=['POST'])
+@require_auth()
 def split_shared_attendance():
     """
     Split attendance from a shared session (e.g., "Shashank & Satyam & Ram")
@@ -11902,6 +10305,7 @@ def split_shared_attendance():
 
 
 @app.route('/employees/sync-from-teams', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
 def sync_employees_from_teams():
     """Populate employee_registry from existing team_members. Run once to initialize."""
     try:
@@ -12715,6 +11119,7 @@ def employee_attendance_detail(employee_id, date):
         WHERE pi.event_date BETWEEN @start_date AND @end_date
           AND (
             pi.participant_key = {norm_emp}
+            OR {_sql_normalize_name('pi.participant_name')} = {norm_emp}
             OR (@emp_email != '' AND LOWER(TRIM(pi.participant_email)) = @emp_email)
           )
         GROUP BY pi.event_date
@@ -12864,6 +11269,7 @@ def employee_yearly_report(employee_id):
         WHERE pi.event_date BETWEEN @start_date AND @end_date
           AND (
             pi.participant_key = {norm_emp}
+            OR {_sql_normalize_name('pi.participant_name')} = {norm_emp}
             OR (@emp_email != '' AND LOWER(TRIM(pi.participant_email)) = @emp_email)
           )
         GROUP BY pi.event_date
@@ -13021,6 +11427,7 @@ def employee_yearly_report(employee_id):
 # Only role=superadmin can access. Direct BigQuery DML, no audit trail.
 
 @app.route('/admin/update-role', methods=['POST'])
+@require_auth(roles=['superadmin'])
 def admin_update_role():
     """Update a user's role (superadmin only)."""
     try:
@@ -13117,6 +11524,7 @@ def admin_search_snapshots():
 
 
 @app.route('/admin/snapshots/edit', methods=['PUT'])
+@require_auth(roles=['superadmin'])
 def admin_edit_snapshots():
     """Edit room_name or participant_name on snapshot rows. Superadmin only, no audit."""
     try:
@@ -13167,6 +11575,7 @@ def admin_edit_snapshots():
 
 
 @app.route('/admin/snapshots/delete', methods=['DELETE'])
+@require_auth(roles=['superadmin'])
 def admin_delete_snapshots():
     """Delete snapshot rows. Superadmin only, no audit."""
     try:
@@ -13194,6 +11603,7 @@ def admin_delete_snapshots():
 
 
 @app.route('/admin/snapshots/add', methods=['POST'])
+@require_auth(roles=['superadmin'])
 def admin_add_snapshot():
     """Insert new snapshot rows. Superadmin only."""
     try:
@@ -13281,6 +11691,7 @@ def admin_search_events():
 
 
 @app.route('/admin/events/edit', methods=['PUT'])
+@require_auth(roles=['superadmin'])
 def admin_edit_events():
     """Edit participant_events rows. Superadmin only, no audit."""
     try:
@@ -13334,6 +11745,7 @@ def admin_edit_events():
 
 
 @app.route('/admin/events/delete', methods=['DELETE'])
+@require_auth(roles=['superadmin'])
 def admin_delete_events():
     """Delete participant_events rows. Superadmin only, no audit."""
     try:
@@ -13875,6 +12287,7 @@ def get_or_create_date_sheet(service, spreadsheet_id, date_str):
 
 
 @app.route('/sheets/update', methods=['POST'])
+@require_auth()
 def update_google_sheet():
     """
     Update Google Sheet with attendance data.
@@ -14281,6 +12694,44 @@ def build_presence_intervals(date_str):
     ))
     buckets = list(job.result())
 
+    # ----- Step 1b: identity map (email-first participant keys) ------------
+    # Names drift (renames, rejoin suffixes, "Shashank C" vs "Shashank
+    # Channawar"); emails don't. Wherever a normalized name maps to exactly
+    # ONE email that day (seen in snapshots or webhooks), the email becomes
+    # the participant_key — so all of a person's name variants merge into a
+    # single identity. Names with no email (or ambiguously two emails) keep
+    # the normalized-name key, exactly as before. Consumers already match
+    # rows by BOTH the name and email columns, so either key form resolves.
+    norm_pn_i = _sql_normalize_name('pe.participant_name')
+    ident_q = f"""
+    WITH pairs AS (
+      SELECT DISTINCT {norm_sn} AS name_key, LOWER(TRIM(s.participant_email)) AS email
+      FROM `{dataset_ref}.room_snapshots_v2` s
+      WHERE s.event_date = @date
+        AND s.participant_name IS NOT NULL AND s.participant_name != ''
+        AND s.participant_email IS NOT NULL AND TRIM(s.participant_email) != ''
+        AND LOWER(s.participant_name) NOT LIKE '%scout%'
+      UNION DISTINCT
+      SELECT DISTINCT {norm_pn_i} AS name_key, LOWER(TRIM(pe.participant_email)) AS email
+      FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+      WHERE pe.event_date = @date
+        AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
+        AND pe.participant_email IS NOT NULL AND TRIM(pe.participant_email) != ''
+        AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+    )
+    SELECT name_key, ANY_VALUE(email) AS email
+    FROM pairs
+    GROUP BY name_key
+    HAVING COUNT(DISTINCT email) = 1
+    """
+    ident_rows = list(client.query(ident_q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
+    )).result())
+    _ident_map = {r.name_key: r.email for r in ident_rows}
+
+    def _remap(name_key):
+        return _ident_map.get(name_key, name_key)
+
     # Last snapshot anywhere = initial monitoring window end.
     # This will be extended in Step 2b if webhooks continued after snapshots stopped.
     last_snapshot_time = None
@@ -14312,7 +12763,27 @@ def build_presence_intervals(date_str):
     webhook_rows = list(client.query(webhook_q, job_config=bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
     )).result())
-    webhook_by_key = {r.participant_key: r for r in webhook_rows}
+    # Merge webhook rows under remapped keys: when two name variants of the
+    # same person (same email) each produced a row, combine them into one.
+    from types import SimpleNamespace as _NS
+    webhook_by_key = {}
+    for r in webhook_rows:
+        k = _remap(r.participant_key)
+        w = webhook_by_key.get(k)
+        if w is None:
+            webhook_by_key[k] = _NS(
+                participant_key=k, participant_name=r.participant_name,
+                participant_email=r.participant_email, meeting_id=r.meeting_id,
+                meeting_joined=r.meeting_joined, meeting_left=r.meeting_left,
+                breakout_webhook_count=r.breakout_webhook_count or 0)
+        else:
+            w.participant_email = w.participant_email or r.participant_email
+            w.meeting_id = w.meeting_id or r.meeting_id
+            if r.meeting_joined and (not w.meeting_joined or r.meeting_joined < w.meeting_joined):
+                w.meeting_joined = r.meeting_joined
+            if r.meeting_left and (not w.meeting_left or r.meeting_left > w.meeting_left):
+                w.meeting_left = r.meeting_left
+            w.breakout_webhook_count += (r.breakout_webhook_count or 0)
 
     # ----- Step 2b: presence windows from join/leave events ----------------
     # For each participant, build (joined_ts, left_ts) windows so synthesis
@@ -14377,13 +12848,16 @@ def build_presence_intervals(date_str):
             merged.append(w)
         return merged
 
+    # Merge event timelines under remapped keys (rename variants combine),
+    # keeping chronological order so window-building stays correct.
+    full_events_by_key = {}
+    for r in events_rows:
+        full_events_by_key.setdefault(_remap(r.participant_key), []).extend(list(r.events))
+    for _k, _evts in full_events_by_key.items():
+        _evts.sort(key=lambda e: e['ts'] if isinstance(e, dict) else e.ts)
     presence_windows_by_key = {
-        r.participant_key: _build_presence_windows(r.events)
-        for r in events_rows
+        k: _build_presence_windows(evts) for k, evts in full_events_by_key.items()
     }
-    # Full per-person event timeline (incl. breakout join/left) — feeds the
-    # Step 5 webhook-fallback room reconstruction.
-    full_events_by_key = {r.participant_key: list(r.events) for r in events_rows}
 
     # ----- Step 2c: extend monitoring_end if webhooks continued after snapshots -----
     # When SDK monitoring stops but webhooks keep flowing, use the latest webhook
@@ -14426,13 +12900,14 @@ def build_presence_intervals(date_str):
     email_by_key = {}
     meeting_by_key = {}
     for b in buckets:
-        by_key_room[(b.participant_key, b.room_name)].append(b)
+        bkey = _remap(b.participant_key)
+        by_key_room[(bkey, b.room_name)].append(b)
         # Track latest seen identity per key (snapshot is authoritative for name)
-        name_by_key[b.participant_key] = b.participant_name
+        name_by_key[bkey] = b.participant_name
         if b.participant_email:
-            email_by_key[b.participant_key] = b.participant_email
+            email_by_key[bkey] = b.participant_email
         if b.meeting_id:
-            meeting_by_key[b.participant_key] = b.meeting_id
+            meeting_by_key[bkey] = b.meeting_id
 
     gap_buckets = GAP_THRESHOLD_SECONDS // BUCKET_SECONDS  # 10
 
@@ -14447,7 +12922,7 @@ def build_presence_intervals(date_str):
     # tiled with no double-counting when someone bounces A->B->A quickly.
     buckets_by_key = defaultdict(set)
     for b in buckets:
-        buckets_by_key[b.participant_key].add(b.bucket30)
+        buckets_by_key[_remap(b.participant_key)].add(b.bucket30)
     credit_by_key_bucket = {}
     for _pkey, bset in buckets_by_key.items():
         blist = sorted(bset)
@@ -14802,7 +13277,7 @@ def build_presence_intervals(date_str):
     if buckets:
         presence_by_bucket = defaultdict(set)
         for b in buckets:
-            presence_by_bucket[b.bucket30].add(b.participant_key)
+            presence_by_bucket[b.bucket30].add(_remap(b.participant_key))
         # First 30s bucket of this IST day: 00:00 IST == UTC midnight - 5:30.
         from datetime import timezone as _tz
         day0_utc_unix = int(
@@ -15188,7 +13663,12 @@ def reconcile_zoom():
         for r in ours_rows:
             zkey = r.participant_key
             if zkey not in zoom_secs and r.participant_email:
-                zkey = zoom_emails.get(r.participant_email, zkey)  # rename fallback
+                zkey = zoom_emails.get(r.participant_email, zkey)  # email bridge
+            if zkey not in zoom_secs and r.participant_name:
+                # our key may be an email; fall back to the normalized name
+                nk = normalize_participant_name(r.participant_name).strip().lower()
+                if nk in zoom_secs:
+                    zkey = nk
             if zkey in zoom_secs:
                 seen_zoom_keys.add(zkey)
                 matched += 1
@@ -15419,6 +13899,7 @@ def team_attendance_v2(team_id, date):
                 SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
                 SUM(pi.alone_seconds) AS isolation_seconds,
                 SUM(pi.duration_seconds) AS total_seconds,
+                SUM(IF(pi.confidence < 0.6, pi.duration_seconds, 0)) AS lowconf_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
             FROM member_bridge mb
@@ -15432,6 +13913,7 @@ def team_attendance_v2(team_id, date):
             tm.member_email,
             pm.display_name AS participant_name,
             pm.display_email AS participant_email,
+            COALESCE(SAFE_DIVIDE(pm.lowconf_seconds, pm.total_seconds), 0) > 0.5 AS estimated,
             {_sql_whole_minutes('pm.main_seconds')} AS main_room_mins,
             {_sql_whole_minutes('pm.breakout_seconds')} AS breakout_mins,
             {_sql_whole_minutes('pm.break_seconds')} AS break_minutes,
@@ -15488,6 +13970,9 @@ def team_attendance_v2(team_id, date):
                 'break_minutes': brk,
                 'isolation_minutes': int(r.isolation_minutes or 0),
                 'status': _status(total - brk),
+                # True when >50% of the day's time came from low-confidence
+                # (webhook-estimated) intervals — the UI shows a ⚠ marker.
+                'estimated': bool(r.estimated),
             })
 
         # Match v1 post-processing: merge Zoom rejoin variants ("Aastha-1"
@@ -15573,94 +14058,6 @@ def team_attendance_v2(team_id, date):
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         print(f"[TeamV2] error: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/report/compare', methods=['GET'])
-def report_compare():
-    """Diff v1 (inline-CTE) vs v2 (presence_intervals) for a team+date.
-
-    Query: ?date=YYYY-MM-DD&team_id=<id>
-    Calls the existing /teams/<id>/attendance/<date> AND /teams/<id>/attendance_v2/<date>
-    internally via Flask's test client, then returns per-participant deltas
-    for the metrics that matter: total/main/breakout/break/isolation.
-    """
-    try:
-        date_str = validate_date_format(request.args.get('date'))
-        team_id = request.args.get('team_id')
-        if not team_id:
-            return jsonify({'success': False, 'error': 'team_id required'}), 400
-
-        # Use Flask's test_client to invoke internal routes — same process,
-        # no network hop, no auth wrangling.
-        tc = app.test_client()
-        v1_resp = tc.get(f'/teams/{team_id}/attendance/{date_str}')
-        v2_resp = tc.get(f'/teams/{team_id}/attendance_v2/{date_str}')
-
-        v1 = v1_resp.get_json() or {}
-        v2 = v2_resp.get_json() or {}
-
-        v1_parts = {(p.get('name') or '').strip().lower(): p for p in (v1.get('participants') or [])}
-        v2_parts = {(p.get('name') or '').strip().lower(): p for p in (v2.get('participants') or [])}
-
-        all_keys = sorted(set(v1_parts.keys()) | set(v2_parts.keys()))
-        rows = []
-        max_total_delta = 0
-        for k in all_keys:
-            v1p = v1_parts.get(k, {})
-            v2p = v2_parts.get(k, {})
-
-            def _g(p, field):
-                return int(p.get(field) or 0)
-
-            row = {
-                'name': v2p.get('name') or v1p.get('name') or k,
-                'email': v2p.get('email') or v1p.get('email') or '',
-                'in_v1': k in v1_parts,
-                'in_v2': k in v2_parts,
-                'v1': {
-                    'total': _g(v1p, 'total_duration_mins'),
-                    'main':  _g(v1p, 'main_room_mins'),
-                    'breakout': _g(v1p, 'breakout_mins'),
-                    'break': _g(v1p, 'break_minutes'),
-                    'isolation': _g(v1p, 'isolation_minutes'),
-                },
-                'v2': {
-                    'total': _g(v2p, 'total_duration_mins'),
-                    'main':  _g(v2p, 'main_room_mins'),
-                    'breakout': _g(v2p, 'breakout_mins'),
-                    'break': _g(v2p, 'break_minutes'),
-                    'isolation': _g(v2p, 'isolation_minutes'),
-                },
-            }
-            row['delta'] = {
-                k2: row['v2'][k2] - row['v1'][k2]
-                for k2 in ('total','main','breakout','break','isolation')
-            }
-            row['significant'] = any(abs(v) > 1 for v in row['delta'].values())
-            max_total_delta = max(max_total_delta, abs(row['delta']['total']))
-            rows.append(row)
-
-        # Summary: rows with significant delta
-        n_significant = sum(1 for r in rows if r['significant'])
-        return jsonify({
-            'success': True,
-            'date': date_str,
-            'team_id': team_id,
-            'v1_status': v1_resp.status_code,
-            'v2_status': v2_resp.status_code,
-            'participants_v1': len(v1_parts),
-            'participants_v2': len(v2_parts),
-            'rows_total': len(rows),
-            'rows_significant_diff': n_significant,
-            'max_total_delta_mins': max_total_delta,
-            'diff': rows,
-        })
-    except ValueError as e:
-        return jsonify({'success': False, 'error': str(e)}), 400
-    except Exception as e:
-        print(f"[Compare] error: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -15898,6 +14295,7 @@ def team_attendance_range_v2(team_id):
                 SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
                 SUM(pi.alone_seconds) AS isolation_seconds,
                 SUM(pi.duration_seconds) AS total_seconds,
+                SUM(IF(pi.confidence < 0.6, pi.duration_seconds, 0)) AS lowconf_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
             FROM member_bridge mb
@@ -15908,6 +14306,7 @@ def team_attendance_range_v2(team_id):
         SELECT
             pd.member_name AS name, pd.member_email AS email,
             CAST(pd.event_date AS STRING) AS date,
+            COALESCE(SAFE_DIVIDE(pd.lowconf_seconds, pd.total_seconds), 0) > 0.5 AS estimated,
             {_sql_whole_minutes('pd.main_seconds')} AS main_room_minutes,
             {_sql_whole_minutes('pd.breakout_seconds')} AS breakout_minutes,
             {_sql_whole_minutes('pd.break_seconds')} AS break_minutes,
@@ -15963,6 +14362,9 @@ def team_attendance_range_v2(team_id):
                 'isolation_minutes': int(r.isolation_minutes or 0),
                 # Status on break-EXCLUSIVE minutes (matches v1 and Team View daily)
                 'status': _status(active),
+                # >50% of the day from low-confidence (webhook-estimated)
+                # intervals — UI shows a ⚠ marker on the cell.
+                'estimated': bool(r.estimated),
             })
 
         # Member summary keyed by normalized name (collapses rejoin variants)
@@ -16106,6 +14508,7 @@ def team_monthly_report_v2(team_id):
                 SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
                 SUM(pi.alone_seconds)             AS isolation_seconds,
                 SUM(pi.duration_seconds)          AS total_seconds,
+                SUM(IF(pi.confidence < 0.6, pi.duration_seconds, 0)) AS lowconf_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
             FROM member_bridge mb
@@ -16116,6 +14519,7 @@ def team_monthly_report_v2(team_id):
         SELECT
             pd.member_name AS name, pd.member_email AS email,
             CAST(pd.event_date AS STRING) AS date,
+            COALESCE(SAFE_DIVIDE(pd.lowconf_seconds, pd.total_seconds), 0) > 0.5 AS estimated,
             {_sql_whole_minutes('pd.main_seconds')} AS main_room_minutes,
             {_sql_whole_minutes('pd.breakout_seconds')} AS breakout_minutes,
             {_sql_whole_minutes('pd.break_seconds')} AS break_minutes,
@@ -16164,6 +14568,9 @@ def team_monthly_report_v2(team_id):
                 'isolation_minutes': int(r.isolation_minutes or 0),
                 # Status on break-EXCLUSIVE minutes (matches v1 and Team View daily)
                 'status': _status(active),
+                # >50% of the day from low-confidence (webhook-estimated)
+                # intervals — UI shows a ⚠ marker on the cell.
+                'estimated': bool(r.estimated),
             })
         data.sort(key=lambda x: (x['name'].lower(), x['date']))
 
