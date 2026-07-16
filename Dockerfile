@@ -27,8 +27,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code (zt_*.py = modules split out of app.py)
 COPY app.py .
+COPY zt_config.py .
+COPY zt_helpers.py .
+COPY zt_zoom_api.py .
+COPY zt_intervals.py .
 COPY report_generator.py .
 COPY chatbot.py .
 
