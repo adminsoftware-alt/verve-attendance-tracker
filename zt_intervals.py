@@ -463,20 +463,6 @@ def build_presence_intervals(date_str):
             print(f"[PresenceIntervals] Extending monitoring_end from {monitoring_end} to {last_webhook_time} (webhooks continued after snapshot outage)")
             monitoring_end = last_webhook_time
 
-    def _present_intersection_seconds(start, end, windows):
-        """Total seconds within [start, end] that fall inside any window."""
-        if not windows:
-            return None  # No webhook data — caller falls back to gap_s
-        total = 0
-        for w_s, w_e in windows:
-            if w_e is None:
-                w_e = end + timedelta(seconds=1)
-            os_ = max(start, w_s)
-            oe = min(end, w_e)
-            if oe > os_:
-                total += (oe - os_).total_seconds()
-        return total
-
     # ----- Step 3: build real intervals from buckets -----------------------
     # Group buckets by (participant_key, room_name), sorted by bucket30.
     # Consecutive buckets (diff == 1, i.e. 30s apart) belong to the same

@@ -136,11 +136,13 @@ def add_zoom_headers(response):
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    elif origin and (path.startswith('/attendance/') or path.startswith('/dashboard') or path.startswith('/teams') or path.startswith('/auth/') or path.startswith('/data/') or path.startswith('/employees') or path.startswith('/admin/') or path == '/chat' or path.startswith('/chat/')):
-        # Allow external apps (attendance manager) to call attendance, team, auth & data APIs
+    elif origin and (path.startswith('/attendance/') or path.startswith('/dashboard') or path.startswith('/teams') or path.startswith('/auth/') or path.startswith('/data/') or path.startswith('/employees') or path.startswith('/admin/') or path.startswith('/aliases') or path.startswith('/monitor/') or path == '/chat' or path.startswith('/chat/')):
+        # Allow external apps (attendance manager) to call attendance, team, auth & data APIs.
+        # Authorization MUST be allowed here: the frontend attaches the signed
+        # login token to every call, which turns them into preflighted requests.
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
 
     # OWASP Security Headers (required by Zoom Apps)
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
@@ -2261,6 +2263,10 @@ def chat_endpoint():
                     or (data.get('user') or '').strip() or None,
             'role': (getattr(request, 'auth_user', None) or {}).get('r')
                     or (data.get('role') or '').strip() or None,
+            # Forwarded so the chatbot's internal POSTs to our own protected
+            # endpoints (/attendance/override, /employees/<id>/leave) carry
+            # the caller's token and pass require_auth.
+            'auth_header': request.headers.get('Authorization', ''),
         }
         history = data.get('history') if isinstance(data.get('history'), list) else None
         return jsonify(_chat_dispatch(prompt, ctx, confirm_token=confirm_token, history=history))
@@ -3427,8 +3433,15 @@ def webhook():
 
     event = data.get('event', '')
 
-    # Handle URL validation (the ONLY event allowed without a signature —
-    # Zoom sends it when registering the endpoint)
+    # Validate signature FIRST — for every event INCLUDING url_validation
+    # (Zoom signs those too). Answering url_validation unsigned would be an
+    # HMAC oracle: an attacker could submit plainToken = "v0:<ts>:<body>"
+    # and receive exactly the digest needed to forge that body's signature.
+    valid, error = validate_webhook_signature(request)
+    if not valid:
+        return jsonify({'error': error}), 401
+
+    # Handle URL validation (endpoint registration handshake)
     if event == 'endpoint.url_validation':
         plain_token = data.get('payload', {}).get('plainToken', '')
         encrypted_token = hmac.new(
@@ -3441,11 +3454,6 @@ def webhook():
             'plainToken': plain_token,
             'encryptedToken': encrypted_token
         })
-
-    # Validate webhook signature (security) — required for every real event
-    valid, error = validate_webhook_signature(request)
-    if not valid:
-        return jsonify({'error': error}), 401
 
     print(f"\n{'='*60}")
     print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] WEBHOOK EVENT: {event}")
@@ -9067,6 +9075,18 @@ def auth_create_user():
             return jsonify({'success': False, 'error': 'role must be admin, hr, manager, or superadmin'}), 400
 
         client = bigquery.Client(project=GCP_PROJECT_ID)
+
+        # Reject duplicate usernames: login fetches ONE row per username
+        # (highest role), so a duplicate would permanently shadow the other.
+        dup = list(client.query(
+            f"SELECT 1 FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.app_users` "
+            f"WHERE LOWER(TRIM(username)) = LOWER(@u) LIMIT 1",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("u", "STRING", username)])
+        ).result())
+        if dup:
+            return jsonify({'success': False, 'error': 'Username already exists'}), 409
+
         # Generate numeric user_id (timestamp-based for uniqueness)
         import time
         user_id = int(time.time() * 1000) % 2147483647  # Keep within INT range
@@ -10888,6 +10908,7 @@ def admin_update_role():
 
 
 @app.route('/admin/snapshots', methods=['GET'])
+@require_auth(roles=['superadmin'])
 def admin_search_snapshots():
     """Search room_snapshots_v2 by date and optional participant name. Superadmin only."""
     try:
@@ -11055,14 +11076,16 @@ def admin_add_snapshot():
         for r in rows_to_add:
             bq_rows.append({
                 'snapshot_id': str(_uuid.uuid4()),
-                'snapshot_time': r.get('snapshot_time', datetime.now(IST).isoformat()),
-                'event_date': r.get('event_date', datetime.now(IST).strftime('%Y-%m-%d')),
+                # get_ist_now(): `IST` tzinfo never existed — datetime.now(IST)
+                # raised NameError on every call (route was broken since birth)
+                'snapshot_time': r.get('snapshot_time', get_ist_now().isoformat()),
+                'event_date': r.get('event_date', get_ist_now().strftime('%Y-%m-%d')),
                 'meeting_id': r.get('meeting_id', ''),
                 'room_name': r.get('room_name', 'Main Meeting'),
                 'participant_name': r.get('participant_name', ''),
                 'participant_email': r.get('participant_email', ''),
                 'participant_uuid': r.get('participant_uuid', ''),
-                'inserted_at': datetime.now(IST).isoformat(),
+                'inserted_at': get_ist_now().isoformat(),
             })
 
         errors = client.insert_rows_json(f"{dataset_ref}.room_snapshots_v2", bq_rows)
@@ -11078,6 +11101,7 @@ def admin_add_snapshot():
 
 
 @app.route('/admin/events', methods=['GET'])
+@require_auth(roles=['superadmin'])
 def admin_search_events():
     """Search participant_events by date and optional participant name. Superadmin only."""
     try:
@@ -12487,6 +12511,10 @@ def team_attendance_v2(team_id, date):
         # rejoined mid-meeting appears as two participants and one of them
         # (the one not in the team roster) gets dropped silently. See
         # app.py:8184-8185 for v1's equivalent calls.
+        # The merge helpers don't carry the estimated flag — capture which
+        # people had it BEFORE merging, restore by OR after.
+        _est_keys = {normalize_participant_name(p['name']).lower().strip()
+                     for p in participants if p.get('estimated')}
         participants = merge_participants_by_name(participants, mode='team')
         participants = collapse_by_email(participants, mode='team')
 
@@ -12496,6 +12524,8 @@ def team_attendance_v2(team_id, date):
             p['status'] = _status(
                 int(p.get('total_duration_mins') or 0) - int(p.get('break_minutes') or 0)
             )
+            if normalize_participant_name(p.get('name') or '').lower().strip() in _est_keys:
+                p['estimated'] = True
 
         # Name-drift detector: participants seen in the meeting today who
         # match NO roster member of ANY team. These are the people whose

@@ -473,7 +473,9 @@ def h_attendance_for_date(params, ctx):
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
         return {'message': f"Date format should be YYYY-MM-DD (got “{date}”)."}
 
-    detail_url = f"{ctx['base_url']}/attendance/summary/{date}"
+    # v2 endpoint (presence_intervals) — the v1 /attendance/summary/<date>
+    # route was removed in the 2026-07-16 dead-code cleanup.
+    detail_url = f"{ctx['base_url']}/attendance/summary_v2/{date}"
     payload = _http_get_json(detail_url) or {}
     parts = payload.get('participants') or []
     if not parts:
@@ -732,8 +734,9 @@ def _apply_override(ctx, employee_name, date, fields):
         'created_by': f"chatbot:{ctx.get('user') or 'unknown'}",
     }
     body.update(fields)
+    headers = {'Authorization': ctx.get('auth_header') or ''}
     try:
-        r = _r.post(url, json=body, timeout=20)
+        r = _r.post(url, json=body, timeout=20, headers=headers)
         if r.status_code >= 300:
             return {'message': f"Override failed: {r.status_code} {r.text[:200]}"}
         return {'message': f"✅ Saved override for **{employee_name}** on **{date}**."}
@@ -744,8 +747,9 @@ def _apply_override(ctx, employee_name, date, fields):
 def _apply_leave(ctx, employee_id, date, leave_type):
     import requests as _r
     url = f"{ctx['base_url']}/employees/{employee_id}/leave"
+    headers = {'Authorization': ctx.get('auth_header') or ''}
     try:
-        r = _r.post(url, json={'date': date, 'leave_type': leave_type}, timeout=20)
+        r = _r.post(url, json={'date': date, 'leave_type': leave_type}, timeout=20, headers=headers)
         if r.status_code >= 300:
             return {'message': f"Leave creation failed: {r.status_code} {r.text[:200]}"}
         return {'message': f"✅ Added **{leave_type}** leave on **{date}**."}
