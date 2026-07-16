@@ -12719,10 +12719,12 @@ def build_presence_intervals(date_str):
         AND pe.participant_email IS NOT NULL AND TRIM(pe.participant_email) != ''
         AND LOWER(pe.participant_name) NOT LIKE '%scout%'
     )
-    SELECT name_key, ANY_VALUE(email) AS email
+    SELECT name_key, ANY_VALUE(pairs.email) AS email
     FROM pairs
     GROUP BY name_key
-    HAVING COUNT(DISTINCT email) = 1
+    -- Qualified pairs.email: bare "email" would resolve to the SELECT alias
+    -- (ANY_VALUE) and BigQuery rejects aggregating an aggregate.
+    HAVING COUNT(DISTINCT pairs.email) = 1
     """
     ident_rows = list(client.query(ident_q, job_config=bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
