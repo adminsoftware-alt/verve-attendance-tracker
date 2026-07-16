@@ -15013,6 +15013,100 @@ def intervals_auto_build():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/admin/ops/partition-events', methods=['POST'])
+def ops_partition_events():
+    """One-time ops runner: partition participant_events + create the
+    Cloud Scheduler jobs, using this service's own service account (no
+    local gcloud needed). Meant to be called at night when the webhook
+    streaming buffer has drained.
+
+    Body: {"swap": true, "jobs": true} — each action is independent,
+    idempotent, and refuses safely when preconditions aren't met:
+      swap: participant_events -> participant_events_old,
+            participant_events_p (partitioned copy) -> participant_events,
+            then top-up rows streamed after the copy (dedup by event_id).
+            Skips if already partitioned; blocks if streaming buffer
+            is non-empty (BigQuery would reject the rename anyway).
+      jobs: create intervals-rebuild-today-2min / intervals-auto-build-sweep /
+            reconcile-zoom-nightly scheduler jobs (ALREADY_EXISTS = ok).
+
+    NOTE: unauthenticated like the repo's other ops endpoints (known
+    issue list in CLAUDE.md); all actions here are benign/idempotent.
+    """
+    results = {}
+    data = request.get_json(silent=True) or {}
+    client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+    if data.get('swap'):
+        try:
+            tbl = client.get_table(f"{dataset_ref}.participant_events")
+            if tbl.time_partitioning and tbl.time_partitioning.field == 'event_date':
+                results['swap'] = {'status': 'already_done'}
+            elif tbl.streaming_buffer is not None:
+                results['swap'] = {'status': 'blocked_streaming_buffer',
+                                   'detail': 'events still draining; retry ~90 min after the last webhook'}
+            else:
+                client.get_table(f"{dataset_ref}.participant_events_p")  # raises if copy missing
+                client.query(f"ALTER TABLE `{dataset_ref}.participant_events` "
+                             f"RENAME TO participant_events_old").result()
+                client.query(f"ALTER TABLE `{dataset_ref}.participant_events_p` "
+                             f"RENAME TO participant_events").result()
+                topup = client.query(f"""
+                    INSERT INTO `{dataset_ref}.participant_events`
+                    SELECT * FROM `{dataset_ref}.participant_events_old` o
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM `{dataset_ref}.participant_events` n
+                      WHERE n.event_id = o.event_id)
+                """)
+                topup.result()
+                results['swap'] = {'status': 'done',
+                                   'topup_rows': topup.num_dml_affected_rows}
+        except Exception as e:
+            results['swap'] = {'status': 'error', 'error': str(e)}
+
+    if data.get('jobs'):
+        try:
+            import base64 as _b64
+            import google.auth
+            from googleapiclient import discovery
+            creds, _ = google.auth.default()
+            svc = discovery.build('cloudscheduler', 'v1', credentials=creds,
+                                  cache_discovery=False)
+            locs = svc.projects().locations().list(
+                name=f"projects/{GCP_PROJECT_ID}").execute()
+            parent = locs['locations'][0]['name']
+            base = "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app"
+            jobs_out = {'location': parent}
+            for name, sched, path, body in [
+                ('intervals-rebuild-today-2min', '*/2 8-23 * * *', '/intervals/rebuild', {}),
+                ('intervals-auto-build-sweep', '*/15 * * * *', '/intervals/auto-build', {'days_back': 35}),
+                ('reconcile-zoom-nightly', '0 9 * * *', '/reconcile/zoom', {'days_ago': 1}),
+            ]:
+                try:
+                    svc.projects().locations().jobs().create(parent=parent, body={
+                        'name': f"{parent}/jobs/{name}",
+                        'schedule': sched,
+                        'timeZone': 'Asia/Kolkata',
+                        'httpTarget': {
+                            'uri': base + path,
+                            'httpMethod': 'POST',
+                            'headers': {'Content-Type': 'application/json'},
+                            'body': _b64.b64encode(json.dumps(body).encode()).decode(),
+                        },
+                    }).execute()
+                    jobs_out[name] = 'created'
+                except Exception as je:
+                    msg = str(je)
+                    jobs_out[name] = 'already_exists' if ('ALREADY_EXISTS' in msg or '409' in msg) \
+                        else f'error: {msg[:300]}'
+            results['jobs'] = jobs_out
+        except Exception as e:
+            results['jobs'] = {'status': 'error', 'error': str(e)}
+
+    return jsonify({'success': True, 'results': results})
+
+
 @app.route('/reconcile/zoom', methods=['GET', 'POST'])
 def reconcile_zoom():
     """Nightly safety net: compare our computed hours (presence_intervals)
