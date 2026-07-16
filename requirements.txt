@@ -20,6 +20,9 @@ requests==2.31.0
 # Timezone handling
 pytz==2024.1
 
+# Password hashing (app_users)
+bcrypt==4.1.2
+
 # Email Reports (SendGrid)
 sendgrid==6.10.0
 

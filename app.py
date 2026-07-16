@@ -40,21 +40,10 @@ import google.auth
 # ==============================================================================
 # IST TIMEZONE HELPERS (UTC+5:30 - India Standard Time)
 # ==============================================================================
-IST_OFFSET = timedelta(hours=5, minutes=30)
+from zt_helpers import *  # noqa: F401,F403 — split from app.py, see zt_helpers.py
 
-def get_ist_now():
-    """Get current datetime in IST"""
-    return datetime.utcnow() + IST_OFFSET
 
-def get_ist_date():
-    """Get current date in IST (YYYY-MM-DD)"""
-    return get_ist_now().strftime('%Y-%m-%d')
 
-def utc_to_ist(utc_dt):
-    """Convert UTC datetime to IST datetime"""
-    if utc_dt is None:
-        return None
-    return utc_dt + IST_OFFSET
 
 def get_ist_date_from_utc(utc_dt):
     """Get IST date string from UTC datetime"""
@@ -92,170 +81,10 @@ def validate_date_format(date_str):
 
 import re as _re
 
-def normalize_participant_name(name):
-    """Strip Zoom rejoin suffixes to get the base participant name.
-    'Aastha Chandwani-2' -> 'Aastha Chandwani'
-    'Geo Prithvipal-1' -> 'Geo Prithvipal'
-    'Yashasvi Dhakate_accurest' -> 'Yashasvi Dhakate'
-    'CS Shweta Tulsani-KPRC' -> 'CS Shweta Tulsani'
-    'Gayatri Dabi - KPRC' -> 'Gayatri Dabi'
-    'Ronit 2' -> 'Ronit'
-    Preserves legitimate hyphenated surnames:
-    'Priya Sharma-Gupta' -> 'Priya Sharma-Gupta' (kept)
-    """
-    if not name:
-        return name
-    n = name.strip()
-    # Remove trailing " - TEXT" (space dash space suffix, always organizational)
-    n = _re.sub(r'\s+-\s+\w+$', '', n)
-    # Remove trailing "-N" (number suffix like -1, -2, -5)
-    n = _re.sub(r'-\d+$', '', n)
-    # Remove trailing "_text" (underscore suffix like _accurest, _KPRC)
-    n = _re.sub(r'_\w+$', '', n)
-    # Remove trailing "-TEXT" ONLY if the suffix is ALL-CAPS (2+ chars, like -KPRC)
-    # Preserves legitimate hyphenated surnames like Sharma-Gupta, Mary-Jane.
-    # Mixed-case org tags (e.g. -Meeting, -Vridam) are handled by _strip_team_and_clean().
-    n = _re.sub(r'-[A-Z]{2,}$', '', n)
-    # Remove trailing " N" where N is a single digit (like "Ronit 2")
-    n = _re.sub(r'\s+\d$', '', n)
-    return n.strip()
 
 
-def collapse_by_email(participants, mode='summary'):
-    """Second-pass merge: if two records (already collapsed by normalized
-    name) share the same non-empty email, merge them too. Handles the
-    "Shashank Channawar" -> "Shashank C" rename where the names don't
-    normalize to the same value but the email is identical.
-    """
-    groups = {}  # lower(email) -> primary record
-    out = []
-    for p in participants:
-        email = (p.get('email') or p.get('participant_email') or '').strip().lower()
-        if not email:
-            out.append(p)
-            continue
-        primary = groups.get(email)
-        if primary is None:
-            groups[email] = p
-            out.append(p)
-            continue
-        # Merge p into primary
-        for email_key in ('email', 'participant_email'):
-            if p.get(email_key) and not primary.get(email_key):
-                primary[email_key] = p[email_key]
-        if mode == 'summary':
-            primary_visits = primary.get('room_visits', []) or []
-            new_visits = p.get('room_visits', []) or []
-            primary['room_visits'] = sorted(
-                primary_visits + new_visits,
-                key=lambda v: v.get('room_joined_ist', '') or ''
-            )
-            for tk in ('first_seen_ist',):
-                if p.get(tk) and (not primary.get(tk) or p[tk] < primary[tk]):
-                    primary[tk] = p[tk]
-            for tk in ('last_seen_ist',):
-                if p.get(tk) and (not primary.get(tk) or p[tk] > primary[tk]):
-                    primary[tk] = p[tk]
-            primary['total_duration_mins'] = (primary.get('total_duration_mins', 0) or 0) \
-                                              + (p.get('total_duration_mins', 0) or 0)
-        elif mode == 'team':
-            for tk in ('first_seen_ist',):
-                if p.get(tk) and (not primary.get(tk) or p[tk] < primary[tk]):
-                    primary[tk] = p[tk]
-            for tk in ('last_seen_ist',):
-                if p.get(tk) and (not primary.get(tk) or p[tk] > primary[tk]):
-                    primary[tk] = p[tk]
-            for nk in ('total_duration_mins', 'breakout_mins', 'main_room_mins',
-                       'break_minutes', 'isolation_minutes'):
-                if nk in p:
-                    primary[nk] = (primary.get(nk, 0) or 0) + (p.get(nk) or 0)
-            status_rank = {'present': 3, 'half_day': 2, 'absent': 1}
-            if status_rank.get(p.get('status'), 0) > status_rank.get(primary.get('status'), 0):
-                primary['status'] = p['status']
-    # Strip duplicates that were merged in place
-    seen_ids = set()
-    deduped = []
-    for p in out:
-        pid = id(p)
-        if pid in seen_ids:
-            continue
-        seen_ids.add(pid)
-        deduped.append(p)
-    return deduped
 
 
-def merge_participants_by_name(participants, mode='summary'):
-    """Merge duplicate participant entries by normalized name.
-
-    For summary mode: merge room_visits, pick best email, earliest/latest times.
-    For live mode: merge participant lists, pick best email.
-    For team mode: merge durations, breaks, isolation.
-    """
-    merged = {}
-    for p in participants:
-        base_name = normalize_participant_name(p.get('name') or p.get('participant_name', ''))
-        if not base_name:
-            continue
-
-        key = base_name.lower().strip()
-
-        if key not in merged:
-            merged[key] = {**p}
-            # Store the cleanest name (the base name)
-            if 'name' in merged[key]:
-                merged[key]['name'] = base_name
-            if 'participant_name' in merged[key]:
-                merged[key]['participant_name'] = base_name
-            continue
-
-        existing = merged[key]
-
-        # Pick best email (non-empty)
-        for email_key in ['email', 'participant_email']:
-            if email_key in p and p[email_key] and not existing.get(email_key):
-                existing[email_key] = p[email_key]
-
-        if mode == 'summary':
-            # Merge room visits
-            existing_visits = existing.get('room_visits', [])
-            new_visits = p.get('room_visits', [])
-            existing['room_visits'] = sorted(
-                existing_visits + new_visits,
-                key=lambda v: v.get('room_joined_ist', '') or ''
-            )
-            # Earliest first_seen, latest last_seen
-            for time_key in ['first_seen_ist']:
-                if p.get(time_key) and (not existing.get(time_key) or p[time_key] < existing[time_key]):
-                    existing[time_key] = p[time_key]
-            for time_key in ['last_seen_ist']:
-                if p.get(time_key) and (not existing.get(time_key) or p[time_key] > existing[time_key]):
-                    existing[time_key] = p[time_key]
-            # Sum duration
-            existing['total_duration_mins'] = existing.get('total_duration_mins', 0) + p.get('total_duration_mins', 0)
-
-        elif mode == 'team':
-            # Earliest first_seen, latest last_seen
-            for time_key in ['first_seen_ist']:
-                if p.get(time_key) and (not existing.get(time_key) or p[time_key] < existing[time_key]):
-                    existing[time_key] = p[time_key]
-            for time_key in ['last_seen_ist']:
-                if p.get(time_key) and (not existing.get(time_key) or p[time_key] > existing[time_key]):
-                    existing[time_key] = p[time_key]
-            # Sum numeric fields
-            for num_key in ['total_duration_mins', 'breakout_mins', 'main_room_mins',
-                            'break_minutes', 'isolation_minutes']:
-                if num_key in p:
-                    existing[num_key] = existing.get(num_key, 0) + (p.get(num_key) or 0)
-            # Best status: present > half_day > absent
-            status_rank = {'present': 3, 'half_day': 2, 'absent': 1}
-            if status_rank.get(p.get('status'), 0) > status_rank.get(existing.get('status'), 0):
-                existing['status'] = p['status']
-
-        elif mode == 'live':
-            # Merge participant lists (for live room view)
-            pass  # Live mode handled separately at room level
-
-    return list(merged.values())
 
 
 def merge_live_rooms(rooms):
@@ -323,14 +152,9 @@ def add_zoom_headers(response):
 
 # Zoom Credentials - MUST be set via environment variables
 # No default values to prevent accidental deployment without proper configuration
-ZOOM_WEBHOOK_SECRET = os.environ.get('ZOOM_WEBHOOK_SECRET', '').strip()
-ZOOM_ACCOUNT_ID = os.environ.get('ZOOM_ACCOUNT_ID', '')
-ZOOM_CLIENT_ID = os.environ.get('ZOOM_CLIENT_ID', '')
-ZOOM_CLIENT_SECRET = os.environ.get('ZOOM_CLIENT_SECRET', '')
+from zt_config import *  # noqa: F401,F403 — split from app.py, see zt_config.py
 
 # Scout Bot Configuration
-SCOUT_BOT_NAME = os.environ.get('SCOUT_BOT_NAME', 'Scout Bot')
-SCOUT_BOT_EMAIL = os.environ.get('SCOUT_BOT_EMAIL', '')
 
 # ==============================================================================
 # FIXED ROOM SEQUENCE - Rooms in the exact order Scout Bot visits them
@@ -419,11 +243,8 @@ FIXED_ROOM_SEQUENCE = [
 USE_FIXED_SEQUENCE = True
 
 # GCP Configuration
-GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID', '')
-BQ_DATASET = os.environ.get('BQ_DATASET', 'breakout_room_calibrator')
 
 # BigQuery Tables
-BQ_EVENTS_TABLE = 'participant_events'
 
 # ==============================================================================
 # SIGNED AUTH TOKENS (require_auth) — login issues an HMAC-signed token; every
@@ -486,15 +307,6 @@ def require_auth(roles=None):
 
 
 
-BQ_MAPPINGS_TABLE = 'room_mappings'
-BQ_CAMERA_TABLE = 'camera_events'
-BQ_QOS_TABLE = 'qos_data'
-BQ_CALIBRATION_STATE_TABLE = 'calibration_state'
-BQ_TEAMS_TABLE = 'teams'
-BQ_TEAM_MEMBERS_TABLE = 'team_members'
-BQ_TEAM_HOLIDAYS_TABLE = 'team_holidays'
-BQ_EMPLOYEE_LEAVE_TABLE = 'employee_leave'
-BQ_ATTENDANCE_OVERRIDES_TABLE = 'attendance_overrides'
 
 # Email Configuration
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
@@ -542,13 +354,7 @@ _email_alert_state = {
 }
 
 # Clients
-bq_client = None
 
-def get_bq_client():
-    global bq_client
-    if bq_client is None:
-        bq_client = bigquery.Client(project=GCP_PROJECT_ID)
-    return bq_client
 
 # ==============================================================================
 # IN-MEMORY STATE (Per Meeting - Reset on new meeting)
@@ -1730,408 +1536,8 @@ def insert_qos_data(qos_data):
 # ZOOM API HELPERS
 # ==============================================================================
 
-class ZoomAPI:
-    """Helper for Zoom API calls"""
+from zt_zoom_api import *  # noqa: F401,F403 — split from app.py, see zt_zoom_api.py
 
-    def __init__(self):
-        self.access_token = None
-        self.token_expires = 0
-
-    def get_access_token(self):
-        """Get OAuth token (cached)"""
-        now = time.time()
-        if self.access_token and now < self.token_expires - 60:
-            return self.access_token
-
-        if not all([ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET]):
-            raise ValueError("Zoom API credentials not configured")
-
-        url = f"https://zoom.us/oauth/token?grant_type=account_credentials&account_id={ZOOM_ACCOUNT_ID}"
-        response = requests.post(
-            url,
-            auth=(ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET),
-            headers={'Content-Type': 'application/x-www-form-urlencoded'},
-            timeout=30
-        )
-
-        if response.status_code != 200:
-            raise Exception(f"Token error: {response.text}")
-
-        data = response.json()
-        self.access_token = data['access_token']
-        self.token_expires = now + data.get('expires_in', 3600)
-        return self.access_token
-
-    def _api_get_with_retry(self, url, headers, params, max_retries=3):
-        """Make a GET request with rate limit (429) retry and exponential backoff."""
-        for attempt in range(max_retries):
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 1))
-                wait_time = max(retry_after, 2 ** attempt)
-                print(f"[ZoomAPI] Rate limited (429), retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait_time)
-                continue
-            return response
-        # Return last response even if still 429
-        return response
-
-    def get_past_meeting_participants(self, meeting_uuid, page_size=300):
-        """
-        Get past meeting participants - includes duration and basic QoS
-        NOW WITH PAGINATION SUPPORT - fetches ALL pages
-
-        IMPORTANT: Zoom API returns 'duration' in SECONDS, not minutes!
-        The caller must convert to minutes if needed.
-
-        Returns list of participant dicts with fields:
-        - id/user_id: Participant ID
-        - name/user_name: Display name
-        - user_email/email: Email (may be empty)
-        - join_time: ISO timestamp
-        - leave_time: ISO timestamp
-        - duration: Duration in SECONDS (not minutes!)
-        - attentiveness_score: May not be present (requires Business+ plan)
-        """
-        all_participants = []
-
-        try:
-            token = self.get_access_token()
-            headers = {'Authorization': f'Bearer {token}'}
-
-            # Build list of URL patterns to try (will add pagination params later)
-            url_patterns = []
-
-            # Method 1: Double-encoded UUID (required for UUIDs with / or //)
-            encoded_uuid = requests.utils.quote(requests.utils.quote(meeting_uuid, safe=''), safe='')
-            url_patterns.append(
-                (f"https://api.zoom.us/v2/past_meetings/{encoded_uuid}/participants", "past_meetings (double-encoded)")
-            )
-
-            # Method 2: Single-encoded UUID
-            encoded_uuid2 = requests.utils.quote(meeting_uuid, safe='')
-            if encoded_uuid2 != encoded_uuid:
-                url_patterns.append(
-                    (f"https://api.zoom.us/v2/past_meetings/{encoded_uuid2}/participants", "past_meetings (single-encoded)")
-                )
-
-            # Method 3: Raw UUID (for simple meeting IDs)
-            if meeting_uuid and not any(c in meeting_uuid for c in ['/', '+', '=']):
-                url_patterns.append(
-                    (f"https://api.zoom.us/v2/past_meetings/{meeting_uuid}/participants", "past_meetings (raw)")
-                )
-
-            # Method 4: Report API (may have more data, requires Zoom Pro+)
-            url_patterns.append(
-                (f"https://api.zoom.us/v2/report/meetings/{encoded_uuid2}/participants", "report API")
-            )
-
-            # Try each method with pagination
-            for base_url, method_name in url_patterns:
-                try:
-                    all_participants = []
-                    next_page_token = None
-                    page_count = 0
-                    max_pages = 50  # Safety limit
-                    auth_retries = 0  # Track 401 retries to prevent infinite loop
-                    max_auth_retries = 3
-                    method_started = time.time()
-                    max_wall_secs = 120  # Bail out if a single method drags on
-
-                    while page_count < max_pages:
-                        # Wall-clock guard: a slow Zoom API shouldn't pin
-                        # Cloud Run indefinitely. Bail with partial data.
-                        if time.time() - method_started > max_wall_secs:
-                            print(f"[ZoomAPI] {method_name} wall-clock cap hit "
-                                  f"({max_wall_secs}s) after {page_count} pages — bailing")
-                            break
-
-                        # Build URL with pagination params
-                        params = {'page_size': page_size}
-                        if next_page_token:
-                            params['next_page_token'] = next_page_token
-
-                        print(f"[ZoomAPI] Trying {method_name} (page {page_count + 1})...")
-                        response = self._api_get_with_retry(base_url, headers, params)
-
-                        if response.status_code == 200:
-                            data = response.json()
-                            participants = data.get('participants', [])
-
-                            if participants:
-                                all_participants.extend(participants)
-                                print(f"[ZoomAPI] Page {page_count + 1}: got {len(participants)} participants (total: {len(all_participants)})")
-
-                                # Check for more pages
-                                next_page_token = data.get('next_page_token', '')
-                                page_count += 1
-
-                                if not next_page_token:
-                                    # No more pages
-                                    print(f"[ZoomAPI] SUCCESS via {method_name}: {len(all_participants)} total participants")
-
-                                    # Log first participant for debugging
-                                    if all_participants:
-                                        sample = all_participants[0]
-                                        print(f"[ZoomAPI] Sample participant fields: {list(sample.keys())}")
-                                        duration = sample.get('duration', 'N/A')
-                                        print(f"[ZoomAPI] Sample duration value: {duration} (type: {type(duration).__name__})")
-
-                                    return all_participants
-                            else:
-                                # No participants on first page
-                                break
-
-                        elif response.status_code == 404:
-                            print(f"[ZoomAPI] {method_name}: Meeting not found (404)")
-                            break
-                        elif response.status_code == 400:
-                            print(f"[ZoomAPI] {method_name}: Bad request (400) - {response.text[:200]}")
-                            break
-                        elif response.status_code == 401:
-                            auth_retries += 1
-                            if auth_retries > max_auth_retries:
-                                print(f"[ZoomAPI] {method_name}: Too many 401 errors ({auth_retries}), giving up")
-                                break
-                            print(f"[ZoomAPI] {method_name}: Unauthorized (401) - refreshing token (retry {auth_retries}/{max_auth_retries})")
-                            self.access_token = None
-                            self.token_expires = 0
-                            token = self.get_access_token()
-                            headers = {'Authorization': f'Bearer {token}'}
-                            # Retry same page
-                            continue
-                        else:
-                            print(f"[ZoomAPI] {method_name}: {response.status_code} - {response.text[:200]}")
-                            break
-
-                    # If we collected any participants, return them
-                    if all_participants:
-                        print(f"[ZoomAPI] SUCCESS via {method_name}: {len(all_participants)} total participants")
-                        return all_participants
-
-                except requests.exceptions.RequestException as re:
-                    print(f"[ZoomAPI] {method_name}: Request error - {re}")
-
-            print(f"[ZoomAPI] All methods failed for meeting: {meeting_uuid}")
-            return []
-
-        except Exception as e:
-            print(f"[ZoomAPI] Past meeting error: {e}")
-            traceback.print_exc()
-            return []
-
-    def get_meeting_participants_qos(self, meeting_id, max_pages=200, max_wall_secs=300):
-        """
-        Get QoS data for meeting participants using Dashboard Metrics API.
-        This includes video_output data which indicates camera status.
-
-        IMPORTANT: Requires Business/Education/Enterprise plan and
-        dashboard_meetings:read:admin scope.
-
-        Args:
-            meeting_id: The meeting ID
-            max_pages: Maximum pages to fetch (default 200 = 2000 participants)
-                       Use smaller value for quick searches
-            max_wall_secs: Hard wall-clock cap on the whole pagination loop.
-                           Without this a slow Dashboard API could keep
-                           Cloud Run busy past its request timeout (default 1
-                           hour for Cloud Run, but we want to fail fast).
-                           Returns partial results when exceeded.
-
-        Returns list of participants with video_output stats.
-        When camera is ON: video_output has bitrate, resolution, etc.
-        When camera is OFF: video_output is empty/null
-        """
-        all_participants = []
-        loop_started = time.time()
-
-        try:
-            token = self.get_access_token()
-            headers = {'Authorization': f'Bearer {token}'}
-
-            # Dashboard Metrics API endpoint
-            # Works for both live and past meetings (within last 30 days)
-            encoded_id = requests.utils.quote(requests.utils.quote(str(meeting_id), safe=''), safe='')
-            base_url = f"https://api.zoom.us/v2/metrics/meetings/{encoded_id}/participants/qos"
-
-            next_page_token = None
-            page_count = 0
-
-            print(f"[ZoomAPI] Fetching QoS data for meeting {meeting_id}...")
-
-            auth_retries = 0
-            max_auth_retries = 3
-
-            while page_count < max_pages:
-                # Wall-clock guard: bail out with whatever we have rather
-                # than blocking the Cloud Run instance indefinitely.
-                if time.time() - loop_started > max_wall_secs:
-                    print(f"[ZoomAPI] QoS pagination wall-clock cap hit "
-                          f"({max_wall_secs}s) after {page_count} pages, "
-                          f"{len(all_participants)} participants — returning partial")
-                    break
-                params = {'page_size': 10}  # Max 10 per page for QoS API
-                if next_page_token:
-                    params['next_page_token'] = next_page_token
-
-                response = self._api_get_with_retry(base_url, headers, params)
-
-                if response.status_code == 200:
-                    data = response.json()
-                    participants = data.get('participants', [])
-
-                    if participants:
-                        # Log first participant's raw QoS structure for debugging
-                        if page_count == 0 and participants:
-                            first_p = participants[0]
-                            print(f"[ZoomAPI] Participant fields: {list(first_p.keys())}")
-                            user_qos_sample = first_p.get('user_qos', [])
-                            if user_qos_sample:
-                                print(f"[ZoomAPI] QoS entry fields: {list(user_qos_sample[0].keys())}")
-                                print(f"[ZoomAPI] FULL QoS entry: {json.dumps(user_qos_sample[0], indent=2)}")
-                            else:
-                                print(f"[ZoomAPI] WARNING: No user_qos data in participant")
-
-                        # Extract camera status from video_output with timestamps
-                        for p in participants:
-                            user_qos = p.get('user_qos', [])
-                            camera_on_periods = []
-                            camera_on_timestamps = []  # List of datetime strings when camera was ON
-
-                            # Debug: Log first participant's QoS structure
-                            if page_count == 0 and participants.index(p) == 0 and user_qos:
-                                sample_qos = user_qos[0]
-                                print(f"[ZoomAPI] Sample QoS date_time: {sample_qos.get('date_time', 'NOT FOUND')}")
-                                print(f"[ZoomAPI] Sample QoS video_output: {sample_qos.get('video_output', 'NOT FOUND')}")
-
-                            for qos_entry in user_qos:
-                                video_output = qos_entry.get('video_output', {})
-                                # Try multiple field names for timestamp
-                                datetime_qos = (
-                                    qos_entry.get('date_time') or
-                                    qos_entry.get('datetime') or
-                                    qos_entry.get('time') or
-                                    qos_entry.get('timestamp') or
-                                    ''
-                                )
-
-                                # FIX: Check if video_output exists with resolution OR bitrate > 0
-                                # bitrate can be 0 or "0" which would fail truthiness check
-                                camera_is_on = False
-                                if video_output:
-                                    resolution = video_output.get('resolution', '')
-                                    bitrate = video_output.get('bitrate', 0)
-                                    # Camera ON if resolution exists OR bitrate > 0
-                                    try:
-                                        bitrate_val = int(bitrate) if bitrate else 0
-                                    except (ValueError, TypeError):
-                                        bitrate_val = 0
-                                    camera_is_on = bool(resolution) or bitrate_val > 0
-
-                                if camera_is_on:
-                                    # Camera was ON during this period
-                                    camera_on_periods.append({
-                                        'datetime': datetime_qos,
-                                        'bitrate': video_output.get('bitrate'),
-                                        'resolution': video_output.get('resolution'),
-                                        'frame_rate': video_output.get('frame_rate')
-                                    })
-                                    if datetime_qos:
-                                        camera_on_timestamps.append(datetime_qos)
-
-                            p['camera_on_periods'] = camera_on_periods
-                            p['camera_on_count'] = len(camera_on_periods)
-                            p['camera_on_timestamps'] = camera_on_timestamps
-
-                            # Debug: Log first participant with camera data
-                            if camera_on_periods and page_count == 0:
-                                user_name = p.get('user_name', 'Unknown')
-                                print(f"[ZoomAPI] {user_name}: {len(camera_on_periods)} camera periods, {len(camera_on_timestamps)} timestamps")
-                                if camera_on_timestamps:
-                                    print(f"[ZoomAPI] Sample timestamp: {camera_on_timestamps[0]}")
-
-                            # Calculate actual camera ON duration from timestamps
-                            camera_on_minutes = 0
-                            if camera_on_timestamps and len(camera_on_timestamps) >= 2:
-                                try:
-                                    # Parse timestamps and calculate duration from intervals
-                                    from datetime import datetime as dt
-                                    parsed_times = []
-                                    for ts in camera_on_timestamps:
-                                        if isinstance(ts, str):
-                                            ts = ts.replace('Z', '+00:00')
-                                            if '.' in ts:
-                                                parsed_times.append(dt.fromisoformat(ts.split('.')[0]))
-                                            else:
-                                                parsed_times.append(dt.fromisoformat(ts.replace('+00:00', '')))
-                                    if parsed_times:
-                                        parsed_times.sort()
-                                        # Calculate total duration considering gaps > 2 min as breaks
-                                        total_seconds = 0
-                                        interval_start = parsed_times[0]
-                                        prev_time = parsed_times[0]
-                                        for curr_time in parsed_times[1:]:
-                                            gap = (curr_time - prev_time).total_seconds()
-                                            if gap > 120:  # Gap > 2 min = new interval
-                                                total_seconds += (prev_time - interval_start).total_seconds() + 60  # Add 1 min for last sample
-                                                interval_start = curr_time
-                                            prev_time = curr_time
-                                        # Add final interval
-                                        total_seconds += (prev_time - interval_start).total_seconds() + 60
-                                        camera_on_minutes = max(1, int(total_seconds / 60))
-                                except Exception as e:
-                                    print(f"[ZoomAPI] Error calculating camera duration: {e}")
-                                    camera_on_minutes = len(camera_on_periods)  # Fallback
-                            elif camera_on_periods:
-                                camera_on_minutes = len(camera_on_periods)  # Fallback if only 1 sample
-
-                            p['camera_on_minutes'] = camera_on_minutes
-
-                        all_participants.extend(participants)
-                        print(f"[ZoomAPI] QoS Page {page_count + 1}: {len(participants)} participants")
-
-                    next_page_token = data.get('next_page_token', '')
-                    page_count += 1
-
-                    if not next_page_token:
-                        break
-
-                elif response.status_code == 400:
-                    print(f"[ZoomAPI] QoS API: Bad request - {response.text[:200]}")
-                    break
-                elif response.status_code == 401:
-                    auth_retries += 1
-                    if auth_retries > max_auth_retries:
-                        print(f"[ZoomAPI] QoS API: Too many 401 errors ({auth_retries}), giving up")
-                        break
-                    print(f"[ZoomAPI] QoS API: Unauthorized - refreshing token (attempt {auth_retries}/{max_auth_retries})")
-                    self.access_token = None
-                    token = self.get_access_token()
-                    headers = {'Authorization': f'Bearer {token}'}
-                    continue
-                elif response.status_code == 403:
-                    print(f"[ZoomAPI] QoS API: Forbidden - requires Business+ plan or dashboard_meetings:read:admin scope")
-                    print(f"[ZoomAPI] Response: {response.text[:300]}")
-                    break
-                elif response.status_code == 404:
-                    print(f"[ZoomAPI] QoS API: Meeting not found")
-                    break
-                else:
-                    print(f"[ZoomAPI] QoS API: {response.status_code} - {response.text[:200]}")
-                    break
-
-            # Count participants with camera data and timestamps
-            with_camera = sum(1 for p in all_participants if p.get('camera_on_count', 0) > 0)
-            with_timestamps = sum(1 for p in all_participants if p.get('camera_on_timestamps'))
-            print(f"[ZoomAPI] QoS: Got {len(all_participants)} participants, {with_camera} with camera, {with_timestamps} with timestamps")
-            return all_participants
-
-        except Exception as e:
-            print(f"[ZoomAPI] QoS API error: {e}")
-            traceback.print_exc()
-            return []
-
-zoom_api = ZoomAPI()
 
 
 # ==============================================================================
@@ -2139,12 +1545,18 @@ zoom_api = ZoomAPI()
 # ==============================================================================
 
 def is_scout_bot(participant_name, participant_email):
-    """Check if participant is the scout bot"""
+    """Check if participant is the scout bot.
+
+    Name matching is EXACT (after trimming + stripping Zoom rejoin
+    suffixes like "-1") — the old substring match meant a real person
+    named e.g. "Priya Scout Bot Reviewer" silently vanished from
+    attendance tracking (CLAUDE.md known issue)."""
     if participant_email and SCOUT_BOT_EMAIL:
-        if participant_email.lower() == SCOUT_BOT_EMAIL.lower():
+        if participant_email.lower().strip() == SCOUT_BOT_EMAIL.lower().strip():
             return True
     if participant_name and SCOUT_BOT_NAME:
-        if SCOUT_BOT_NAME.lower() in participant_name.lower():
+        cleaned = normalize_participant_name(participant_name).lower().strip()
+        if cleaned == SCOUT_BOT_NAME.lower().strip():
             return True
     return False
 
@@ -2624,21 +2036,8 @@ def handle_camera_event(data, camera_on):
     print(f"  -> CAMERA {status}: {p['participant_name']} at {event_dt.strftime('%H:%M:%S')}{duration_str} {'[OK]' if success else '[FAILED]'}")
 
 
-def safe_int(value, default=0):
-    """Safely convert value to int, handling None and empty strings"""
-    if value is None or value == '':
-        return default
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return default
 
 
-def safe_str(value, default=''):
-    """Safely convert value to string, handling None"""
-    if value is None:
-        return default
-    return str(value).strip() if value else default
 
 
 def handle_meeting_ended(data):
@@ -2811,7 +2210,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'Breakout Room Calibrator',
-        'version': '2.0.0',
+        'version': '2.1.0-split',
         'config': {
             'project': GCP_PROJECT_ID,
             'dataset': BQ_DATASET,
@@ -9557,28 +8956,61 @@ def auth_login():
             return resp
 
         client = bigquery.Client(project=GCP_PROJECT_ID)
-        # Case-insensitive username match, trim whitespace
+        # Fetch by username only; the password is verified in Python so it
+        # can be a bcrypt hash. Legacy plaintext rows still work and are
+        # UPGRADED to bcrypt on their first successful login.
         query = f"""
-            SELECT user_id, username, name, role, email
+            SELECT user_id, username, name, role, email, password
             FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.app_users`
             WHERE LOWER(TRIM(username)) = LOWER(@username)
-              AND TRIM(password) = @password
             ORDER BY CASE role WHEN 'superadmin' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
             LIMIT 1
         """
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ScalarQueryParameter("username", "STRING", username),
-                bigquery.ScalarQueryParameter("password", "STRING", password),
             ]
         )
         results = list(client.query(query, job_config=job_config).result())
 
-        if not results:
+        user = results[0] if results else None
+        password_ok = False
+        legacy_upgrade = False
+        if user is not None:
+            stored = (user.password or '').strip()
+            if stored.startswith(('$2a$', '$2b$', '$2y$')):
+                try:
+                    import bcrypt as _bc
+                    password_ok = _bc.checkpw(password.encode('utf-8'), stored.encode('utf-8'))
+                except Exception:
+                    password_ok = False
+            else:
+                # Legacy plaintext row: constant-time compare, then upgrade.
+                password_ok = hmac.compare_digest(stored, password)
+                legacy_upgrade = password_ok
+
+        if not password_ok:
             _login_record_failure(ip, username)
             return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
 
-        user = results[0]
+        if legacy_upgrade:
+            try:
+                import bcrypt as _bc
+                new_hash = _bc.hashpw(password.encode('utf-8'), _bc.gensalt()).decode('utf-8')
+                client.query(
+                    f"UPDATE `{GCP_PROJECT_ID}.{BQ_DATASET}.app_users` "
+                    f"SET password = @p WHERE user_id = @uid",
+                    job_config=bigquery.QueryJobConfig(query_parameters=[
+                        bigquery.ScalarQueryParameter("p", "STRING", new_hash),
+                        bigquery.ScalarQueryParameter("uid", "INT64", user.user_id),
+                    ])
+                ).result()
+                print(f"[Auth] Upgraded '{username}' to bcrypt hash")
+            except Exception as ue:
+                # Non-fatal (e.g. row still in streaming buffer) — retried
+                # automatically on the next login.
+                print(f"[Auth] bcrypt upgrade deferred for '{username}': {ue}")
+
         _login_record_success(ip, username)
         return jsonify({
             'success': True,
@@ -9639,9 +9071,13 @@ def auth_create_user():
         import time
         user_id = int(time.time() * 1000) % 2147483647  # Keep within INT range
 
+        # Never store plaintext: hash at creation (login verifies bcrypt).
+        import bcrypt as _bc
+        stored_pw = _bc.hashpw(password.encode('utf-8'), _bc.gensalt()).decode('utf-8')
+
         errors = client.insert_rows_json(
             f"{GCP_PROJECT_ID}.{BQ_DATASET}.app_users",
-            [{'user_id': user_id, 'username': username, 'password': password,
+            [{'user_id': user_id, 'username': username, 'password': stored_pw,
               'name': name, 'role': role, 'email': email}]
         )
         if errors:
@@ -12444,28 +11880,20 @@ def google_sheet_status():
 # Zoom webhooks confirmed presence).
 # ==============================================================================
 
-PRESENCE_INTERVALS_TABLE = 'presence_intervals'
-GAP_THRESHOLD_SECONDS = 300          # >5min gap between snapshots = new interval
-BUCKET_SECONDS = 30                  # 30s dedup bucket (multi-source polling)
-MAIN_ROOM_SYNTH_CAP_MINUTES = 600    # Cap any single synthesized Main Room interval
-MAIN_ROOM_SYNTH_MIN_SECONDS = 120    # Don't synthesize gaps smaller than 2min
+from zt_intervals import *  # noqa: F401,F403 — split from app.py, see zt_intervals.py
 # When a participant's LEAVE webhook never arrived (laptop died, Zoom dropped
 # the event) we still credit them (join -> monitoring end) so a whole day isn't
 # lost — but capped tighter than a normal fill, because "no leave event" could
 # also mean they left and we never heard. 4h default = at most a half-day of
 # benefit-of-the-doubt, never a 10h phantom.
-WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES = int(os.environ.get('WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES', '240'))
-WEBHOOK_SEGMENT_MIN_SECONDS = 60     # Webhook-timeline segments shorter than this are noise
 # Page-load auto-build kill switch. 'true' (default) = pages may trigger
 # builds (legacy behavior). Set to 'false' on Cloud Run ONCE the Cloud
 # Scheduler jobs own freshness (2-min today rebuild + /intervals/auto-build
 # sweep) — pages then become pure readers and never pay build latency.
-PAGELOAD_AUTO_BUILD = os.environ.get('PAGELOAD_AUTO_BUILD', 'true').lower() != 'false'
 # Recent days (today/yesterday) are kept fresh by the hourly + nightly rebuild
 # Cloud Scheduler jobs. The Team View pivot only re-materializes one of those
 # days on view if it's gone STALER than this (a scheduler missed/died) — so a
 # healthy system pays no rebuild latency, but a dead scheduler self-heals.
-SETTLING_STALE_MINUTES = int(os.environ.get('SETTLING_STALE_MINUTES', '90'))
 # --- Inherited-meeting (overnight-spillover) guard ------------------------
 # Zoom meetings can run 24h+. When one is left running across IST midnight its
 # tail lands on the NEXT day's partition starting at ~00:00, with the whole
@@ -12476,11 +11904,6 @@ SETTLING_STALE_MINUTES = int(os.environ.get('SETTLING_STALE_MINUTES', '90'))
 # every interval that STARTS before it. This implements "count from the meeting
 # that starts today; skip the post-midnight tail of yesterday's meeting." On a
 # normal day nobody is present at 00:00, so nothing is dropped. Tunable via env.
-INHERITED_MIN_PARTICIPANTS     = int(os.environ.get('INHERITED_MIN_PARTICIPANTS', '10'))      # >=N frozen at 00:00 => inherited meeting
-INHERITED_LEAVE_FRACTION       = float(os.environ.get('INHERITED_LEAVE_FRACTION', '0.5'))     # occupancy < frac*start_level => mass-exit
-INHERITED_MAX_BOUNDARY_IST_MIN = int(os.environ.get('INHERITED_MAX_BOUNDARY_IST_MIN', '840')) # don't place boundary after 14:00 IST
-INHERITED_EXIT_SUSTAIN_BUCKETS = int(os.environ.get('INHERITED_EXIT_SUSTAIN_BUCKETS', '10'))  # exit must stay low this many 30s buckets (5min)
-IST_OFFSET_MINUTES = 330
 
 
 # In-process guard so "always rebuild today" endpoints don't hammer BigQuery:
@@ -12488,47 +11911,11 @@ IST_OFFSET_MINUTES = 330
 # a full build_presence_intervals (5+ queries + a load job). One rebuild per
 # TODAY_REBUILD_MIN_INTERVAL_S per process keeps every view fresh to within
 # ~3 minutes while cutting BQ query volume by the number of teams.
-_TODAY_BUILD_GUARD = {'date': None, 'ts': 0.0}
-_TODAY_BUILD_LOCK = threading.Lock()
-TODAY_REBUILD_MIN_INTERVAL_S = int(os.environ.get('TODAY_REBUILD_MIN_INTERVAL_S', '180'))
 # On build failure, retry sooner than the full interval but NOT immediately:
 # during a BQ incident every request would otherwise re-run the full 5-query
 # build, amplifying the outage.
-TODAY_REBUILD_FAILURE_BACKOFF_S = int(os.environ.get('TODAY_REBUILD_FAILURE_BACKOFF_S', '30'))
 
 
-def _rebuild_today_guarded(date_str):
-    """Rebuild today's partition unless this process already did (or started
-    to) within TODAY_REBUILD_MIN_INTERVAL_S. Returns True if a rebuild ran.
-
-    The guard is CLAIMED before the build starts (under a lock): a dashboard
-    fires one attendance_v2 call per team in parallel, and a build takes many
-    seconds — claiming after completion let every parallel request start its
-    own full rebuild. Parallel callers now return immediately and serve the
-    existing (at most ~3 min old) data. On failure the claim is shortened to
-    a backoff so the next request retries soon without a failure storm."""
-    now = time.time()
-    with _TODAY_BUILD_LOCK:
-        if (_TODAY_BUILD_GUARD['date'] == date_str
-                and now - _TODAY_BUILD_GUARD['ts'] < TODAY_REBUILD_MIN_INTERVAL_S):
-            return False
-        # Claim BEFORE building so concurrent requests don't duplicate it.
-        _TODAY_BUILD_GUARD['date'] = date_str
-        _TODAY_BUILD_GUARD['ts'] = now
-    try:
-        build_presence_intervals(date_str)
-    except Exception:
-        with _TODAY_BUILD_LOCK:
-            if _TODAY_BUILD_GUARD['date'] == date_str:
-                # Shorten the claim: retry after the backoff, not the full interval
-                _TODAY_BUILD_GUARD['ts'] = (
-                    time.time() - TODAY_REBUILD_MIN_INTERVAL_S + TODAY_REBUILD_FAILURE_BACKOFF_S
-                )
-        raise
-    with _TODAY_BUILD_LOCK:
-        _TODAY_BUILD_GUARD['date'] = date_str
-        _TODAY_BUILD_GUARD['ts'] = time.time()
-    return True
 
 
 def _whole_minutes_from_seconds(seconds):
@@ -12542,896 +11929,14 @@ def _whole_minutes_from_seconds(seconds):
     return int(((seconds or 0) + 30) // 60)
 
 
-def _sql_whole_minutes(seconds_expr):
-    # Round half-up — must stay identical to _whole_minutes_from_seconds.
-    return f"CAST(FLOOR((COALESCE({seconds_expr}, 0) + 30) / 60.0) AS INT64)"
 
 
-def _classify_room(room_name):
-    """Return 'main' | 'breakout' | 'break' for a room name.
-    Matches v1 conventions at app.py:7753, 7760, 7775."""
-    if not room_name:
-        return 'breakout'
-    n = room_name.strip().lower()
-    if 'break time' in n:
-        return 'break'
-    if n == 'main room' or n.startswith('0.main'):
-        return 'main'
-    return 'breakout'
 
 
-def _sql_normalize_name(col_expr):
-    """SQL expression that strips Zoom rejoin suffixes the same way
-    normalize_participant_name() does in Python. Used by the team_v2
-    identity bridge so 'Kajal Yadav-1' in snapshots links to the
-    'Kajal Yadav' row in team_members."""
-    s = f"TRIM({col_expr})"
-    # In order: " - TEXT" suffix, "-N", "_TEXT", "-CAPS", trailing " N"
-    s = f"REGEXP_REPLACE({s}, r'\\s+-\\s+\\w+$', '')"
-    s = f"REGEXP_REPLACE({s}, r'-\\d+$', '')"
-    s = f"REGEXP_REPLACE({s}, r'_\\w+$', '')"
-    s = f"REGEXP_REPLACE({s}, r'-[A-Z]{{2,}}$', '')"
-    s = f"REGEXP_REPLACE({s}, r'\\s+\\d$', '')"
-    return f"LOWER(TRIM({s}))"
 
 
-def _ensure_presence_intervals_table():
-    """Create presence_intervals table if it does not yet exist.
-    Partitioned by event_date, clustered by meeting_id, participant_key."""
-    client = get_bq_client()
-    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
-    ddl = f"""
-    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` (
-        interval_id        STRING NOT NULL,
-        event_date         DATE   NOT NULL,
-        meeting_id         STRING,
-        meeting_uuid       STRING,
-        participant_key    STRING NOT NULL,
-        participant_name   STRING,
-        participant_email  STRING,
-        room_name          STRING,
-        room_category      STRING,
-        start_ts           TIMESTAMP NOT NULL,
-        end_ts             TIMESTAMP NOT NULL,
-        duration_seconds   INT64,
-        alone_seconds      INT64,
-        snapshot_count     INT64,
-        source             STRING,
-        confidence         FLOAT64,
-        built_at           TIMESTAMP
-    )
-    PARTITION BY event_date
-    CLUSTER BY meeting_id, participant_key
-    """
-    client.query(ddl).result()
 
 
-def build_presence_intervals(date_str):
-    """Materialize presence_intervals for one IST date.
-
-    Steps:
-      1. Pull bucketed snapshot data (per participant+room+30s bucket).
-      2. Pull webhook timestamps (meeting_joined, meeting_left, breakout flag).
-      3. Compute real intervals from snapshots, with alone_seconds.
-      4. Fill snapshot gaps from the webhook timeline: uncovered stretches
-         become Main Room (synthesized) OR the breakout room the webhooks
-         reported (webhook_room) — a mid-day bot outage no longer mislabels
-         breakout time as Main Room.
-      5. Webhook timeline fallback: participants with webhook presence but
-         NO snapshots (bot off / bot missed them) get their full room
-         timeline rebuilt from webhook events — Main Room between meeting
-         join and breakout joins, the breakout room between its join/left
-         events. Bot data (snapshots) stays primary when it exists.
-      6. DELETE existing rows for the date, INSERT new rows.
-
-    Returns dict with counts and timing.
-    """
-    started = time.time()
-    _ensure_presence_intervals_table()
-    client = get_bq_client()
-    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
-
-    # ----- Step 1: bucketed snapshot data ----------------------------------
-    # CANONICAL participant_key = normalized name (Zoom rejoin suffixes
-    # stripped). Same person across rejoin variants gets one key, all
-    # their intervals merge before synthesis. Edge case: two real people
-    # with identical normalized names would collide — acceptable trade-off
-    # for the simplicity (Zoom snapshots often lack email anyway).
-    norm_sn = _sql_normalize_name('s.participant_name')
-    bucket_q = f"""
-    WITH normalized AS (
-      SELECT
-        s.snapshot_time,
-        s.meeting_id,
-        s.participant_name,
-        s.participant_email,
-        s.participant_uuid,
-        s.room_name,
-        {norm_sn} AS participant_key,
-        DIV(UNIX_SECONDS(s.snapshot_time), {BUCKET_SECONDS}) AS bucket30
-      FROM `{dataset_ref}.room_snapshots_v2` s
-      WHERE s.event_date = @date
-        AND s.room_name IS NOT NULL AND s.room_name != ''
-        AND s.participant_name IS NOT NULL AND s.participant_name != ''
-        AND LOWER(s.participant_name) NOT LIKE '%scout%'
-    ),
-    dedup AS (
-      -- Within (canonical_key, bucket30): keep ONE row. Prefer non-Main-Room.
-      -- This kills both SDK-transition artifacts (same uuid, same instant,
-      -- two rooms) AND multi-source duplication (Source A says Main Room,
-      -- Source B says Breakout for same person in same 30s window).
-      SELECT *
-      FROM normalized
-      QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY participant_key, bucket30
-        ORDER BY
-          CASE WHEN LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-          room_name
-      ) = 1
-    ),
-    occupancy AS (
-      SELECT room_name, bucket30, COUNT(DISTINCT participant_key) AS occupant_count
-      FROM dedup
-      GROUP BY room_name, bucket30
-    )
-    SELECT
-      d.participant_key,
-      ANY_VALUE(d.participant_name) AS participant_name,
-      MAX(d.participant_email) AS participant_email,
-      ANY_VALUE(d.meeting_id) AS meeting_id,
-      d.room_name,
-      d.bucket30,
-      MIN(d.snapshot_time) AS bucket_start,
-      MAX(d.snapshot_time) AS bucket_end,
-      MAX(o.occupant_count) AS occupant_count
-    FROM dedup d
-    JOIN occupancy o USING (room_name, bucket30)
-    GROUP BY d.participant_key, d.room_name, d.bucket30
-    ORDER BY d.participant_key, d.bucket30
-    """
-    job = client.query(bucket_q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
-    ))
-    buckets = list(job.result())
-
-    # ----- Step 1b: identity map (email-first participant keys) ------------
-    # Names drift (renames, rejoin suffixes, "Shashank C" vs "Shashank
-    # Channawar"); emails don't. Wherever a normalized name maps to exactly
-    # ONE email that day (seen in snapshots or webhooks), the email becomes
-    # the participant_key — so all of a person's name variants merge into a
-    # single identity. Names with no email (or ambiguously two emails) keep
-    # the normalized-name key, exactly as before. Consumers already match
-    # rows by BOTH the name and email columns, so either key form resolves.
-    norm_pn_i = _sql_normalize_name('pe.participant_name')
-    ident_q = f"""
-    WITH pairs AS (
-      SELECT DISTINCT {norm_sn} AS name_key, LOWER(TRIM(s.participant_email)) AS email
-      FROM `{dataset_ref}.room_snapshots_v2` s
-      WHERE s.event_date = @date
-        AND s.participant_name IS NOT NULL AND s.participant_name != ''
-        AND s.participant_email IS NOT NULL AND TRIM(s.participant_email) != ''
-        AND LOWER(s.participant_name) NOT LIKE '%scout%'
-      UNION DISTINCT
-      SELECT DISTINCT {norm_pn_i} AS name_key, LOWER(TRIM(pe.participant_email)) AS email
-      FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-      WHERE pe.event_date = @date
-        AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
-        AND pe.participant_email IS NOT NULL AND TRIM(pe.participant_email) != ''
-        AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-    )
-    SELECT name_key, ANY_VALUE(pairs.email) AS email
-    FROM pairs
-    GROUP BY name_key
-    -- Qualified pairs.email: bare "email" would resolve to the SELECT alias
-    -- (ANY_VALUE) and BigQuery rejects aggregating an aggregate.
-    HAVING COUNT(DISTINCT pairs.email) = 1
-    """
-    ident_rows = list(client.query(ident_q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
-    )).result())
-    _ident_map = {r.name_key: r.email for r in ident_rows}
-
-    def _remap(name_key):
-        return _ident_map.get(name_key, name_key)
-
-    # Last snapshot anywhere = initial monitoring window end.
-    # This will be extended in Step 2b if webhooks continued after snapshots stopped.
-    last_snapshot_time = None
-    if buckets:
-        last_snapshot_time = max(b.bucket_end for b in buckets)
-    monitoring_end = last_snapshot_time  # Will be updated after Step 2
-
-    # ----- Step 2: webhook timestamps per participant ----------------------
-    # Use the SAME canonical key formula as snapshots (normalized name)
-    # so webhook data merges correctly with snapshot data in Python.
-    norm_pn = _sql_normalize_name('pe.participant_name')
-    webhook_q = f"""
-    SELECT
-      {norm_pn} AS participant_key,
-      ANY_VALUE(pe.participant_name) AS participant_name,
-      ANY_VALUE(pe.participant_email) AS participant_email,
-      ANY_VALUE(pe.meeting_id) AS meeting_id,
-      MIN(CASE WHEN pe.event_type IN ('participant_joined','meeting.participant_joined')
-          THEN CAST(pe.event_timestamp AS TIMESTAMP) END) AS meeting_joined,
-      MAX(CASE WHEN pe.event_type IN ('participant_left','meeting.participant_left')
-          THEN CAST(pe.event_timestamp AS TIMESTAMP) END) AS meeting_left,
-      COUNTIF(pe.event_type = 'breakout_room_joined') AS breakout_webhook_count
-    FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-    WHERE pe.event_date = @date
-      AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
-      AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-    GROUP BY participant_key
-    """
-    webhook_rows = list(client.query(webhook_q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
-    )).result())
-    # Merge webhook rows under remapped keys: when two name variants of the
-    # same person (same email) each produced a row, combine them into one.
-    from types import SimpleNamespace as _NS
-    webhook_by_key = {}
-    for r in webhook_rows:
-        k = _remap(r.participant_key)
-        w = webhook_by_key.get(k)
-        if w is None:
-            webhook_by_key[k] = _NS(
-                participant_key=k, participant_name=r.participant_name,
-                participant_email=r.participant_email, meeting_id=r.meeting_id,
-                meeting_joined=r.meeting_joined, meeting_left=r.meeting_left,
-                breakout_webhook_count=r.breakout_webhook_count or 0)
-        else:
-            w.participant_email = w.participant_email or r.participant_email
-            w.meeting_id = w.meeting_id or r.meeting_id
-            if r.meeting_joined and (not w.meeting_joined or r.meeting_joined < w.meeting_joined):
-                w.meeting_joined = r.meeting_joined
-            if r.meeting_left and (not w.meeting_left or r.meeting_left > w.meeting_left):
-                w.meeting_left = r.meeting_left
-            w.breakout_webhook_count += (r.breakout_webhook_count or 0)
-
-    # ----- Step 2b: presence windows from join/leave events ----------------
-    # For each participant, build (joined_ts, left_ts) windows so synthesis
-    # only credits Main Room time when they were ACTUALLY in the meeting.
-    # Without this, a participant who left for an hour between breakouts
-    # gets credited that whole hour as phantom Main Room time.
-    events_q = f"""
-    SELECT
-      {norm_pn} AS participant_key,
-      ARRAY_AGG(
-        STRUCT(
-          CAST(pe.event_timestamp AS TIMESTAMP) AS ts,
-          pe.event_type AS et,
-          pe.room_name AS room
-        )
-        ORDER BY pe.event_timestamp
-      ) AS events
-    FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-    WHERE pe.event_date = @date
-      AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
-      AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-      AND pe.event_type IN ('participant_joined','participant_left',
-                            'meeting.participant_joined','meeting.participant_left',
-                            'breakout_room_joined','breakout_room_left')
-    GROUP BY participant_key
-    """
-    events_rows = list(client.query(events_q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", date_str)]
-    )).result())
-
-    # Coalesce threshold: leave/rejoin gaps shorter than this are treated
-    # as continuous presence (Zoom often sends micro-disconnects).
-    COALESCE_GAP_S = 30
-
-    def _build_presence_windows(evt_list):
-        """Return list of (join_dt, leave_dt) UTC tuples. leave_dt may be
-        None if the participant was still present at end of capture."""
-        raw = []
-        current_join = None
-        for e in evt_list:
-            ts = e['ts'] if isinstance(e, dict) else e.ts
-            et = e['et'] if isinstance(e, dict) else e.et
-            if et in ('participant_joined', 'meeting.participant_joined'):
-                if current_join is None:
-                    current_join = ts
-            elif et in ('participant_left', 'meeting.participant_left'):
-                if current_join is not None:
-                    raw.append((current_join, ts))
-                    current_join = None
-        if current_join is not None:
-            raw.append((current_join, None))
-        if not raw:
-            return []
-        merged = [raw[0]]
-        for w in raw[1:]:
-            prev_s, prev_e = merged[-1]
-            if prev_e is not None and w[0] is not None:
-                gap = (w[0] - prev_e).total_seconds()
-                if gap < COALESCE_GAP_S:
-                    merged[-1] = (prev_s, w[1])
-                    continue
-            merged.append(w)
-        return merged
-
-    # Merge event timelines under remapped keys (rename variants combine),
-    # keeping chronological order so window-building stays correct.
-    full_events_by_key = {}
-    for r in events_rows:
-        full_events_by_key.setdefault(_remap(r.participant_key), []).extend(list(r.events))
-    for _k, _evts in full_events_by_key.items():
-        _evts.sort(key=lambda e: e['ts'] if isinstance(e, dict) else e.ts)
-    presence_windows_by_key = {
-        k: _build_presence_windows(evts) for k, evts in full_events_by_key.items()
-    }
-
-    # ----- Step 2c: extend monitoring_end if webhooks continued after snapshots -----
-    # When SDK monitoring stops but webhooks keep flowing, use the latest webhook
-    # event time as the cap. This prevents discarding valid webhook data.
-    last_webhook_time = None
-    for wh in webhook_by_key.values():
-        if wh.meeting_left and (last_webhook_time is None or wh.meeting_left > last_webhook_time):
-            last_webhook_time = wh.meeting_left
-
-    if last_webhook_time:
-        if monitoring_end is None:
-            monitoring_end = last_webhook_time
-        elif last_webhook_time > monitoring_end:
-            # Webhooks continued after snapshots stopped — extend the window
-            print(f"[PresenceIntervals] Extending monitoring_end from {monitoring_end} to {last_webhook_time} (webhooks continued after snapshot outage)")
-            monitoring_end = last_webhook_time
-
-    def _present_intersection_seconds(start, end, windows):
-        """Total seconds within [start, end] that fall inside any window."""
-        if not windows:
-            return None  # No webhook data — caller falls back to gap_s
-        total = 0
-        for w_s, w_e in windows:
-            if w_e is None:
-                w_e = end + timedelta(seconds=1)
-            os_ = max(start, w_s)
-            oe = min(end, w_e)
-            if oe > os_:
-                total += (oe - os_).total_seconds()
-        return total
-
-    # ----- Step 3: build real intervals from buckets -----------------------
-    # Group buckets by (participant_key, room_name), sorted by bucket30.
-    # Consecutive buckets (diff == 1, i.e. 30s apart) belong to the same
-    # interval. A gap > GAP_THRESHOLD_SECONDS / BUCKET_SECONDS = 10 buckets
-    # starts a new interval.
-    from collections import defaultdict
-    by_key_room = defaultdict(list)
-    name_by_key = {}
-    email_by_key = {}
-    meeting_by_key = {}
-    for b in buckets:
-        bkey = _remap(b.participant_key)
-        by_key_room[(bkey, b.room_name)].append(b)
-        # Track latest seen identity per key (snapshot is authoritative for name)
-        name_by_key[bkey] = b.participant_name
-        if b.participant_email:
-            email_by_key[bkey] = b.participant_email
-        if b.meeting_id:
-            meeting_by_key[bkey] = b.meeting_id
-
-    gap_buckets = GAP_THRESHOLD_SECONDS // BUCKET_SECONDS  # 10
-
-    # --- Cross-room gap credit --------------------------------------------
-    # A missed 30s poll must not discard presence: the person did not
-    # teleport out of the meeting because the SDK skipped a beat. For each
-    # observed bucket, credit the time up to the participant's NEXT observed
-    # bucket in ANY room (they stayed in the current room until seen
-    # elsewhere), capped at the gap threshold. Holes larger than the
-    # threshold still split intervals and are not credited. Crediting to the
-    # PRECEDING room and looking across rooms keeps the per-person timeline
-    # tiled with no double-counting when someone bounces A->B->A quickly.
-    buckets_by_key = defaultdict(set)
-    for b in buckets:
-        buckets_by_key[_remap(b.participant_key)].add(b.bucket30)
-    credit_by_key_bucket = {}
-    for _pkey, bset in buckets_by_key.items():
-        blist = sorted(bset)
-        for i, bk in enumerate(blist):
-            if i + 1 < len(blist):
-                gap = blist[i + 1] - bk
-                credit = gap if gap <= gap_buckets else 1
-            else:
-                credit = 1  # last observation: credit its own bucket only
-            credit_by_key_bucket[(_pkey, bk)] = credit * BUCKET_SECONDS
-
-    intervals = []  # list of dicts ready for BQ insert
-    intervals_by_participant = defaultdict(list)  # key -> [interval dict, ...]
-
-    now_ts = datetime.utcnow()
-    built_at_iso = now_ts.replace(microsecond=0).isoformat() + 'Z'
-
-    for (pkey, room), brows in by_key_room.items():
-        category = _classify_room(room)
-        # Sort by bucket30
-        brows.sort(key=lambda x: x.bucket30)
-        # Gap-group
-        groups = []
-        current = [brows[0]]
-        for prev, curr in zip(brows, brows[1:]):
-            if (curr.bucket30 - prev.bucket30) > gap_buckets:
-                groups.append(current)
-                current = [curr]
-            else:
-                current.append(curr)
-        groups.append(current)
-
-        for grp in groups:
-            start_ts = grp[0].bucket_start
-            # Duration = sum of per-bucket credits (each bucket counts until
-            # the participant's next observation in any room, capped at the
-            # gap threshold). This credits sub-threshold polling holes that
-            # the old `distinct_buckets * 30` formula silently discarded —
-            # the source of every view showing less time than the wall clock.
-            seen_buckets = {}
-            for g in grp:
-                seen_buckets.setdefault(g.bucket30, g)
-            duration = sum(
-                credit_by_key_bucket.get((pkey, bk), BUCKET_SECONDS)
-                for bk in seen_buckets
-            )
-            # End = start of last bucket + its credit, so end-start stays
-            # consistent with the credited duration in Day View room rows.
-            last_credit = credit_by_key_bucket.get((pkey, grp[-1].bucket30), BUCKET_SECONDS)
-            end_ts = grp[-1].bucket_start + timedelta(seconds=last_credit)
-            # Alone seconds: 30 per bucket where occupant_count==1, excluding Main
-            alone = 0
-            if category != 'main':
-                alone = sum(
-                    BUCKET_SECONDS for g in seen_buckets.values()
-                    if (g.occupant_count or 0) == 1
-                )
-            iv = {
-                'interval_id': str(uuid_lib.uuid4()),
-                'event_date': date_str,
-                'meeting_id': meeting_by_key.get(pkey),
-                'meeting_uuid': None,
-                'participant_key': pkey,
-                'participant_name': name_by_key.get(pkey),
-                'participant_email': email_by_key.get(pkey),
-                'room_name': room,
-                'room_category': category,
-                'start_ts': start_ts.isoformat(),
-                'end_ts': end_ts.isoformat(),
-                'duration_seconds': duration,
-                'alone_seconds': alone,
-                'snapshot_count': len(grp),
-                'source': 'snapshot',
-                'confidence': 1.0,
-                'built_at': built_at_iso,
-            }
-            intervals.append(iv)
-            intervals_by_participant[pkey].append(iv)
-
-    # ----- Step 4: synthesize Main Room from webhook presence --------------
-    # Snapshots are primary truth. Wherever a participant has webhook presence
-    # (join->leave windows) NOT already covered by a snapshot interval, credit
-    # that time as Main Room. This fills holes when the snapshot monitor had an
-    # outage but webhooks kept flowing (Zoom sends them automatically), so a day
-    # is no longer under-counted just because polling stopped. Open windows
-    # (missing leave) are capped at the monitoring window end — never phantom
-    # presence past it.
-    def _parse_ts(s):
-        # ISO string -> naive UTC datetime
-        if isinstance(s, str):
-            return datetime.fromisoformat(s.replace('Z', ''))
-        return s
-
-    def _emit_main(bucket_list, pkey, s_dt, e_dt):
-        secs = (e_dt - s_dt).total_seconds()
-        if secs < MAIN_ROOM_SYNTH_MIN_SECONDS:
-            return
-        secs = min(secs, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
-        bucket_list.append({
-            'interval_id': str(uuid_lib.uuid4()),
-            'event_date': date_str,
-            'meeting_id': meeting_by_key.get(pkey),
-            'meeting_uuid': None,
-            'participant_key': pkey,
-            'participant_name': name_by_key.get(pkey),
-            'participant_email': email_by_key.get(pkey),
-            'room_name': '0.Main Room',
-            'room_category': 'main',
-            'start_ts': s_dt.isoformat(),
-            'end_ts': (s_dt + timedelta(seconds=secs)).isoformat(),
-            'duration_seconds': int(secs),
-            'alone_seconds': 0,
-            'snapshot_count': 0,
-            'source': 'synthesized_main',
-            'confidence': 0.6,
-            'built_at': built_at_iso,
-        })
-
-    # --- Shared webhook-timeline machinery (used by Steps 4 and 5) ---------
-    def _evt(e, name):
-        return e[name] if isinstance(e, dict) else getattr(e, name)
-
-    def _breakout_events_for(pkey):
-        return [e for e in full_events_by_key.get(pkey, [])
-                if _evt(e, 'et') in ('breakout_room_joined', 'breakout_room_left')]
-
-    def _room_state_at(breakout_evts, at_ts, not_before):
-        """Which room was the participant in at `at_ts`, judged from their
-        last breakout event in [not_before, at_ts]. Events before
-        `not_before` (a previous meeting session) are stale — ignored."""
-        room = 'Main Room'
-        for e in breakout_evts:
-            ets = _evt(e, 'ts')
-            if ets < not_before or ets > at_ts:
-                continue
-            if _evt(e, 'et') == 'breakout_room_joined':
-                room = _evt(e, 'room') or 'Unknown Room'
-            else:
-                room = 'Main Room'
-        return room
-
-    def _tile_window_with_rooms(breakout_evts, w_start, w_end, initial_room='Main Room'):
-        """Tile [w_start, w_end] into (room, start, end) segments from
-        breakout join/left webhooks — a state machine starting in
-        `initial_room`. Drops Zoom double-sends (same event repeated <5s;
-        the in-memory dedup misses those across Cloud Run instances)."""
-        tiles = []
-        cur_room = initial_room
-        seg_start = w_start
-        prev_et, prev_room, prev_ts = None, None, None
-        for e in breakout_evts:
-            ts, et, room = _evt(e, 'ts'), _evt(e, 'et'), _evt(e, 'room')
-            if ts < w_start or ts > w_end:
-                continue
-            if (prev_et == et and (prev_room or '') == (room or '')
-                    and prev_ts and (ts - prev_ts).total_seconds() < 5):
-                continue
-            prev_et, prev_room, prev_ts = et, room, ts
-            if et == 'breakout_room_joined':
-                new_room = room or 'Unknown Room'
-                if new_room == cur_room:
-                    continue
-                tiles.append((cur_room, seg_start, ts))
-                cur_room, seg_start = new_room, ts
-            else:  # breakout_room_left -> back to Main Room
-                if cur_room == 'Main Room':
-                    continue  # stray left (its join was missed) — stay in Main
-                tiles.append((cur_room, seg_start, ts))
-                cur_room, seg_start = 'Main Room', ts
-        tiles.append((cur_room, seg_start, w_end))
-        return [(r, s, e) for (r, s, e) in tiles if e > s]
-
-    def _emit_uncovered_stretch(bucket_list, pkey, brk_evts, window_start, s_dt, e_dt):
-        """Fill an uncovered stretch for a SNAPSHOT participant. Previously
-        this was always synthesized Main Room — wrong when the bot died
-        mid-day while webhooks show the person in a breakout. Now the
-        stretch is tiled by the webhook timeline: Main portions keep the
-        legacy synthesized_main path, breakout portions become webhook_room
-        intervals with the room the webhooks reported."""
-        init_room = _room_state_at(brk_evts, s_dt, window_start)
-        for room, t_s, t_e in _tile_window_with_rooms(brk_evts, s_dt, e_dt,
-                                                      initial_room=init_room):
-            category = _classify_room(room)
-            if category == 'main':
-                _emit_main(bucket_list, pkey, t_s, t_e)
-                continue
-            secs = (t_e - t_s).total_seconds()
-            if secs < WEBHOOK_SEGMENT_MIN_SECONDS:
-                continue
-            secs = min(secs, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
-            bucket_list.append({
-                'interval_id': str(uuid_lib.uuid4()),
-                'event_date': date_str,
-                'meeting_id': meeting_by_key.get(pkey),
-                'meeting_uuid': None,
-                'participant_key': pkey,
-                'participant_name': name_by_key.get(pkey),
-                'participant_email': email_by_key.get(pkey),
-                'room_name': room,
-                'room_category': category,
-                'start_ts': t_s.isoformat(),
-                'end_ts': (t_s + timedelta(seconds=secs)).isoformat(),
-                'duration_seconds': int(secs),
-                'alone_seconds': 0,
-                'snapshot_count': 0,
-                'source': 'webhook_room',
-                'confidence': 0.5,
-                'built_at': built_at_iso,
-            })
-
-    for pkey, plist in list(intervals_by_participant.items()):
-        windows = presence_windows_by_key.get(pkey, [])
-        if not windows:
-            continue  # no webhook presence -> nothing to synthesize
-        wh = webhook_by_key.get(pkey)
-        meeting_left = wh.meeting_left if wh else None
-        brk_evts = _breakout_events_for(pkey)
-        # Time already covered by ANY snapshot interval (breakout or main).
-        covered = sorted(
-            (_parse_ts(iv['start_ts']), _parse_ts(iv['end_ts']))
-            for iv in plist if iv['source'] == 'snapshot'
-        )
-        synthesized = []
-        for w_s, w_e in windows:
-            if w_e is None:
-                w_e = meeting_left or monitoring_end
-            if w_e is None:
-                continue
-            # No phantom presence after monitoring/meeting ended.
-            if monitoring_end and w_e > monitoring_end:
-                w_e = monitoring_end
-            if w_e <= w_s:
-                continue
-            # Walk the window, filling every stretch not already covered by
-            # a snapshot interval from the webhook timeline (Main Room when
-            # webhooks say Main, the actual breakout room when they don't).
-            cursor = w_s
-            for c_s, c_e in covered:
-                if c_e <= cursor or c_s >= w_e:
-                    continue
-                if c_s > cursor:
-                    _emit_uncovered_stretch(synthesized, pkey, brk_evts,
-                                            w_s, cursor, min(c_s, w_e))
-                cursor = max(cursor, c_e)
-                if cursor >= w_e:
-                    break
-            if cursor < w_e:
-                _emit_uncovered_stretch(synthesized, pkey, brk_evts, w_s, cursor, w_e)
-        intervals.extend(synthesized)
-        intervals_by_participant[pkey].extend(synthesized)
-
-    # ----- Step 5: webhook timeline for participants with NO snapshots -----
-    # Bot-primary, webhook-fallback. When the bot (snapshots) saw a
-    # participant, Steps 3-4 already built their day and this step skips
-    # them. When it did not — bot off all day, bot crashed mid-meeting,
-    # person never captured by polling — reconstruct their room timeline
-    # from the webhook event sequence itself: Main Room from meeting join
-    # until the first breakout join, the breakout room until its left event
-    # (or the next join), Main Room again after leaving, until meeting
-    # leave. Room names come from the events (real names when calibration
-    # mappings existed that day, 'Room-xxxxxxxx' otherwise — still counted
-    # as breakout time either way).
-    #
-    # This replaces the old rule that skipped anyone with breakout webhooks
-    # and no snapshots, which blanked entire bot-off days (e.g. 2026-07-15).
-    #
-    # Each PRESENCE WINDOW (join->leave pair) is credited separately:
-    # someone who attended 09:00-09:10 and 17:00-17:30 gets 40 min, not the
-    # whole day. A window with a missing leave (laptop closed, Zoom dropped
-    # the event) is credited until monitoring end but capped tighter
-    # (WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES) because monitoring_end is the
-    # MEETING's last activity, not this person's.
-    snapshot_keys = set(intervals_by_participant.keys())
-
-    def _emit_webhook_segment(pkey, wh, room, s_dt, e_dt, no_leave):
-        secs = (e_dt - s_dt).total_seconds()
-        if secs < WEBHOOK_SEGMENT_MIN_SECONDS:
-            return
-        secs = min(secs, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
-        category = _classify_room(room)
-        intervals.append({
-            'interval_id': str(uuid_lib.uuid4()),
-            'event_date': date_str,
-            'meeting_id': wh.meeting_id,
-            'meeting_uuid': None,
-            'participant_key': pkey,
-            'participant_name': wh.participant_name,
-            'participant_email': wh.participant_email,
-            'room_name': '0.Main Room' if category == 'main' else room,
-            'room_category': category,
-            'start_ts': s_dt.isoformat(),
-            'end_ts': (s_dt + timedelta(seconds=secs)).isoformat(),
-            'duration_seconds': int(secs),
-            'alone_seconds': 0,
-            'snapshot_count': 0,
-            # webhook_fill = Main Room credit from webhooks (legacy name,
-            # kept for audit continuity); webhook_room = placed in a
-            # specific breakout room by breakout join/left webhooks.
-            'source': 'webhook_fill' if category == 'main' else 'webhook_room',
-            # 0.35 flags "leave webhook never arrived" fills for auditing
-            'confidence': 0.35 if no_leave else 0.5,
-            'built_at': built_at_iso,
-        })
-
-    for pkey, wh in webhook_by_key.items():
-        if pkey in snapshot_keys:
-            continue  # bot data exists — snapshot path already covered them
-
-        breakout_evts = _breakout_events_for(pkey)
-
-        # Presence windows from join/leave events; if Zoom dropped every
-        # join/leave but breakout events exist, fall back to an open window
-        # starting at the first breakout event (no-leave cap applies).
-        windows = presence_windows_by_key.get(pkey)
-        if not windows:
-            if wh.meeting_joined:
-                windows = [(wh.meeting_joined, wh.meeting_left)]
-            elif breakout_evts:
-                windows = [(_evt(breakout_evts[0], 'ts'), None)]
-            else:
-                continue
-
-        for w_start, w_leave in windows:
-            if w_start is None:
-                continue
-            no_leave = w_leave is None
-            w_end = w_leave or monitoring_end
-            if not w_end:
-                continue
-            if monitoring_end and w_end > monitoring_end:
-                w_end = monitoring_end
-            if no_leave:
-                cap = timedelta(minutes=WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES)
-                if w_end - w_start > cap:
-                    w_end = w_start + cap
-            if w_end <= w_start:
-                continue
-
-            # Tile [w_start, w_end] with Main/breakout segments from the
-            # breakout events inside this window.
-            for room, t_s, t_e in _tile_window_with_rooms(breakout_evts, w_start, w_end):
-                _emit_webhook_segment(pkey, wh, room, t_s, t_e, no_leave)
-
-    # ----- Step 5b: drop the inherited (overnight) meeting block -----------
-    # See the INHERITED_* constants above for the full rationale. We rebuild
-    # global per-30s-bucket occupancy from the snapshot buckets, check whether
-    # a large cohort was already present at the very start of the IST day, and
-    # if so find the mass-exit boundary (occupancy falls below a fraction of
-    # that start level and STAYS low). Every interval starting before that
-    # boundary is the tail of yesterday's meeting and is dropped.
-    inherited_cutoff_utc = None
-    if buckets:
-        presence_by_bucket = defaultdict(set)
-        for b in buckets:
-            presence_by_bucket[b.bucket30].add(_remap(b.participant_key))
-        # First 30s bucket of this IST day: 00:00 IST == UTC midnight - 5:30.
-        from datetime import timezone as _tz
-        day0_utc_unix = int(
-            datetime.fromisoformat(date_str).replace(tzinfo=_tz.utc).timestamp()
-        ) - IST_OFFSET_MINUTES * 60
-        day_start_bucket = day0_utc_unix // BUCKET_SECONDS
-        # Occupancy at the very start of the IST day (peak over first 5 min).
-        start_level = max(
-            (len(presence_by_bucket.get(day_start_bucket + i, ())) for i in range(10)),
-            default=0,
-        )
-        if start_level >= INHERITED_MIN_PARTICIPANTS:
-            threshold = max(1, int(start_level * INHERITED_LEAVE_FRACTION))
-            max_scan_bucket = day_start_bucket + (INHERITED_MAX_BOUNDARY_IST_MIN * 60) // BUCKET_SECONDS
-            sustain = INHERITED_EXIT_SUSTAIN_BUCKETS
-            scan = day_start_bucket
-            while scan <= max_scan_bucket:
-                # A real mass-exit stays low; a one-bucket polling blip does not.
-                if all(len(presence_by_bucket.get(scan + i, ())) < threshold
-                       for i in range(sustain)):
-                    # Keep tz-aware (UTC): the interval start_ts values parsed
-                    # below come from BigQuery timestamps and are tz-aware, so
-                    # the cutoff must be too or the comparison raises.
-                    inherited_cutoff_utc = datetime.fromtimestamp(
-                        scan * BUCKET_SECONDS, _tz.utc)
-                    break
-                scan += 1
-            if inherited_cutoff_utc is None:
-                print(f"[BuildIntervals {date_str}] WARNING: {start_level} present at "
-                      f"00:00 IST but no sustained mass-exit found before "
-                      f"{INHERITED_MAX_BOUNDARY_IST_MIN // 60:02d}:00 IST — no overnight drop applied")
-
-    if inherited_cutoff_utc is not None:
-        kept_intervals = []
-        dropped_n = 0
-        dropped_secs = 0
-        clamped_n = 0
-        for iv in intervals:
-            iv_start = _parse_ts(iv['start_ts'])
-            iv_end = _parse_ts(iv['end_ts'])
-            if iv_end <= inherited_cutoff_utc:
-                # Entirely inside yesterday's tail — drop.
-                dropped_n += 1
-                dropped_secs += iv['duration_seconds']
-            elif iv_start < inherited_cutoff_utc:
-                # Spans the boundary: keep the post-cutoff remainder instead
-                # of throwing the whole interval away (which also destroyed
-                # its valid same-day time).
-                keep_secs = int((iv_end - inherited_cutoff_utc).total_seconds())
-                if keep_secs <= 0:
-                    # Ends <1s past the cutoff — nothing meaningful to keep
-                    dropped_n += 1
-                    dropped_secs += iv['duration_seconds']
-                    continue
-                dropped_secs += max(0, iv['duration_seconds'] - keep_secs)
-                iv['start_ts'] = inherited_cutoff_utc.isoformat()
-                iv['duration_seconds'] = min(iv['duration_seconds'], keep_secs)
-                iv['alone_seconds'] = min(iv['alone_seconds'], iv['duration_seconds'])
-                clamped_n += 1
-                kept_intervals.append(iv)
-            else:
-                kept_intervals.append(iv)
-        if dropped_n or clamped_n:
-            ist_cut = inherited_cutoff_utc + timedelta(minutes=IST_OFFSET_MINUTES)
-            print(f"[BuildIntervals {date_str}] inherited overnight meeting detected "
-                  f"(start_level={start_level}); dropped {dropped_n}, clamped {clamped_n} "
-                  f"intervals ({dropped_secs // 60} min removed) before {ist_cut.strftime('%H:%M')} IST")
-        intervals = kept_intervals
-
-    # ----- Step 6: Atomic partition replace via load job -------------------
-    # Use a BigQuery LOAD job with WRITE_TRUNCATE and a partition decorator
-    # instead of DELETE+streaming-INSERT. This avoids the streaming buffer
-    # entirely: load jobs go straight to the partition's permanent storage,
-    # and WRITE_TRUNCATE replaces the partition atomically (no DELETE needed,
-    # no buffer-blocks-DELETE race). Also free (no streaming insert cost).
-    import io as _io
-    table_id = f"{dataset_ref}.{PRESENCE_INTERVALS_TABLE}"
-    partition_id = f"{table_id}${date_str.replace('-', '')}"
-
-    inserted = 0
-    if intervals:
-        ndjson = "\n".join(json.dumps(iv) for iv in intervals)
-        load_cfg = bigquery.LoadJobConfig(
-            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-            schema=[
-                bigquery.SchemaField("interval_id",       "STRING",    mode="REQUIRED"),
-                bigquery.SchemaField("event_date",        "DATE",      mode="REQUIRED"),
-                bigquery.SchemaField("meeting_id",        "STRING"),
-                bigquery.SchemaField("meeting_uuid",      "STRING"),
-                bigquery.SchemaField("participant_key",   "STRING",    mode="REQUIRED"),
-                bigquery.SchemaField("participant_name",  "STRING"),
-                bigquery.SchemaField("participant_email", "STRING"),
-                bigquery.SchemaField("room_name",         "STRING"),
-                bigquery.SchemaField("room_category",     "STRING"),
-                bigquery.SchemaField("start_ts",          "TIMESTAMP", mode="REQUIRED"),
-                bigquery.SchemaField("end_ts",            "TIMESTAMP", mode="REQUIRED"),
-                bigquery.SchemaField("duration_seconds",  "INT64"),
-                bigquery.SchemaField("alone_seconds",     "INT64"),
-                bigquery.SchemaField("snapshot_count",    "INT64"),
-                bigquery.SchemaField("source",            "STRING"),
-                bigquery.SchemaField("confidence",        "FLOAT64"),
-                bigquery.SchemaField("built_at",          "TIMESTAMP"),
-            ],
-        )
-        load_job = client.load_table_from_file(
-            _io.BytesIO(ndjson.encode('utf-8')),
-            partition_id,
-            job_config=load_cfg,
-        )
-        load_job.result()  # wait for completion; raises on error
-        inserted = len(intervals)
-    else:
-        # No intervals for this date — clear the partition so it stays
-        # consistent with the source data. Empty load with WRITE_TRUNCATE
-        # is also fine (creates a 0-row partition).
-        load_cfg = bigquery.LoadJobConfig(
-            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        )
-        load_job = client.load_table_from_file(
-            _io.BytesIO(b""),
-            partition_id,
-            job_config=load_cfg,
-        )
-        try:
-            load_job.result()
-        except Exception:
-            # Empty load can sometimes 400; safe to ignore — no data to write
-            pass
-
-    # ----- Summary stats ---------------------------------------------------
-    by_source = defaultdict(int)
-    by_category = defaultdict(int)
-    duration_total = 0
-    participants = set()
-    for iv in intervals:
-        by_source[iv['source']] += 1
-        by_category[iv['room_category']] += 1
-        duration_total += iv['duration_seconds']
-        participants.add(iv['participant_key'])
-
-    return {
-        'date': date_str,
-        'intervals_built': inserted,
-        'by_source': dict(by_source),
-        'by_category': dict(by_category),
-        'participants': len(participants),
-        'duration_seconds_total': duration_total,
-        'monitoring_window_end_utc': monitoring_end.isoformat() if monitoring_end else None,
-        'elapsed_seconds': round(time.time() - started, 2),
-    }
 
 
 @app.route('/intervals/rebuild', methods=['POST'])
@@ -14064,160 +12569,6 @@ def team_attendance_v2(team_id, date):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-def _auto_build_dates_in_range(start_date, end_date, max_builds=15, force=False):
-    """Build presence_intervals for dates in [start, end] that need it, and
-    return (built_count, still_missing_count).
-
-    When PAGELOAD_AUTO_BUILD is disabled, page-triggered calls become no-ops
-    (pages are pure readers; Cloud Scheduler owns freshness via
-    /intervals/rebuild + /intervals/auto-build). force=True bypasses the
-    gate — used by the scheduler endpoint itself.
-
-    Freshness for recent days is owned by Cloud Scheduler:
-      - an hourly job rebuilds TODAY  (so the pivot is never >1h stale), and
-      - a nightly job rebuilds YESTERDAY at 00:30 IST (after it completes).
-    This function is the lazy/self-healing backstop on top of that:
-      1. Dates with NO rows yet: built once, capped at max_builds, so a wide
-         range the user navigates to still shows something even if backfill
-         wasn't run. Already-built older days are stable — left alone.
-      2. The still-settling window (TODAY/YESTERDAY IST) is rebuilt ONLY if its
-         materialization is STALE (older than SETTLING_STALE_MINUTES). That way
-         if a scheduler ever dies (e.g. pointed at a dead URL), opening the view
-         self-heals the frozen day — but a freshly-built day adds no latency.
-         Builds are idempotent (load-job WRITE_TRUNCATE) so re-running is safe.
-    """
-    if not PAGELOAD_AUTO_BUILD and not force:
-        return 0, 0
-
-    client = get_bq_client()
-    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
-    _ensure_presence_intervals_table()
-
-    # Still-settling window: today + yesterday IST, intersected with the range.
-    today_ist = get_ist_date()
-    yesterday_ist = (get_ist_now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    settling = {d for d in (today_ist, yesterday_ist) if start_date <= d <= end_date}
-
-    # Per-date row count + freshness + latest SOURCE activity in one pass.
-    # last_source lets past days self-heal: if a day's materialization is
-    # OLDER than the last snapshot/webhook observed for that day (e.g. the
-    # hourly job built it at 15:10 but the meeting ran to 18:30 and the
-    # nightly rebuild died), it is rebuilt instead of staying frozen short
-    # forever.
-    q = f"""
-    WITH wanted AS (
-      SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(@start, @end)) AS day
-    ),
-    built AS (
-      SELECT event_date, MAX(built_at) AS last_built
-      FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-      WHERE event_date BETWEEN @start AND @end
-      GROUP BY event_date
-    ),
-    snap_src AS (
-      SELECT event_date, MAX(snapshot_time) AS last_src
-      FROM `{dataset_ref}.room_snapshots_v2`
-      WHERE event_date BETWEEN @start AND @end
-      GROUP BY event_date
-    ),
-    evt_src AS (
-      -- Use DELIVERY time (inserted_at) when available: Zoom retries failed
-      -- webhooks for hours, so late-DELIVERED events with old event
-      -- timestamps must still mark the build as outdated.
-      SELECT event_date,
-             MAX(COALESCE(CAST(inserted_at AS TIMESTAMP),
-                          CAST(event_timestamp AS TIMESTAMP))) AS last_src
-      FROM `{dataset_ref}.{BQ_EVENTS_TABLE}`
-      WHERE event_date BETWEEN @start AND @end
-      GROUP BY event_date
-    )
-    SELECT
-      w.day,
-      b.event_date IS NOT NULL AS has_rows,
-      (s.last_src IS NOT NULL OR e.last_src IS NOT NULL) AS has_source,
-      TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), b.last_built, MINUTE) AS age_min,
-      (
-        b.last_built IS NOT NULL AND
-        GREATEST(
-          COALESCE(s.last_src, TIMESTAMP('1970-01-01')),
-          COALESCE(e.last_src, TIMESTAMP('1970-01-01'))
-        ) > b.last_built
-      ) AS build_outdated
-    FROM wanted w
-    LEFT JOIN built b ON w.day = b.event_date
-    LEFT JOIN snap_src s ON w.day = s.event_date
-    LEFT JOIN evt_src e ON w.day = e.event_date
-    ORDER BY w.day DESC
-    """
-    rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("start", "DATE", start_date),
-            bigquery.ScalarQueryParameter("end", "DATE", end_date),
-        ]
-    )).result())
-
-    missing = []         # older dates never built
-    stale_settling = []  # today/yesterday needing a rebuild
-    outdated = []        # past dates whose build predates their latest source data
-    for r in rows:
-        d = r.day.isoformat()
-        # NEVER build future dates: they have no source data yet, and an empty
-        # partition stays at 0 rows, so they'd look "missing" and get rebuilt on
-        # EVERY load — e.g. viewing the current month rebuilds all remaining
-        # days of the month each time, adding ~20s+ of pointless latency.
-        if d > today_ist:
-            continue
-        if not r.has_rows:
-            # No source data at all (weekend/holiday/pre-deployment day):
-            # building it would produce 0 rows AGAIN, so it would look
-            # "missing" and be rebuilt on EVERY load — a permanent
-            # rebuild loop costing ~20s + several BQ queries per empty day
-            # per page view. Skip outright.
-            if not r.has_source:
-                continue
-            if d not in settling:
-                missing.append(d)
-            else:
-                stale_settling.append(d)  # in window but never built -> build
-        elif d == today_ist:
-            # Rebuild today, matching Day View / attendance_v2. This was the
-            # Team-vs-Day discrepancy: Day View force-rebuilt today while the
-            # monthly/range pivot served up-to-90-min-stale data. The
-            # in-process guard skips it if a rebuild ran in the last ~3 min.
-            if (_TODAY_BUILD_GUARD['date'] != d
-                    or time.time() - _TODAY_BUILD_GUARD['ts'] >= TODAY_REBUILD_MIN_INTERVAL_S):
-                stale_settling.append(d)
-        elif d in settling and (r.age_min is None or r.age_min >= SETTLING_STALE_MINUTES):
-            stale_settling.append(d)
-        elif r.build_outdated:
-            outdated.append(d)
-
-    built = 0
-    # 1. Refresh today/yesterday first (self-healing backstop).
-    for d in sorted(stale_settling, reverse=True):
-        try:
-            if d == today_ist:
-                if _rebuild_today_guarded(d):
-                    built += 1
-            else:
-                build_presence_intervals(d)
-                built += 1
-        except Exception as e:
-            print(f"[AutoBuildRange] settling-day {d} failed: {e}")
-    # 2. Build never-built dates, then self-heal outdated ones, sharing the cap.
-    to_build = missing[:max_builds]
-    remaining_slots = max_builds - len(to_build)
-    to_build += sorted(outdated, reverse=True)[:remaining_slots]
-    for d in to_build:
-        try:
-            build_presence_intervals(d)
-            built += 1
-        except Exception as e:
-            print(f"[AutoBuildRange] {d} failed: {e}")
-    # Report BOTH kinds of leftover work so the UI's "unbuilt dates" count
-    # is honest: never-built dates and stale-but-built dates beyond the cap.
-    still_missing = max(0, len(missing) + len(outdated) - max_builds)
-    return built, still_missing
 
 
 @app.route('/teams/<team_id>/attendance/range_v2', methods=['GET'])

@@ -58,15 +58,16 @@ function getParticipantEmail(p) {
  * Shared bot name matching logic
  */
 export function isBotNameMatch(participantName, botName = BOT_NAME) {
-  const pName = participantName.toLowerCase();
-  const normalizedBotName = botName.toLowerCase();
-
-  const isExactMatch = pName === normalizedBotName;
-  const containsBotName = pName.includes(normalizedBotName);
-  const isScoutBot = pName.includes('scout bot') || pName.includes('scoutbot');
-  const isScoutPattern = pName.startsWith('scout') && pName.includes('bot');
-
-  return isExactMatch || containsBotName || isScoutBot || isScoutPattern;
+  // EXACT match after stripping Zoom rejoin suffixes ("Scout Bot-1",
+  // "Scout Bot (2)"). Substring matching made real people whose display
+  // name merely contained the bot name get moved around / dropped from
+  // tracking.
+  const strip = (n) => n.toLowerCase().trim()
+    .replace(/\s*\(\d+\)$/, '')   // "(2)" duplicate-name suffix
+    .replace(/-\d+$/, '')          // "-1" rejoin suffix
+    .replace(/\s+\d$/, '')         // " 2" trailing digit
+    .trim();
+  return strip(participantName) === strip(botName);
 }
 
 /**
