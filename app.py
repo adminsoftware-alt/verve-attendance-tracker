@@ -3902,8 +3902,11 @@ def validate_webhook_signature(request_obj):
     timestamp = request_obj.headers.get('x-zm-request-timestamp', '')
 
     if not signature or not timestamp:
-        # URL validation events don't have these headers
-        return True, None
+        # SECURITY: missing headers used to be a free pass, which let anyone
+        # who found the URL inject fake attendance events. Only
+        # endpoint.url_validation is exempt — and the caller handles that
+        # BEFORE calling this function.
+        return False, "Missing signature headers"
 
     # Zoom signature format: v0=HMAC-SHA256(secret, timestamp + payload)
     raw_body = request_obj.data.decode('utf-8') if request_obj.data else ''
@@ -3943,11 +3946,6 @@ def webhook():
     if request.method == 'GET':
         return jsonify({'status': 'Webhook ready'})
 
-    # Validate webhook signature (security)
-    valid, error = validate_webhook_signature(request)
-    if not valid:
-        return jsonify({'error': error}), 401
-
     # Get raw data for logging
     try:
         data = request.json
@@ -3962,18 +3960,8 @@ def webhook():
 
     event = data.get('event', '')
 
-    print(f"\n{'='*60}")
-    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] WEBHOOK EVENT: {event}")
-    print(f"{'='*60}")
-
-    # Log raw payload for debugging (first 500 chars)
-    raw_str = json.dumps(data)
-    if len(raw_str) > 500:
-        print(f"[Webhook] Payload (truncated): {raw_str[:500]}...")
-    else:
-        print(f"[Webhook] Payload: {raw_str}")
-
-    # Handle URL validation
+    # Handle URL validation (the ONLY event allowed without a signature —
+    # Zoom sends it when registering the endpoint)
     if event == 'endpoint.url_validation':
         plain_token = data.get('payload', {}).get('plainToken', '')
         encrypted_token = hmac.new(
@@ -3986,6 +3974,22 @@ def webhook():
             'plainToken': plain_token,
             'encryptedToken': encrypted_token
         })
+
+    # Validate webhook signature (security) — required for every real event
+    valid, error = validate_webhook_signature(request)
+    if not valid:
+        return jsonify({'error': error}), 401
+
+    print(f"\n{'='*60}")
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] WEBHOOK EVENT: {event}")
+    print(f"{'='*60}")
+
+    # Log raw payload for debugging (first 500 chars)
+    raw_str = json.dumps(data)
+    if len(raw_str) > 500:
+        print(f"[Webhook] Payload (truncated): {raw_str[:500]}...")
+    else:
+        print(f"[Webhook] Payload: {raw_str}")
 
     # Route events to handlers with error catching
     try:
@@ -9127,75 +9131,37 @@ def compare_teams():
             stats_config = bigquery.QueryJobConfig(
                 query_parameters=[
                     bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
-                    bigquery.ScalarQueryParameter("report_date", "STRING", report_date)
+                    bigquery.ScalarQueryParameter("report_date", "DATE", report_date)
                 ]
             )
+            # Hours from presence_intervals (one source of hours). Roster
+            # bridge matches on normalized name OR email, mirroring the v2
+            # team endpoints.
+            norm_tm = _sql_normalize_name('tm.participant_name')
             stats_query = f"""
             WITH team_members AS (
                 SELECT participant_name, participant_email
                 FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id
             ),
-            deduped AS (
-                SELECT
-                    s.participant_uuid,
-                    s.participant_name,
-                    s.room_name,
-                    s.snapshot_time
-                FROM `{dataset_ref}.room_snapshots_v2` s
-                -- Match on name OR email; Zoom display names drift from
-                -- team_members.participant_name and would otherwise drop users.
-                INNER JOIN team_members tm
-                    ON LOWER(TRIM(s.participant_name)) = LOWER(TRIM(tm.participant_name))
-                    OR (NULLIF(LOWER(TRIM(s.participant_email)), '') IS NOT NULL
-                        AND NULLIF(LOWER(TRIM(s.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), ''))
-                WHERE s.event_date = @report_date
-                  AND s.room_name IS NOT NULL AND s.room_name != ''
-                  AND s.participant_name IS NOT NULL
-                  AND LOWER(s.participant_name) NOT LIKE '%scout%'
-                QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))),
-                                 s.snapshot_time
-                    ORDER BY
-                        CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-                        s.room_name
-                ) = 1
-            ),
-            snaps AS (
-                SELECT
-                    COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
-                    participant_name,
-                    snapshot_time,
-                    TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                    LAG(snapshot_time) OVER (
-                        PARTITION BY COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))
-                        ORDER BY snapshot_time
-                    ) as prev_snapshot
-                FROM deduped
-            ),
             per_person AS (
                 SELECT
-                    participant_key,
-                    MIN(snapshot_ist) as first_seen,
-                    MAX(snapshot_ist) as last_seen,
-                    -- Actual active time: sum consecutive intervals where gap < 5 mins
-                    CEILING(SUM(
-                        CASE
-                            WHEN prev_snapshot IS NULL THEN 0  -- First snapshot is start marker only
-                            WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300 THEN
-                                TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                            ELSE 0  -- After long gap, start marker for new presence period
-                        END
-                    )) as active_mins
-                    -- break_secs removed: gap-based detection treated session
-                    -- boundaries (left and rejoined) as breaks. Break metrics
-                    -- now derive from Break Time room presence elsewhere.
-                FROM snaps
-                GROUP BY participant_key
+                    pi.participant_key,
+                    TIMESTAMP_ADD(MIN(pi.start_ts), INTERVAL 330 MINUTE) AS first_seen,
+                    TIMESTAMP_ADD(MAX(pi.end_ts), INTERVAL 330 MINUTE) AS last_seen,
+                    CEILING(SUM(IF(pi.room_category != 'break', pi.duration_seconds, 0)) / 60.0) AS active_mins,
+                    CEILING(SUM(IF(pi.room_category = 'break', pi.duration_seconds, 0)) / 60.0) AS break_mins
+                FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+                INNER JOIN team_members tm
+                    ON pi.participant_key = {norm_tm}
+                    OR (NULLIF(LOWER(TRIM(pi.participant_email)), '') IS NOT NULL
+                        AND NULLIF(LOWER(TRIM(pi.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), ''))
+                WHERE pi.event_date = @report_date
+                GROUP BY pi.participant_key
             )
             SELECT
                 COUNT(*) as present,
                 ROUND(AVG(active_mins), 0) as avg_active,
-                0 as avg_break,
+                ROUND(AVG(break_mins), 0) as avg_break,
                 FORMAT_TIMESTAMP('%H:%M', MIN(first_seen)) as earliest_arrival,
                 FORMAT_TIMESTAMP('%H:%M', MAX(last_seen)) as latest_departure
             FROM per_person
@@ -9291,249 +9257,42 @@ def team_monthly_report(team_id):
             email_key = (email or '').lower().strip()
             return name_key in team_member_names or (email_key and email_key in team_member_emails)
 
-        # Get attendance data for entire month using the SAME query as attendance_summary
-        # This ensures Team View matches Day View exactly
+        # Attendance data for the whole month from presence_intervals — the ONE
+        # source of hours (same table Day View / Team View v2 read), so these
+        # exports can never disagree with them. Webhook fill / synthesis is
+        # already materialized as interval rows, so main_room_fill_mins is 0.
         start_date = f"{year}-{month:02d}-01"
         end_date = f"{year}-{month:02d}-{last_day:02d}"
 
+        # Ensure the month's intervals exist (no-op when the scheduler owns
+        # freshness / PAGELOAD_AUTO_BUILD=false).
+        try:
+            _auto_build_dates_in_range(start_date, end_date)
+        except Exception as be:
+            print(f"[TeamMonthly] auto-build warning: {be}")
+
         query = f"""
-        WITH
-        participant_name_map AS (
-          SELECT DISTINCT
-            event_date,
-            LOWER(TRIM(participant_name)) as name_key,
-            NULLIF(LOWER(TRIM(participant_email)), '') as email_key,
-            COALESCE(
-              NULLIF(participant_uuid, ''),
-              NULLIF(LOWER(TRIM(participant_email)), ''),
-              LOWER(TRIM(participant_name))
-            ) as participant_key
-          FROM `{dataset_ref}.room_snapshots_v2`
-          WHERE event_date >= @start_date AND event_date <= @end_date
-            AND participant_name IS NOT NULL AND participant_name != ''
-        ),
-        name_to_key AS (
-          SELECT event_date, name_key, MIN(participant_key) as participant_key
-          FROM participant_name_map
-          GROUP BY event_date, name_key
-        ),
-        email_to_key AS (
-          SELECT event_date, email_key, MIN(participant_key) as participant_key
-          FROM participant_name_map
-          WHERE email_key IS NOT NULL
-          GROUP BY event_date, email_key
-        ),
-        snapshot_clean AS (
-          SELECT
-            rs.event_date,
-            COALESCE(
-              ntk.participant_key,
-              NULLIF(rs.participant_uuid, ''),
-              NULLIF(LOWER(TRIM(rs.participant_email)), ''),
-              LOWER(TRIM(rs.participant_name))
-            ) as participant_key,
-            rs.participant_name,
-            COALESCE(NULLIF(rs.participant_email, ''), '') as participant_email,
-            rs.room_name,
-            rs.snapshot_time
-          FROM `{dataset_ref}.room_snapshots_v2` rs
-          LEFT JOIN name_to_key ntk ON rs.event_date = ntk.event_date AND LOWER(TRIM(rs.participant_name)) = ntk.name_key
-          WHERE rs.event_date >= @start_date AND rs.event_date <= @end_date
-            AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
-            AND rs.room_name IS NOT NULL AND rs.room_name != ''
-            AND LOWER(rs.participant_name) NOT LIKE '%scout%'
-            AND LOWER(rs.room_name) NOT LIKE '%break time%'
-          QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY rs.event_date,
-              COALESCE(ntk.participant_key, NULLIF(rs.participant_uuid, ''), NULLIF(LOWER(TRIM(rs.participant_email)), ''), LOWER(TRIM(rs.participant_name))),
-              rs.snapshot_time
-            ORDER BY
-              CASE WHEN LOWER(rs.room_name) = 'main room' OR LOWER(rs.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-              rs.room_name
-          ) = 1
-        ),
-        -- Break time from BREAK TIME room visits (separate CTE since snapshot_clean excludes them)
-        break_room_time AS (
-          SELECT
-            rs.event_date,
-            COALESCE(
-              ntk.participant_key,
-              NULLIF(rs.participant_uuid, ''),
-              NULLIF(LOWER(TRIM(rs.participant_email)), ''),
-              LOWER(TRIM(rs.participant_name))
-            ) as participant_key,
-            -- Dedup multi-source duplicates: bucket to 30-second windows
-            -- so polls from multiple devices count once per cycle.
-            COUNT(DISTINCT DIV(UNIX_SECONDS(rs.snapshot_time), 30)) * 0.5 as break_room_mins
-          FROM `{dataset_ref}.room_snapshots_v2` rs
-          LEFT JOIN name_to_key ntk ON rs.event_date = ntk.event_date AND LOWER(TRIM(rs.participant_name)) = ntk.name_key
-          WHERE rs.event_date >= @start_date AND rs.event_date <= @end_date
-            AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
-            AND LOWER(rs.participant_name) NOT LIKE '%scout%'
-            AND LOWER(rs.room_name) LIKE '%break time%'
-          GROUP BY rs.event_date, participant_key
-        ),
-        ordered_snaps AS (
-          SELECT *,
-            LAG(snapshot_time) OVER (PARTITION BY event_date, participant_key ORDER BY snapshot_time) as prev_snapshot
-          FROM snapshot_clean
-        ),
-        -- Calculate room visit durations using interval-sum (same as attendance_summary)
-        daily_stats AS (
-          SELECT
-            event_date,
-            participant_key,
-            ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
-            MAX(participant_email) as participant_email,
-            TIMESTAMP_ADD(MIN(snapshot_time), INTERVAL 330 MINUTE) as first_seen,
-            TIMESTAMP_ADD(MAX(snapshot_time), INTERVAL 330 MINUTE) as last_seen,
-            -- Total active time (interval-sum) - includes Main Room and breakout rooms
-            CEILING(SUM(
-              CASE
-                WHEN prev_snapshot IS NULL THEN 0
-                WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300 THEN
-                  TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                ELSE 0
-              END
-            )) as total_mins,
-            -- Breakout room time (excluding main room)
-            CEILING(SUM(
-              CASE
-                WHEN prev_snapshot IS NULL THEN 0
-                WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
-                     AND LOWER(room_name) != 'main room'
-                     AND LOWER(room_name) NOT LIKE '0.main%' THEN
-                  TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                ELSE 0
-              END
-            )) as breakout_mins
-          FROM ordered_snaps
-          GROUP BY event_date, participant_key
-        ),
-        -- Isolation time (alone in room) - snapshot_clean already excludes Break Time rooms
-        room_occupancy AS (
-          SELECT event_date, snapshot_time, room_name,
-            COUNT(DISTINCT participant_key) as occupant_count
-          FROM snapshot_clean
-          GROUP BY event_date, snapshot_time, room_name
-        ),
-        daily_isolation AS (
-          SELECT
-            sc.event_date,
-            sc.participant_key,
-            -- Bucket to 30s windows: multi-source polls (HR client + VM)
-            -- have millisecond-different timestamps, so snapshot_clean's
-            -- per-timestamp QUALIFY dedup doesn't catch them. Without this
-            -- bucketing, the same minute of solitude can count 2x.
-            COUNT(DISTINCT DIV(UNIX_SECONDS(sc.snapshot_time), 30)) * 0.5 as isolation_mins
-          FROM snapshot_clean sc
-          INNER JOIN room_occupancy ro
-            ON sc.event_date = ro.event_date AND sc.snapshot_time = ro.snapshot_time AND sc.room_name = ro.room_name
-          WHERE ro.occupant_count = 1
-            -- Being alone in Main Room (e.g. first to join the meeting) isn't
-            -- isolation in the work sense; only count breakout-room solitude.
-            AND LOWER(sc.room_name) != 'main room'
-            AND LOWER(sc.room_name) NOT LIKE '0.main%'
-          GROUP BY sc.event_date, sc.participant_key
-        ),
-        -- Break time = time in "Break Time" room only (break_room_time above).
-        -- Gap-based break detection was removed because long absences (left
-        -- meeting / SDK outage / leave day with bot still polling) couldn't
-        -- be distinguished from real breaks and produced 17hr+ "breaks."
-        -- Matches the day view, which treats Break Time presence as the
-        -- only break signal.
-        -- Last SDK snapshot per day: hard end of the monitoring window.
-        -- Beyond it we had no visibility; any Main Room time inferred past
-        -- this point would be phantom attendance from a monitoring outage.
-        daily_monitoring_window AS (
-          SELECT event_date, MAX(snapshot_time) as last_snapshot_ts
-          FROM `{dataset_ref}.room_snapshots_v2`
-          WHERE event_date >= @start_date AND event_date <= @end_date
-          GROUP BY event_date
-        ),
-        -- Did this participant have ANY breakout_room_joined webhook today?
-        -- Used to detect users who were in breakouts the SDK never saw —
-        -- in that case Main Room time should be 0, not the entire meeting.
-        daily_breakout_webhooks AS (
-          SELECT
-            pe.event_date,
-            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
-            COUNT(*) as breakout_joined_count
-          FROM `{dataset_ref}.participant_events` pe
-          LEFT JOIN email_to_key etk
-            ON pe.event_date = etk.event_date
-           AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-          LEFT JOIN name_to_key ntk
-            ON pe.event_date = ntk.event_date
-           AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
-          WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
-            AND pe.event_type = 'breakout_room_joined'
-            AND pe.participant_name IS NOT NULL
-            AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-          GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
-        ),
-        -- Main meeting time from webhooks for gap-filling Main Room time
-        -- that SDK snapshots didn't capture. Bridges to UUID via separate
-        -- name/email lookups against the snapshot-derived key.
-        daily_webhook AS (
-          SELECT
-            pe.event_date,
-            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
-            MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
-                THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_joined_ts,
-            MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
-                THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_left_ts
-          FROM `{dataset_ref}.participant_events` pe
-          LEFT JOIN email_to_key etk
-            ON pe.event_date = etk.event_date
-           AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
-          LEFT JOIN name_to_key ntk
-            ON pe.event_date = ntk.event_date
-           AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
-          WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
-            AND pe.participant_name IS NOT NULL
-            AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-          GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
-        )
         SELECT
-          ds.event_date,
-          ds.participant_name,
-          ds.participant_email,
-          FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
-          FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
-          ds.total_mins,
-          ds.breakout_mins,
-          -- Break = time in "Break Time" room (gap-based detection removed).
-          COALESCE(brt.break_room_mins, 0) as break_mins,
-          COALESCE(di.isolation_mins, 0) as isolation_mins,
-          -- Webhook-derived Main Room time NOT captured by snapshots.
-          -- Same safeguards as team_attendance_range:
-          --   (a) meeting_left clamped to last SDK snapshot of the day
-          --   (b) force 0 if user had breakout webhooks but zero snapshot coverage
-          CASE
-            WHEN COALESCE(dbw.breakout_joined_count, 0) > 0 AND COALESCE(ds.total_mins, 0) = 0
-            THEN 0
-            ELSE GREATEST(
-              COALESCE(TIMESTAMP_DIFF(
-                  LEAST(dw.meeting_left_ts, COALESCE(mw.last_snapshot_ts, dw.meeting_left_ts)),
-                  dw.meeting_joined_ts,
-                  MINUTE), 0)
-              - ds.total_mins - COALESCE(ROUND(brt.break_room_mins), 0),
-              0)
-          END as main_room_fill_mins
-        FROM daily_stats ds
-        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.participant_key = brt.participant_key
-        LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
-        LEFT JOIN daily_webhook dw ON ds.event_date = dw.event_date AND ds.participant_key = dw.participant_key
-        LEFT JOIN daily_monitoring_window mw ON ds.event_date = mw.event_date
-        LEFT JOIN daily_breakout_webhooks dbw ON ds.event_date = dbw.event_date AND ds.participant_key = dbw.participant_key
-        ORDER BY ds.participant_name, ds.event_date
+          pi.event_date,
+          ANY_VALUE(pi.participant_name) AS participant_name,
+          COALESCE(MAX(pi.participant_email), '') AS participant_email,
+          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(pi.start_ts), INTERVAL 330 MINUTE)) AS first_seen_ist,
+          FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(pi.end_ts), INTERVAL 330 MINUTE)) AS last_seen_ist,
+          CAST(CEILING(SUM(IF(pi.room_category != 'break', pi.duration_seconds, 0)) / 60.0) AS INT64) AS total_mins,
+          CAST(CEILING(SUM(IF(pi.room_category = 'breakout', pi.duration_seconds, 0)) / 60.0) AS INT64) AS breakout_mins,
+          CAST(CEILING(SUM(IF(pi.room_category = 'break', pi.duration_seconds, 0)) / 60.0) AS INT64) AS break_mins,
+          CAST(CEILING(SUM(pi.alone_seconds) / 60.0) AS INT64) AS isolation_mins,
+          0 AS main_room_fill_mins
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+        WHERE pi.event_date BETWEEN @start_date AND @end_date
+        GROUP BY pi.event_date, pi.participant_key
+        ORDER BY participant_name, pi.event_date
         """
 
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
-                bigquery.ScalarQueryParameter("end_date", "STRING", end_date)
+                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+                bigquery.ScalarQueryParameter("end_date", "DATE", end_date)
             ]
         )
         rows = list(client.query(query, job_config=job_config).result())
@@ -12784,127 +12543,36 @@ def list_classified_monthly():
                     if key and key not in name_to_reg:
                         name_to_reg[key] = info
 
-        # 2. Per-day snapshot stats (same pattern as /employees/unrecognized-monthly).
+        # 2. Per-day stats from presence_intervals (one source of hours).
+        # active_mins keeps the v1 semantic for visitors: BREAKOUT-room time
+        # only (Main Room lobby time never counted toward visitor presence).
+        # participant_key is the normalized lower-cased name, which the
+        # registry lookup below already handles via its normalized keys.
+        try:
+            _auto_build_dates_in_range(start_date, end_date)
+        except Exception as be:
+            print(f"[ClassifiedMonthly] auto-build warning: {be}")
+
         query = f"""
-        WITH deduped AS (
-            SELECT
-                s.event_date,
-                s.participant_name,
-                s.participant_email,
-                s.room_name,
-                s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.participant_name IS NOT NULL AND s.participant_name != ''
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-              AND LOWER(s.room_name) != 'main room'
-              AND LOWER(s.room_name) NOT LIKE '0.main%'
-              AND LOWER(s.room_name) NOT LIKE '%break time%'
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY s.event_date, LOWER(TRIM(s.participant_name)), s.snapshot_time
-                ORDER BY s.room_name
-            ) = 1
-        ),
-        ordered_snaps AS (
-            SELECT
-                event_date,
-                LOWER(TRIM(participant_name)) as name_key,
-                participant_name,
-                participant_email,
-                snapshot_time,
-                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                LAG(snapshot_time) OVER (
-                    PARTITION BY event_date, LOWER(TRIM(participant_name))
-                    ORDER BY snapshot_time
-                ) as prev_time
-            FROM deduped
-        ),
-        daily_stats AS (
-            SELECT
-                event_date,
-                name_key,
-                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
-                MAX(participant_email) as participant_email,
-                MIN(snapshot_ist) as first_seen,
-                MAX(snapshot_ist) as last_seen,
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_time IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
-                        ELSE 0  -- Long gap = session boundary, not active time
-                    END
-                )) as active_mins
-            FROM ordered_snaps
-            GROUP BY event_date, name_key
-        ),
-        -- Break time from BREAK TIME room visits
-        break_room_time AS (
-            SELECT
-                s.event_date,
-                LOWER(TRIM(s.participant_name)) as name_key,
-                -- Dedup multi-source duplicates: if the MonitorPanel is open
-                -- on >1 device (HR client + VM), each polls every 30s and
-                -- writes its own row. Bucketing to 30-second windows keeps
-                -- one count per polling cycle regardless of source.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.participant_name IS NOT NULL AND s.participant_name != ''
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-              AND LOWER(s.room_name) LIKE '%break time%'
-            GROUP BY s.event_date, name_key
-        ),
-        -- Break time = Break Time room presence only. Gap-based detection
-        -- removed (long absences from session boundaries / outages were
-        -- being mis-attributed as huge breaks).
-        room_occupancy AS (
-            SELECT snapshot_time, room_name,
-                   COUNT(DISTINCT LOWER(TRIM(participant_name))) as cnt
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date >= @start_date AND event_date <= @end_date
-              AND room_name IS NOT NULL AND room_name != ''
-              AND LOWER(participant_name) NOT LIKE '%scout%'
-            GROUP BY snapshot_time, room_name
-        ),
-        daily_isolation AS (
-            SELECT
-                s.event_date,
-                LOWER(TRIM(s.participant_name)) as name_key,
-                -- Bucket to 30-second windows to dedup multi-source polls.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN room_occupancy ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-              AND LOWER(s.room_name) NOT LIKE '%break time%'
-              -- Alone in Main Room isn't isolation in the work sense.
-              AND LOWER(s.room_name) != 'main room'
-              AND LOWER(s.room_name) NOT LIKE '0.main%'
-              AND ro.cnt = 1
-            GROUP BY s.event_date, name_key
-        )
         SELECT
-            ds.event_date,
-            ds.name_key,
-            ds.participant_name,
-            ds.participant_email,
-            FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
-            FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
-            ds.active_mins,
-            COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
-            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins
-        FROM daily_stats ds
-        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.name_key = brt.name_key
-        LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.name_key = di.name_key
-        ORDER BY ds.name_key, ds.event_date
+            pi.event_date,
+            pi.participant_key AS name_key,
+            ANY_VALUE(pi.participant_name) AS participant_name,
+            COALESCE(MAX(pi.participant_email), '') AS participant_email,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(pi.start_ts), INTERVAL 330 MINUTE)) AS first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(pi.end_ts), INTERVAL 330 MINUTE)) AS last_seen_ist,
+            CAST(CEILING(SUM(IF(pi.room_category = 'breakout', pi.duration_seconds, 0)) / 60.0) AS INT64) AS active_mins,
+            CAST(CEILING(SUM(IF(pi.room_category = 'break', pi.duration_seconds, 0)) / 60.0) AS INT64) AS break_mins,
+            CAST(CEILING(SUM(pi.alone_seconds) / 60.0) AS INT64) AS isolation_mins
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+        WHERE pi.event_date BETWEEN @start_date AND @end_date
+        GROUP BY pi.event_date, pi.participant_key
+        ORDER BY name_key, pi.event_date
         """
 
         job_config = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
-            bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+            bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+            bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
         ])
         snap_rows = list(client.query(query, job_config=job_config).result())
 
@@ -13026,132 +12694,36 @@ def employee_attendance_detail(employee_id, date):
         start_date = f"{year}-{month:02d}-01"
         end_date = f"{year}-{month:02d}-{last_day:02d}"
 
-        # Get daily data.
-        # emp_keys resolves all UUID/name variants the employee appeared under,
-        # so snapshots recorded after a mid-meeting rename (e.g. "Shashank" ->
-        # "Shashank-1") still count toward this employee's attendance.
+        # Daily data from presence_intervals (one source of hours).
+        # Match by normalized name OR email so Zoom display-name drift
+        # ("Sayli S" vs "Sayli Sonone") doesn't drop the user's data.
+        try:
+            _auto_build_dates_in_range(start_date, end_date)
+        except Exception as be:
+            print(f"[EmployeeDetail] auto-build warning: {be}")
+
+        norm_emp = _sql_normalize_name('@emp_name')
         query = f"""
-        WITH emp_keys AS (
-            -- Match by name OR email. Zoom display names drift from the
-            -- canonical employee_registry name (e.g. "Sayli S" vs "Sayli
-            -- Sonone"), and a name-only match would silently drop all
-            -- that user's data.
-            SELECT DISTINCT
-                COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date >= @start_date AND event_date <= @end_date
-              AND participant_name IS NOT NULL AND participant_name != ''
-              AND (
-                LOWER(TRIM(participant_name)) = LOWER(TRIM(@emp_name))
-                OR (@emp_email != '' AND LOWER(TRIM(participant_email)) = @emp_email)
-              )
-        ),
-        -- Dedupe before windowing so SDK transition artifacts (two rooms
-        -- at the same snapshot) don't inflate breaks or active intervals.
-        deduped AS (
-            SELECT
-                s.event_date,
-                s.participant_uuid,
-                s.participant_name,
-                s.room_name,
-                s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN emp_keys ek
-                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND LOWER(s.room_name) NOT LIKE '%break time%'
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY s.event_date, s.snapshot_time
-                ORDER BY
-                    CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-                    s.room_name
-            ) = 1
-        ),
-        -- Break time from BREAK TIME room visits
-        break_room_time AS (
-            SELECT
-                s.event_date,
-                -- Dedup multi-source duplicates: if the MonitorPanel is open
-                -- on >1 device (HR client + VM), each polls every 30s and
-                -- writes its own row. Bucketing to 30-second windows keeps
-                -- one count per polling cycle regardless of source.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN emp_keys ek
-                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND LOWER(s.room_name) LIKE '%break time%'
-            GROUP BY s.event_date
-        ),
-        snaps_with_lag AS (
-            SELECT
-                event_date,
-                snapshot_time,
-                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                LAG(snapshot_time) OVER (PARTITION BY event_date ORDER BY snapshot_time) as prev_time
-            FROM deduped
-        ),
-        snaps AS (
-            SELECT
-                event_date,
-                MIN(snapshot_ist) as first_seen,
-                MAX(snapshot_ist) as last_seen,
-                -- Actual active time: sum consecutive intervals where gap < 5 mins
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_time IS NULL THEN 0  -- First snapshot is start marker only
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
-                        ELSE 0  -- After long gap, start marker for new presence period
-                    END
-                )) as active_mins,
-                COUNT(DISTINCT snapshot_time) as snap_count
-            FROM snaps_with_lag
-            GROUP BY event_date
-        ),
-        -- Break time = time in "Break Time" room only (break_room_time above).
-        -- Gap-based break detection was removed because long absences (left
-        -- meeting / SDK outage / leave day) couldn't be distinguished from
-        -- real breaks and inflated the number wildly.
-        isolation AS (
-            SELECT
-                event_date,
-                -- Bucket to 30s windows to dedup multi-source polls.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as iso_secs
-            FROM deduped s
-            INNER JOIN (
-                SELECT snapshot_time, room_name,
-                       COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as cnt
-                FROM `{dataset_ref}.room_snapshots_v2`
-                WHERE event_date >= @start_date AND event_date <= @end_date
-                  AND room_name IS NOT NULL AND room_name != ''
-                  AND LOWER(participant_name) NOT LIKE '%scout%'
-                  AND LOWER(room_name) NOT LIKE '%break time%'
-                GROUP BY snapshot_time, room_name
-            ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
-            WHERE ro.cnt = 1
-              -- Exclude Main Room from isolation (matches team-view convention).
-              AND LOWER(s.room_name) != 'main room'
-              AND LOWER(s.room_name) NOT LIKE '0.main%'
-            GROUP BY event_date
-        )
         SELECT
-            sn.event_date,
-            FORMAT_TIMESTAMP('%H:%M', sn.first_seen) as first_seen_ist,
-            FORMAT_TIMESTAMP('%H:%M', sn.last_seen) as last_seen_ist,
-            sn.active_mins,
-            COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
-            COALESCE(ROUND(i.iso_secs / 60), 0) as isolation_mins
-        FROM snaps sn
-        LEFT JOIN break_room_time brt ON sn.event_date = brt.event_date
-        LEFT JOIN isolation i ON sn.event_date = i.event_date
-        ORDER BY sn.event_date
+            pi.event_date,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(pi.start_ts), INTERVAL 330 MINUTE)) AS first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(pi.end_ts), INTERVAL 330 MINUTE)) AS last_seen_ist,
+            CAST(CEILING(SUM(IF(pi.room_category != 'break', pi.duration_seconds, 0)) / 60.0) AS INT64) AS active_mins,
+            CAST(CEILING(SUM(IF(pi.room_category = 'break', pi.duration_seconds, 0)) / 60.0) AS INT64) AS break_mins,
+            CAST(CEILING(SUM(pi.alone_seconds) / 60.0) AS INT64) AS isolation_mins
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+        WHERE pi.event_date BETWEEN @start_date AND @end_date
+          AND (
+            pi.participant_key = {norm_emp}
+            OR (@emp_email != '' AND LOWER(TRIM(pi.participant_email)) = @emp_email)
+          )
+        GROUP BY pi.event_date
+        ORDER BY pi.event_date
         """
 
         job_config = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
-            bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+            bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+            bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
             bigquery.ScalarQueryParameter("emp_name", "STRING", emp_name),
             bigquery.ScalarQueryParameter("emp_email", "STRING", emp_email),
         ])
@@ -13270,135 +12842,37 @@ def employee_yearly_report(employee_id):
             except Exception:
                 pass  # team_holidays table might not exist
 
-        # Query yearly data with monthly aggregation
+        # Yearly data from presence_intervals (one source of hours), with
+        # per-day rows the Python below aggregates into months. Match by
+        # normalized name OR email (display-name drift safe).
         start_date = f"{year}-01-01"
         end_date = f"{year}-12-31"
 
+        norm_emp = _sql_normalize_name('@emp_name')
         query = f"""
-        WITH emp_keys AS (
-            -- Match by name OR email. Zoom display names drift from the
-            -- canonical employee_registry name (e.g. "Sayli S" vs "Sayli
-            -- Sonone"), and a name-only match would silently drop all
-            -- that user's data.
-            SELECT DISTINCT
-                COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date >= @start_date AND event_date <= @end_date
-              AND participant_name IS NOT NULL AND participant_name != ''
-              AND (
-                LOWER(TRIM(participant_name)) = LOWER(TRIM(@emp_name))
-                OR (@emp_email != '' AND LOWER(TRIM(participant_email)) = @emp_email)
-              )
-        ),
-        -- Dedupe first: if the SDK briefly listed this person in two rooms
-        -- at the same snapshot_time, collapse to one row.
-        deduped AS (
-            SELECT
-                s.event_date,
-                s.participant_uuid,
-                s.participant_name,
-                s.room_name,
-                s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN emp_keys ek
-                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND LOWER(s.room_name) NOT LIKE '%break time%'
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY s.event_date, s.snapshot_time
-                ORDER BY
-                    CASE WHEN LOWER(s.room_name) = 'main room' OR LOWER(s.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-                    s.room_name
-            ) = 1
-        ),
-        -- Break time from BREAK TIME room visits
-        break_room_time AS (
-            SELECT
-                s.event_date,
-                -- Dedup multi-source duplicates: if the MonitorPanel is open
-                -- on >1 device (HR client + VM), each polls every 30s and
-                -- writes its own row. Bucketing to 30-second windows keeps
-                -- one count per polling cycle regardless of source.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN emp_keys ek
-                ON COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name))) = ek.participant_key
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND LOWER(s.room_name) LIKE '%break time%'
-            GROUP BY s.event_date
-        ),
-        snaps_with_lag AS (
-            SELECT
-                event_date,
-                EXTRACT(MONTH FROM event_date) as month_num,
-                snapshot_time,
-                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                LAG(snapshot_time) OVER (PARTITION BY event_date ORDER BY snapshot_time) as prev_time
-            FROM deduped
-        ),
-        daily_stats AS (
-            SELECT
-                event_date,
-                month_num,
-                MIN(snapshot_ist) as first_seen,
-                MAX(snapshot_ist) as last_seen,
-                -- Actual active time: sum consecutive intervals where gap < 5 mins
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_time IS NULL THEN 0  -- First snapshot is start marker only
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
-                        ELSE 0  -- After long gap, start marker for new presence period
-                    END
-                )) as active_mins,
-                COUNT(DISTINCT snapshot_time) as snap_count
-            FROM snaps_with_lag
-            GROUP BY event_date, month_num
-        ),
-        -- Break time = time in "Break Time" room only (break_room_time above).
-        -- Gap-based break detection was removed because long absences (left
-        -- meeting / SDK outage / leave day) couldn't be distinguished from
-        -- real breaks and inflated the number wildly.
-        isolation AS (
-            SELECT
-                event_date,
-                -- Bucket to 30s windows to dedup multi-source polls.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as iso_secs
-            FROM deduped s
-            INNER JOIN (
-                SELECT snapshot_time, room_name,
-                       COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as cnt
-                FROM `{dataset_ref}.room_snapshots_v2`
-                WHERE event_date >= @start_date AND event_date <= @end_date
-                  AND room_name IS NOT NULL AND room_name != ''
-                  AND LOWER(participant_name) NOT LIKE '%scout%'
-                  AND LOWER(room_name) NOT LIKE '%break time%'
-                GROUP BY snapshot_time, room_name
-            ) ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
-            WHERE ro.cnt = 1
-              -- Exclude Main Room from isolation (matches team-view convention).
-              AND LOWER(s.room_name) != 'main room'
-              AND LOWER(s.room_name) NOT LIKE '0.main%'
-            GROUP BY event_date
-        )
         SELECT
-            ds.event_date,
-            ds.month_num,
-            ds.active_mins,
-            EXTRACT(HOUR FROM ds.first_seen) * 60 + EXTRACT(MINUTE FROM ds.first_seen) as login_mins,
-            EXTRACT(HOUR FROM ds.last_seen) * 60 + EXTRACT(MINUTE FROM ds.last_seen) as logout_mins,
-            COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
-            COALESCE(ROUND(i.iso_secs / 60), 0) as isolation_mins
-        FROM daily_stats ds
-        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date
-        LEFT JOIN isolation i ON ds.event_date = i.event_date
-        ORDER BY ds.event_date
+            pi.event_date,
+            EXTRACT(MONTH FROM pi.event_date) AS month_num,
+            CAST(CEILING(SUM(IF(pi.room_category != 'break', pi.duration_seconds, 0)) / 60.0) AS INT64) AS active_mins,
+            EXTRACT(HOUR FROM TIMESTAMP_ADD(MIN(pi.start_ts), INTERVAL 330 MINUTE)) * 60
+              + EXTRACT(MINUTE FROM TIMESTAMP_ADD(MIN(pi.start_ts), INTERVAL 330 MINUTE)) AS login_mins,
+            EXTRACT(HOUR FROM TIMESTAMP_ADD(MAX(pi.end_ts), INTERVAL 330 MINUTE)) * 60
+              + EXTRACT(MINUTE FROM TIMESTAMP_ADD(MAX(pi.end_ts), INTERVAL 330 MINUTE)) AS logout_mins,
+            CAST(CEILING(SUM(IF(pi.room_category = 'break', pi.duration_seconds, 0)) / 60.0) AS INT64) AS break_mins,
+            CAST(CEILING(SUM(pi.alone_seconds) / 60.0) AS INT64) AS isolation_mins
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+        WHERE pi.event_date BETWEEN @start_date AND @end_date
+          AND (
+            pi.participant_key = {norm_emp}
+            OR (@emp_email != '' AND LOWER(TRIM(pi.participant_email)) = @emp_email)
+          )
+        GROUP BY pi.event_date
+        ORDER BY pi.event_date
         """
 
         job_config = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
-            bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+            bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+            bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
             bigquery.ScalarQueryParameter("emp_name", "STRING", emp_name),
             bigquery.ScalarQueryParameter("emp_email", "STRING", emp_email),
         ])
@@ -14568,6 +14042,12 @@ MAIN_ROOM_SYNTH_MIN_SECONDS = 120    # Don't synthesize gaps smaller than 2min
 # also mean they left and we never heard. 4h default = at most a half-day of
 # benefit-of-the-doubt, never a 10h phantom.
 WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES = int(os.environ.get('WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES', '240'))
+WEBHOOK_SEGMENT_MIN_SECONDS = 60     # Webhook-timeline segments shorter than this are noise
+# Page-load auto-build kill switch. 'true' (default) = pages may trigger
+# builds (legacy behavior). Set to 'false' on Cloud Run ONCE the Cloud
+# Scheduler jobs own freshness (2-min today rebuild + /intervals/auto-build
+# sweep) — pages then become pure readers and never pay build latency.
+PAGELOAD_AUTO_BUILD = os.environ.get('PAGELOAD_AUTO_BUILD', 'true').lower() != 'false'
 # Recent days (today/yesterday) are kept fresh by the hourly + nightly rebuild
 # Cloud Scheduler jobs. The Team View pivot only re-materializes one of those
 # days on view if it's gone STALER than this (a scheduler missed/died) — so a
@@ -14720,10 +14200,15 @@ def build_presence_intervals(date_str):
       1. Pull bucketed snapshot data (per participant+room+30s bucket).
       2. Pull webhook timestamps (meeting_joined, meeting_left, breakout flag).
       3. Compute real intervals from snapshots, with alone_seconds.
-      4. Synthesize Main Room intervals for gaps between/around breakouts.
-      5. Webhook-fill: participants with webhook presence but no snapshots
-         (only if they have NO breakout webhooks — otherwise they were in
-         unmonitored breakouts and we don't credit them Main Room time).
+      4. Fill snapshot gaps from the webhook timeline: uncovered stretches
+         become Main Room (synthesized) OR the breakout room the webhooks
+         reported (webhook_room) — a mid-day bot outage no longer mislabels
+         breakout time as Main Room.
+      5. Webhook timeline fallback: participants with webhook presence but
+         NO snapshots (bot off / bot missed them) get their full room
+         timeline rebuilt from webhook events — Main Room between meeting
+         join and breakout joins, the breakout room between its join/left
+         events. Bot data (snapshots) stays primary when it exists.
       6. DELETE existing rows for the date, INSERT new rows.
 
     Returns dict with counts and timing.
@@ -14840,7 +14325,8 @@ def build_presence_intervals(date_str):
       ARRAY_AGG(
         STRUCT(
           CAST(pe.event_timestamp AS TIMESTAMP) AS ts,
-          pe.event_type AS et
+          pe.event_type AS et,
+          pe.room_name AS room
         )
         ORDER BY pe.event_timestamp
       ) AS events
@@ -14849,7 +14335,8 @@ def build_presence_intervals(date_str):
       AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
       AND LOWER(pe.participant_name) NOT LIKE '%scout%'
       AND pe.event_type IN ('participant_joined','participant_left',
-                            'meeting.participant_joined','meeting.participant_left')
+                            'meeting.participant_joined','meeting.participant_left',
+                            'breakout_room_joined','breakout_room_left')
     GROUP BY participant_key
     """
     events_rows = list(client.query(events_q, job_config=bigquery.QueryJobConfig(
@@ -14894,6 +14381,9 @@ def build_presence_intervals(date_str):
         r.participant_key: _build_presence_windows(r.events)
         for r in events_rows
     }
+    # Full per-person event timeline (incl. breakout join/left) — feeds the
+    # Step 5 webhook-fallback room reconstruction.
+    full_events_by_key = {r.participant_key: list(r.events) for r in events_rows}
 
     # ----- Step 2c: extend monitoring_end if webhooks continued after snapshots -----
     # When SDK monitoring stops but webhooks keep flowing, use the latest webhook
@@ -15076,12 +14566,105 @@ def build_presence_intervals(date_str):
             'built_at': built_at_iso,
         })
 
+    # --- Shared webhook-timeline machinery (used by Steps 4 and 5) ---------
+    def _evt(e, name):
+        return e[name] if isinstance(e, dict) else getattr(e, name)
+
+    def _breakout_events_for(pkey):
+        return [e for e in full_events_by_key.get(pkey, [])
+                if _evt(e, 'et') in ('breakout_room_joined', 'breakout_room_left')]
+
+    def _room_state_at(breakout_evts, at_ts, not_before):
+        """Which room was the participant in at `at_ts`, judged from their
+        last breakout event in [not_before, at_ts]. Events before
+        `not_before` (a previous meeting session) are stale — ignored."""
+        room = 'Main Room'
+        for e in breakout_evts:
+            ets = _evt(e, 'ts')
+            if ets < not_before or ets > at_ts:
+                continue
+            if _evt(e, 'et') == 'breakout_room_joined':
+                room = _evt(e, 'room') or 'Unknown Room'
+            else:
+                room = 'Main Room'
+        return room
+
+    def _tile_window_with_rooms(breakout_evts, w_start, w_end, initial_room='Main Room'):
+        """Tile [w_start, w_end] into (room, start, end) segments from
+        breakout join/left webhooks — a state machine starting in
+        `initial_room`. Drops Zoom double-sends (same event repeated <5s;
+        the in-memory dedup misses those across Cloud Run instances)."""
+        tiles = []
+        cur_room = initial_room
+        seg_start = w_start
+        prev_et, prev_room, prev_ts = None, None, None
+        for e in breakout_evts:
+            ts, et, room = _evt(e, 'ts'), _evt(e, 'et'), _evt(e, 'room')
+            if ts < w_start or ts > w_end:
+                continue
+            if (prev_et == et and (prev_room or '') == (room or '')
+                    and prev_ts and (ts - prev_ts).total_seconds() < 5):
+                continue
+            prev_et, prev_room, prev_ts = et, room, ts
+            if et == 'breakout_room_joined':
+                new_room = room or 'Unknown Room'
+                if new_room == cur_room:
+                    continue
+                tiles.append((cur_room, seg_start, ts))
+                cur_room, seg_start = new_room, ts
+            else:  # breakout_room_left -> back to Main Room
+                if cur_room == 'Main Room':
+                    continue  # stray left (its join was missed) — stay in Main
+                tiles.append((cur_room, seg_start, ts))
+                cur_room, seg_start = 'Main Room', ts
+        tiles.append((cur_room, seg_start, w_end))
+        return [(r, s, e) for (r, s, e) in tiles if e > s]
+
+    def _emit_uncovered_stretch(bucket_list, pkey, brk_evts, window_start, s_dt, e_dt):
+        """Fill an uncovered stretch for a SNAPSHOT participant. Previously
+        this was always synthesized Main Room — wrong when the bot died
+        mid-day while webhooks show the person in a breakout. Now the
+        stretch is tiled by the webhook timeline: Main portions keep the
+        legacy synthesized_main path, breakout portions become webhook_room
+        intervals with the room the webhooks reported."""
+        init_room = _room_state_at(brk_evts, s_dt, window_start)
+        for room, t_s, t_e in _tile_window_with_rooms(brk_evts, s_dt, e_dt,
+                                                      initial_room=init_room):
+            category = _classify_room(room)
+            if category == 'main':
+                _emit_main(bucket_list, pkey, t_s, t_e)
+                continue
+            secs = (t_e - t_s).total_seconds()
+            if secs < WEBHOOK_SEGMENT_MIN_SECONDS:
+                continue
+            secs = min(secs, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
+            bucket_list.append({
+                'interval_id': str(uuid_lib.uuid4()),
+                'event_date': date_str,
+                'meeting_id': meeting_by_key.get(pkey),
+                'meeting_uuid': None,
+                'participant_key': pkey,
+                'participant_name': name_by_key.get(pkey),
+                'participant_email': email_by_key.get(pkey),
+                'room_name': room,
+                'room_category': category,
+                'start_ts': t_s.isoformat(),
+                'end_ts': (t_s + timedelta(seconds=secs)).isoformat(),
+                'duration_seconds': int(secs),
+                'alone_seconds': 0,
+                'snapshot_count': 0,
+                'source': 'webhook_room',
+                'confidence': 0.5,
+                'built_at': built_at_iso,
+            })
+
     for pkey, plist in list(intervals_by_participant.items()):
         windows = presence_windows_by_key.get(pkey, [])
         if not windows:
             continue  # no webhook presence -> nothing to synthesize
         wh = webhook_by_key.get(pkey)
         meeting_left = wh.meeting_left if wh else None
+        brk_evts = _breakout_events_for(pkey)
         # Time already covered by ANY snapshot interval (breakout or main).
         covered = sorted(
             (_parse_ts(iv['start_ts']), _parse_ts(iv['end_ts']))
@@ -15098,41 +14681,95 @@ def build_presence_intervals(date_str):
                 w_e = monitoring_end
             if w_e <= w_s:
                 continue
-            # Walk the window, emitting Main Room for every stretch not already
-            # covered by a snapshot interval.
+            # Walk the window, filling every stretch not already covered by
+            # a snapshot interval from the webhook timeline (Main Room when
+            # webhooks say Main, the actual breakout room when they don't).
             cursor = w_s
             for c_s, c_e in covered:
                 if c_e <= cursor or c_s >= w_e:
                     continue
                 if c_s > cursor:
-                    _emit_main(synthesized, pkey, cursor, min(c_s, w_e))
+                    _emit_uncovered_stretch(synthesized, pkey, brk_evts,
+                                            w_s, cursor, min(c_s, w_e))
                 cursor = max(cursor, c_e)
                 if cursor >= w_e:
                     break
             if cursor < w_e:
-                _emit_main(synthesized, pkey, cursor, w_e)
+                _emit_uncovered_stretch(synthesized, pkey, brk_evts, w_s, cursor, w_e)
         intervals.extend(synthesized)
         intervals_by_participant[pkey].extend(synthesized)
 
-    # ----- Step 5: webhook-fill for participants with NO snapshots ---------
+    # ----- Step 5: webhook timeline for participants with NO snapshots -----
+    # Bot-primary, webhook-fallback. When the bot (snapshots) saw a
+    # participant, Steps 3-4 already built their day and this step skips
+    # them. When it did not — bot off all day, bot crashed mid-meeting,
+    # person never captured by polling — reconstruct their room timeline
+    # from the webhook event sequence itself: Main Room from meeting join
+    # until the first breakout join, the breakout room until its left event
+    # (or the next join), Main Room again after leaving, until meeting
+    # leave. Room names come from the events (real names when calibration
+    # mappings existed that day, 'Room-xxxxxxxx' otherwise — still counted
+    # as breakout time either way).
+    #
+    # This replaces the old rule that skipped anyone with breakout webhooks
+    # and no snapshots, which blanked entire bot-off days (e.g. 2026-07-15).
+    #
+    # Each PRESENCE WINDOW (join->leave pair) is credited separately:
+    # someone who attended 09:00-09:10 and 17:00-17:30 gets 40 min, not the
+    # whole day. A window with a missing leave (laptop closed, Zoom dropped
+    # the event) is credited until monitoring end but capped tighter
+    # (WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES) because monitoring_end is the
+    # MEETING's last activity, not this person's.
     snapshot_keys = set(intervals_by_participant.keys())
+
+    def _emit_webhook_segment(pkey, wh, room, s_dt, e_dt, no_leave):
+        secs = (e_dt - s_dt).total_seconds()
+        if secs < WEBHOOK_SEGMENT_MIN_SECONDS:
+            return
+        secs = min(secs, MAIN_ROOM_SYNTH_CAP_MINUTES * 60)
+        category = _classify_room(room)
+        intervals.append({
+            'interval_id': str(uuid_lib.uuid4()),
+            'event_date': date_str,
+            'meeting_id': wh.meeting_id,
+            'meeting_uuid': None,
+            'participant_key': pkey,
+            'participant_name': wh.participant_name,
+            'participant_email': wh.participant_email,
+            'room_name': '0.Main Room' if category == 'main' else room,
+            'room_category': category,
+            'start_ts': s_dt.isoformat(),
+            'end_ts': (s_dt + timedelta(seconds=secs)).isoformat(),
+            'duration_seconds': int(secs),
+            'alone_seconds': 0,
+            'snapshot_count': 0,
+            # webhook_fill = Main Room credit from webhooks (legacy name,
+            # kept for audit continuity); webhook_room = placed in a
+            # specific breakout room by breakout join/left webhooks.
+            'source': 'webhook_fill' if category == 'main' else 'webhook_room',
+            # 0.35 flags "leave webhook never arrived" fills for auditing
+            'confidence': 0.35 if no_leave else 0.5,
+            'built_at': built_at_iso,
+        })
+
     for pkey, wh in webhook_by_key.items():
         if pkey in snapshot_keys:
-            continue  # already has snapshot intervals
-        # Skip if they had breakout webhooks but no snapshots — unmonitored
-        # breakouts; we can't tell where they were, so don't credit anything.
-        if (wh.breakout_webhook_count or 0) > 0:
-            continue
-        if not wh.meeting_joined:
-            continue
-        # Credit each PRESENCE WINDOW (join->leave pair) separately instead
-        # of the raw MIN(join)->MAX(leave) span: someone who attended
-        # 09:00-09:10 and 17:00-17:30 must get 40 min, not the whole day.
-        # A window with a missing leave (app/laptop closed, Zoom dropped the
-        # event) is credited until monitoring end but capped tighter
-        # (WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES) because monitoring_end is the
-        # MEETING's last activity, not this person's.
-        windows = presence_windows_by_key.get(pkey) or [(wh.meeting_joined, wh.meeting_left)]
+            continue  # bot data exists — snapshot path already covered them
+
+        breakout_evts = _breakout_events_for(pkey)
+
+        # Presence windows from join/leave events; if Zoom dropped every
+        # join/leave but breakout events exist, fall back to an open window
+        # starting at the first breakout event (no-leave cap applies).
+        windows = presence_windows_by_key.get(pkey)
+        if not windows:
+            if wh.meeting_joined:
+                windows = [(wh.meeting_joined, wh.meeting_left)]
+            elif breakout_evts:
+                windows = [(_evt(breakout_evts[0], 'ts'), None)]
+            else:
+                continue
+
         for w_start, w_leave in windows:
             if w_start is None:
                 continue
@@ -15142,31 +14779,17 @@ def build_presence_intervals(date_str):
                 continue
             if monitoring_end and w_end > monitoring_end:
                 w_end = monitoring_end
-            duration = (w_end - w_start).total_seconds()
-            if duration <= 0:
+            if no_leave:
+                cap = timedelta(minutes=WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES)
+                if w_end - w_start > cap:
+                    w_end = w_start + cap
+            if w_end <= w_start:
                 continue
-            cap_minutes = WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES if no_leave else MAIN_ROOM_SYNTH_CAP_MINUTES
-            duration = min(duration, cap_minutes * 60)
-            intervals.append({
-                'interval_id': str(uuid_lib.uuid4()),
-                'event_date': date_str,
-                'meeting_id': wh.meeting_id,
-                'meeting_uuid': None,
-                'participant_key': pkey,
-                'participant_name': wh.participant_name,
-                'participant_email': wh.participant_email,
-                'room_name': '0.Main Room',
-                'room_category': 'main',
-                'start_ts': w_start.isoformat(),
-                'end_ts': (w_start + timedelta(seconds=duration)).isoformat(),
-                'duration_seconds': int(duration),
-                'alone_seconds': 0,
-                'snapshot_count': 0,
-                'source': 'webhook_fill',
-                # 0.35 flags "leave webhook never arrived" fills for auditing
-                'confidence': 0.35 if no_leave else 0.5,
-                'built_at': built_at_iso,
-            })
+
+            # Tile [w_start, w_end] with Main/breakout segments from the
+            # breakout events inside this window.
+            for room, t_s, t_e in _tile_window_with_rooms(breakout_evts, w_start, w_end):
+                _emit_webhook_segment(pkey, wh, room, t_s, t_e, no_leave)
 
     # ----- Step 5b: drop the inherited (overnight) meeting block -----------
     # See the INHERITED_* constants above for the full rationale. We rebuild
@@ -15364,6 +14987,165 @@ def intervals_rebuild():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/intervals/auto-build', methods=['POST'])
+def intervals_auto_build():
+    """Scheduler-owned self-healing sweep: build any date in the window that
+    is missing, stale, or whose source data arrived after its last build.
+    Same logic pages used to trigger lazily — now runnable in the background
+    so pages can be pure readers (set PAGELOAD_AUTO_BUILD=false).
+
+    Body: {"days_back": N (default 35), "max_builds": M (default 15)}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        days_back = min(int(data.get('days_back', 35)), 370)
+        max_builds = min(int(data.get('max_builds', 15)), 50)
+        end_d = get_ist_date()
+        start_d = (datetime.strptime(end_d, '%Y-%m-%d').date()
+                   - timedelta(days=days_back)).isoformat()
+        built, still_missing = _auto_build_dates_in_range(
+            start_d, end_d, max_builds=max_builds, force=True)
+        return jsonify({'success': True, 'start': start_d, 'end': end_d,
+                        'built': built, 'still_missing': still_missing})
+    except Exception as e:
+        print(f"[AutoBuildSweep] error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/reconcile/zoom', methods=['GET', 'POST'])
+def reconcile_zoom():
+    """Nightly safety net: compare our computed hours (presence_intervals)
+    against Zoom's own Reports API per participant, flag big mismatches.
+
+    Zoom's per-participant duration is authoritative for TOTAL in-meeting
+    time (main + breakouts combined), so any bug in our pipeline — missed
+    webhooks, bad synthesis, identity glitches — shows up here as a delta.
+
+    GET query / POST body params:
+      date=YYYY-MM-DD  or  days_ago=N   (default: yesterday IST)
+      threshold_pct    flag if |delta| > this % of the larger value (default 10)
+      min_minutes      ignore people under this on both sides (default 15)
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        args = {**request.args.to_dict(), **data}
+        if args.get('date'):
+            date_str = validate_date_format(args['date'])
+        else:
+            days_ago = int(args.get('days_ago', 1))
+            date_str = (datetime.strptime(get_ist_date(), '%Y-%m-%d').date()
+                        - timedelta(days=days_ago)).isoformat()
+        threshold_pct = float(args.get('threshold_pct', 10))
+        min_minutes = float(args.get('min_minutes', 15))
+
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        # --- Zoom's numbers: every meeting seen in webhooks that day --------
+        mtg_q = f"""
+        SELECT DISTINCT meeting_uuid, meeting_id
+        FROM `{dataset_ref}.{BQ_EVENTS_TABLE}`
+        WHERE event_date = @d AND meeting_uuid IS NOT NULL AND meeting_uuid != ''
+        LIMIT 5
+        """
+        meetings = list(client.query(mtg_q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", date_str)]
+        )).result())
+        if not meetings:
+            return jsonify({'success': False, 'date': date_str,
+                            'error': 'No meetings found in webhook events for this date'}), 404
+
+        zoom_secs = {}    # participant_key -> total seconds per Zoom
+        zoom_names = {}   # participant_key -> display name
+        zoom_emails = {}  # lower(email) -> participant_key
+        for m in meetings:
+            participants = zoom_api.get_past_meeting_participants(m.meeting_uuid) or []
+            if not participants and m.meeting_id:
+                participants = zoom_api.get_past_meeting_participants(str(m.meeting_id)) or []
+            for p in participants:
+                pname = safe_str(p.get('name') or p.get('user_name'), default='')
+                pemail = safe_str(p.get('user_email') or p.get('email'), default='').strip().lower()
+                if not pname or is_scout_bot(pname, pemail):
+                    continue
+                key = normalize_participant_name(pname).strip().lower()
+                zoom_secs[key] = zoom_secs.get(key, 0) + safe_int(p.get('duration', 0))
+                zoom_names.setdefault(key, pname)
+                if pemail:
+                    zoom_emails[pemail] = key
+
+        # --- Our numbers: presence_intervals totals --------------------------
+        ours_q = f"""
+        SELECT participant_key,
+               ANY_VALUE(participant_name) AS participant_name,
+               LOWER(TRIM(MAX(participant_email))) AS participant_email,
+               SUM(duration_seconds) AS total_seconds,
+               MIN(confidence) AS min_confidence
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+        WHERE event_date = @d
+        GROUP BY participant_key
+        """
+        ours_rows = list(client.query(ours_q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", date_str)]
+        )).result())
+
+        flagged, matched, only_ours, only_zoom = [], 0, [], []
+        seen_zoom_keys = set()
+        for r in ours_rows:
+            zkey = r.participant_key
+            if zkey not in zoom_secs and r.participant_email:
+                zkey = zoom_emails.get(r.participant_email, zkey)  # rename fallback
+            if zkey in zoom_secs:
+                seen_zoom_keys.add(zkey)
+                matched += 1
+                ours_min = round(r.total_seconds / 60, 1)
+                zoom_min = round(zoom_secs[zkey] / 60, 1)
+                if max(ours_min, zoom_min) < min_minutes:
+                    continue
+                delta = ours_min - zoom_min
+                pct = abs(delta) / max(ours_min, zoom_min) * 100
+                if pct > threshold_pct:
+                    flagged.append({
+                        'participant': r.participant_name,
+                        'ours_minutes': ours_min,
+                        'zoom_minutes': zoom_min,
+                        'delta_minutes': round(delta, 1),
+                        'delta_pct': round(pct, 1),
+                        'min_confidence': r.min_confidence,
+                    })
+            elif r.total_seconds / 60 >= min_minutes:
+                only_ours.append({'participant': r.participant_name,
+                                  'ours_minutes': round(r.total_seconds / 60, 1)})
+        for zkey, secs in zoom_secs.items():
+            if zkey not in seen_zoom_keys and secs / 60 >= min_minutes:
+                only_zoom.append({'participant': zoom_names.get(zkey, zkey),
+                                  'zoom_minutes': round(secs / 60, 1)})
+
+        flagged.sort(key=lambda x: -abs(x['delta_minutes']))
+        result = {
+            'success': True,
+            'date': date_str,
+            'meetings_checked': len(meetings),
+            'zoom_participants': len(zoom_secs),
+            'ours_participants': len(ours_rows),
+            'matched': matched,
+            'threshold_pct': threshold_pct,
+            'flagged_count': len(flagged),
+            'flagged': flagged,
+            'only_in_ours': only_ours,
+            'only_in_zoom': only_zoom,
+        }
+        print(f"[Reconcile {date_str}] matched={matched} flagged={len(flagged)} "
+              f"only_ours={len(only_ours)} only_zoom={len(only_zoom)}")
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[Reconcile] error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/intervals/status', methods=['GET'])
 def intervals_status():
     """Visibility into materialized intervals for a date.
@@ -15381,6 +15163,7 @@ def intervals_status():
           COUNTIF(source = 'snapshot')         AS source_snapshot,
           COUNTIF(source = 'synthesized_main') AS source_synthesized,
           COUNTIF(source = 'webhook_fill')     AS source_webhook_fill,
+          COUNTIF(source = 'webhook_room')     AS source_webhook_room,
           COUNTIF(room_category = 'main')      AS cat_main,
           COUNTIF(room_category = 'breakout')  AS cat_breakout,
           COUNTIF(room_category = 'break')     AS cat_break,
@@ -15788,9 +15571,14 @@ def report_compare():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
+def _auto_build_dates_in_range(start_date, end_date, max_builds=15, force=False):
     """Build presence_intervals for dates in [start, end] that need it, and
     return (built_count, still_missing_count).
+
+    When PAGELOAD_AUTO_BUILD is disabled, page-triggered calls become no-ops
+    (pages are pure readers; Cloud Scheduler owns freshness via
+    /intervals/rebuild + /intervals/auto-build). force=True bypasses the
+    gate — used by the scheduler endpoint itself.
 
     Freshness for recent days is owned by Cloud Scheduler:
       - an hourly job rebuilds TODAY  (so the pivot is never >1h stale), and
@@ -15805,6 +15593,9 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15):
          self-heals the frozen day — but a freshly-built day adds no latency.
          Builds are idempotent (load-job WRITE_TRUNCATE) so re-running is safe.
     """
+    if not PAGELOAD_AUTO_BUILD and not force:
+        return 0, 0
+
     client = get_bq_client()
     dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
     _ensure_presence_intervals_table()
