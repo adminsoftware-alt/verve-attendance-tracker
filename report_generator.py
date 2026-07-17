@@ -134,6 +134,7 @@ except ImportError:
     print("[ReportGenerator] SendGrid not installed - email disabled")
 
 # Configuration
+from zt_config import BQ_EVENTS_TABLE
 GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID', 'verve-attendance-tracker')
 BQ_DATASET = os.environ.get('BQ_DATASET', 'breakout_room_calibrator')
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
@@ -340,7 +341,7 @@ def generate_daily_report(report_date=None):
         MAX(pe.event_timestamp) as last_event_time,
         MIN(CASE WHEN pe.event_type = 'breakout_room_joined' THEN pe.event_timestamp END) as first_breakout_joined_time,
         COUNTIF(pe.event_type = 'breakout_room_joined') as breakout_joined_count
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}` pe
       LEFT JOIN email_to_key etk
         ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
       LEFT JOIN name_to_key ntk
@@ -361,7 +362,7 @@ def generate_daily_report(report_date=None):
         MAX(pe.participant_email) as participant_email,
         MIN(CASE WHEN pe.event_type = 'participant_joined' THEN TIMESTAMP(pe.event_timestamp) END) as main_join_time,
         MAX(CASE WHEN pe.event_type = 'participant_left' THEN TIMESTAMP(pe.event_timestamp) END) as main_leave_time
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}` pe
       LEFT JOIN email_to_key etk
         ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
       LEFT JOIN name_to_key ntk
@@ -575,7 +576,7 @@ def generate_daily_report(report_date=None):
       SELECT
         COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
         TIMESTAMP(pe.event_timestamp) as exit_time
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}` pe
       LEFT JOIN email_to_key etk
         ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
       LEFT JOIN name_to_key ntk

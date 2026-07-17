@@ -50,7 +50,12 @@ GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID', '')
 BQ_DATASET = os.environ.get('BQ_DATASET', 'breakout_room_calibrator')
 
 
-BQ_EVENTS_TABLE = 'participant_events'
+# Partitioned (by event_date) + clustered successor of the original
+# unpartitioned `participant_events`. Switched via code pointer on
+# 2026-07-17 because ALTER TABLE RENAME is blocked while the webhook
+# streaming buffer is warm. The old table is frozen and dropped after
+# row-count verification.
+BQ_EVENTS_TABLE = 'participant_events_p'
 
 
 BQ_MAPPINGS_TABLE = 'room_mappings'
