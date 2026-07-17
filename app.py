@@ -623,7 +623,8 @@ class MeetingState:
             ]
             meeting_filter = ""
             if meeting_id:
-                meeting_filter = " AND meeting_id = @meeting_id"
+                # meeting_id column is INT64; compare as STRING so both sides coerce safely
+                meeting_filter = " AND CAST(meeting_id AS STRING) = @meeting_id"
                 query_params.append(bigquery.ScalarQueryParameter("meeting_id", "STRING", str(meeting_id)))
             query = f"""
             SELECT room_uuid, room_name, meeting_id, mapping_date

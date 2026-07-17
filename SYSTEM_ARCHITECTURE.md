@@ -36,7 +36,7 @@ This document explains the entire system: where services run, how data flows, ho
 | **Backend API** | Cloud Run | `https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app` | Flask server - all API endpoints, Zoom SDK app |
 | **Frontend UI** | Cloud Run | `https://attendance-frontend-4e5na4tdha-uc.a.run.app` | React app - login, Team View, reports |
 | **Zoom SDK App** | Served from Backend | `https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/app` | React app that runs inside Zoom client |
-| **Scout Bot VM** | Compute Engine | IP: `34.47.178.82` | Windows VM that auto-joins Zoom meetings |
+| **Scout Bot VM** | Compute Engine | `scout-bot-2` (us-central1-a) | Windows VM running the Zoom client + SDK app |
 
 ### Why Cloud Run?
 - **Auto-scaling**: Handles traffic spikes without manual intervention
@@ -49,7 +49,7 @@ This document explains the entire system: where services run, how data flows, ho
 | Table | Purpose | Key Columns |
 |-------|---------|-------------|
 | `room_snapshots_v2` | **PRIMARY SOURCE** - SDK polls every 30s, stores who is in which room | `event_date`, `snapshot_time`, `participant_name`, `room_name` |
-| `participant_events` | Webhook events from Zoom (join/leave) | `event_type`, `event_timestamp`, `participant_name`, `room_name` |
+| `participant_events_p` | Webhook events from Zoom (join/leave) | `event_type`, `event_timestamp`, `participant_name`, `room_name` |
 | `presence_intervals` | **MATERIALIZED VIEW** - Pre-computed attendance intervals | `participant_key`, `room_category`, `duration_seconds`, `start_ts`, `end_ts` |
 | `teams` | Team definitions | `team_id`, `team_name`, `manager_name` |
 | `team_members` | Who belongs to which team | `team_id`, `participant_name`, `participant_email` |
@@ -81,7 +81,7 @@ This document explains the entire system: where services run, how data flows, ho
                     |                             breakout_room_left
                     |                                      |
                     v                                      v
-           POST /monitor/snapshot              INSERT INTO participant_events
+           POST /monitor/snapshot              INSERT INTO participant_events_p
                     |                                      |
                     v                                      |
            INSERT INTO room_snapshots_v2                   |
@@ -173,7 +173,7 @@ POST /webhook
   }
 }
 ```
-Stored in `participant_events` table.
+Stored in `participant_events_p` table.
 
 ---
 
@@ -279,7 +279,7 @@ Step 1: Pull bucketed snapshot data
         └─ Calculate occupancy per room per bucket
 
 Step 2: Pull webhook timestamps
-        └─ Get join/leave times from participant_events
+        └─ Get join/leave times from participant_events_p
         └─ Build presence windows (when was person in meeting?)
 
 Step 3: Build snapshot intervals
@@ -322,14 +322,16 @@ Step 6: Atomic partition replace
 
 ## 6. Scheduled Jobs - Automation
 
-### Cloud Scheduler Jobs (us-central1)
+### Cloud Scheduler Jobs (updated 2026-07-17)
 
-| Job Name | Schedule | Endpoint | Purpose |
-|----------|----------|----------|---------|
-| `hourly-presence-intervals-today` | `0 9-23 * * *` (hourly 9AM-11PM IST) | POST `/intervals/rebuild` `{"days_ago":0}` | Keep today's data fresh |
-| `daily-presence-intervals` | `30 0 * * *` (00:30 AM IST) | POST `/intervals/rebuild` `{"days_ago":1}` | Final rebuild of yesterday |
-| `hourly-sheets-update` | `0 9-23 * * *` | POST `/sheets/update` | Sync to Google Sheets |
-| `email-monitor-alert` | `*/1 * * * *` (every minute) | POST `/alert/email/check` | Alert if monitoring dies (PAUSED) |
+| Job Name | Region | Schedule (IST) | Endpoint | Purpose |
+|----------|--------|----------------|----------|---------|
+| `intervals-rebuild-today-2min` | asia-east1 | every 2 min, 8:00–23:59 | POST `/intervals/rebuild` | Keep today's data fresh |
+| `intervals-auto-build-sweep` | asia-east1 | every 15 min | POST `/intervals/auto-build` `{"days_back":35}` | Self-heal any of the last 35 days |
+| `reconcile-zoom-nightly` | asia-east1 | 10:00 (**PAUSED** — Zoom S2S creds broken) | POST `/reconcile/zoom` | Cross-check vs Zoom's records |
+| `hourly-sheets-update` | us-central1 | hourly 9–23 | POST `/sheets/update` | Sync to Google Sheets |
+| `hourly-presence-intervals-today`, `daily-presence-intervals` | us-central1 | **PAUSED** (superseded by the 2-min + sweep jobs) | POST `/intervals/rebuild` | — |
+| `email-monitor-alert` | us-central1 | **PAUSED** | POST `/alert/email/check` | Alert if monitoring dies |
 
 ### Why These Schedules?
 
@@ -445,7 +447,7 @@ Team-member-to-intervals join uses normalized names on both sides.
 ### Authentication
 | Endpoint | Method | Purpose | Example |
 |----------|--------|---------|---------|
-| `/auth/login` | POST | Validate credentials | `{"username":"admin","password":"verve2026"}` |
+| `/auth/login` | POST | Validate credentials, returns a signed 12h token | `{"username":"<user>","password":"<password>"}` |
 | `/auth/users` | GET | List all users | Returns array of users |
 
 ### Monitoring (SDK Data Ingestion)
@@ -497,7 +499,7 @@ Team-member-to-intervals join uses normalized names on both sides.
 ```
 https://attendance-frontend-4e5na4tdha-uc.a.run.app
 ```
-Login with: `admin` / `verve2026`
+Login with your dashboard credentials (managed in the `app_users` table; passwords are bcrypt-hashed — ask an admin for access).
 
 ### Backend Health Check
 ```bash
@@ -549,12 +551,8 @@ GROUP BY event_date ORDER BY event_date
 ```
 
 ### Scout Bot VM Access
-```
-IP: 34.47.178.82
-Username: dataapps
-Password: ScoutBot2026
-```
-Use Remote Desktop (RDP) to connect.
+GCP Console → Compute Engine → `scout-bot-2` (us-central1-a). Connect via RDP;
+credentials are in the team password manager (not stored in this repo).
 
 ---
 
@@ -607,5 +605,5 @@ This system captures Zoom meeting attendance through SDK polling (every 30s) and
 
 **Key Tables:**
 - Raw snapshots: `room_snapshots_v2`
-- Raw webhooks: `participant_events`
+- Raw webhooks: `participant_events_p`
 - Computed intervals: `presence_intervals`

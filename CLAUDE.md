@@ -19,7 +19,7 @@ This file provides complete guidance to Claude Code when working with this repos
 **GCP Project:** `verve-attendance-tracker` (Project #: 1073587167150)
 **BigQuery Dataset:** `breakout_room_calibrator`
 **GitHub Repo:** `adminsoftware-alt/verve-attendance-tracker`
-**Current Revision:** 130
+**Deploys:** auto from `main` via Cloud Build (revision number changes every push)
 
 **Auto-Deploy:** Push to `main` triggers Cloud Build
 
@@ -28,7 +28,7 @@ This file provides complete guidance to Claude Code when working with this repos
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Scout Bot VM (GCP)                            │
-│   IP: 34.47.178.82 | User: dataapps | Pass: ScoutBot2026        │
+│   VM: scout-bot-2 (us-central1-a) — creds in password manager   │
 │   Auto-joins meeting → HR clicks app → Monitoring starts         │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ SDK polls every 30s
@@ -73,7 +73,7 @@ This file provides complete guidance to Claude Code when working with this repos
 git add . && git commit -m "message" && git push origin main
 
 # Manual deployment - Backend (build React + deploy to Cloud Run)
-cd C:\Users\shash\Downloads\zoom+tracker
+cd C:\Users\shash\Downloads\zoom_tracker_project\verve-attendance-tracker
 cd breakout-calibrator && npm run build && cd ..
 gcloud.cmd run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated --min-instances=1 --project=verve-attendance-tracker
 
@@ -95,7 +95,8 @@ gcloud.cmd run services logs tail breakout-room-calibrator --region us-central1 
 
 | Table | Schema | Purpose |
 |-------|--------|---------|
-| `room_snapshots` | snapshot_id, snapshot_time, event_date, meeting_id, room_name, participant_name, participant_email, participant_uuid, inserted_at | **PRIMARY** - SDK polling data (every 30s) |
+| `room_snapshots_v2` | snapshot_id, snapshot_time, event_date, meeting_id, room_name, participant_name, participant_email, participant_uuid, inserted_at | **PRIMARY** - SDK polling data (every 30s); date-partitioned |
+| `presence_intervals` | participant_key, participant_name, participant_email, room_name, room_category, start_ts, end_ts, duration_seconds, confidence, event_date | **SOURCE OF TRUTH for hours** — built by `zt_intervals.build_presence_intervals`; every report reads this; date-partitioned |
 | `participant_events_p` | event_id, event_type, event_timestamp, event_date, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, room_uuid, room_name, inserted_at | Webhook join/leave events (partitioned by event_date, clustered; replaced unpartitioned `participant_events` on 2026-07-17 — always reference via `BQ_EVENTS_TABLE`) |
 | `room_mappings` | mapping_id, meeting_id, meeting_uuid, room_uuid, room_name, room_index, mapping_date, mapped_at, source | UUID -> room name (legacy calibration) |
 | `camera_events` | event_id, event_type, event_timestamp, event_date, event_time, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, camera_on, room_name, duration_seconds, inserted_at | Camera ON/OFF events |
@@ -188,7 +189,8 @@ The core problem: Zoom SDK uses GUIDs (`{E7F123FC-EE33-47D8-BC5E-C84FCD31E06F}`)
 - Zoom sends `x-zm-signature` and `x-zm-request-timestamp` headers
 - Signature: `v0=HMAC-SHA256(secret, "v0:{timestamp}:{body}")`
 - Must check timestamp freshness (within 5 minutes)
-- URL validation events don't have these headers (skip validation)
+- **Every request must be signed — including `endpoint.url_validation`** (hardened
+  2026-07-16; missing headers → 401; Zoom signs all events so nothing legitimate breaks)
 
 ### 5. IST Timezone Handling
 - All event_date fields stored in IST (UTC+5:30)
@@ -211,10 +213,13 @@ The core problem: Zoom SDK uses GUIDs (`{E7F123FC-EE33-47D8-BC5E-C84FCD31E06F}`)
 
 ## Cloud Scheduler Jobs
 
-| Job | Schedule | Endpoint | Purpose |
-|-----|----------|----------|---------|
-| `daily-qos-collection` | 9:30 AM IST | `/qos/scheduled` | Collect QoS/camera data for yesterday's meeting |
-| `daily-attendance-report` | 11:15 AM IST | `/report/generate` | Generate and email daily attendance CSV |
+| Job | Region | Schedule (IST) | Endpoint | Purpose |
+|-----|--------|----------------|----------|---------|
+| `intervals-rebuild-today-2min` | asia-east1 | every 2 min, 8:00–23:59 | `/intervals/rebuild` | Keep today fresh |
+| `intervals-auto-build-sweep` | asia-east1 | every 15 min | `/intervals/auto-build` | Self-heal last 35 days |
+| `reconcile-zoom-nightly` | asia-east1 | 10:00 — **PAUSED** (Zoom S2S creds broken) | `/reconcile/zoom` | Cross-check vs Zoom records |
+| `hourly-sheets-update` | us-central1 | hourly 9–23 | `/sheets/update` | Google Sheets export |
+| `hourly-presence-intervals-today`, `daily-presence-intervals`, `email-monitor-alert` | us-central1 | **PAUSED** | — | Superseded / disabled |
 
 ## Environment Variables
 
@@ -263,24 +268,12 @@ Name, Email, Main_Joined_IST, Main_Left_IST, Total_Duration, Room_History
 - Duration as "Xh Ym"
 - Room history shows join/leave times per room
 
-## Bot Detection Logic (shared in zoomService.js)
+## Bot Detection Logic (exact-match since 2026-07-16)
 
-```javascript
-function isBotNameMatch(participantName, botName = 'Scout Bot') {
-  const pName = participantName.toLowerCase();
-  const normalizedBotName = botName.toLowerCase();
-
-  // Exact match
-  const isExactMatch = pName === normalizedBotName;
-  // Contains the configured bot name
-  const containsBotName = pName.includes(normalizedBotName);
-  // Scout bot patterns
-  const isScoutBot = pName.includes('scout bot') || pName.includes('scoutbot');
-  const isScoutPattern = pName.startsWith('scout') && pName.includes('bot');
-
-  return isExactMatch || containsBotName || isScoutBot || isScoutPattern;
-}
-```
+Backend `is_scout_bot()` and calibrator `isBotNameMatch()` both use **exact name
+match** after stripping Zoom rejoin suffixes (e.g. `"Scout Bot-1"` → `"Scout Bot"`),
+case-insensitive. Substring matching was removed — a real person whose display name
+merely contained "Scout Bot" used to vanish from tracking.
 
 ## In-Memory State (MeetingState class)
 
@@ -379,6 +372,8 @@ src/
 
 ## Version History
 
+- **2026-07-17**: Events table switched to partitioned `participant_events_p` via code-pointer swap (zero downtime; old table dropped; always use `BQ_EVENTS_TABLE`). Temp `/admin/ops/partition-events` endpoint deleted. Duplicate us-central1 builder jobs paused. `reconcile-zoom-nightly` moved to 10:00 IST then paused (S2S creds broken). `load_mappings_from_bigquery` INT64/STRING mismatch fixed. Docs refreshed; credentials removed from repo docs; dead Supabase files removed.
+- **2026-07-16**: Major overhaul (see `docs/CHANGES-2026-07-16.md`): webhook-fallback rebuild for bot-off days, single source of hours (`presence_intervals`), auth on 45 endpoints (12h HMAC token), bcrypt passwords, email-based identity, ⚠ estimated flags, module split (`zt_config/zt_helpers/zt_zoom_api/zt_intervals`), scheduler jobs, webhook signature hardening, exact-match bot detection.
 - **2026-05-11** (post-audit cleanup): Replaced gap-based break detection with "Break Time room presence only" across every team / employee endpoint. Capture Main Room participants in SDK snapshots. 30-second bucket dedup for break/isolation counts so multi-source polling (HR client + VM) doesn't double-count. Match team members by name OR email (Zoom display-name drift no longer drops users). Auto-start the SDK monitor without manual click. Day View Duration now includes Break Time. Server-side dedup on `/monitor/snapshot` insert. Per-IP `/auth/login` rate limit (5 tries per 60s, 5-min lockout). Wall-clock cap on Zoom API pagination.
 - **Revision 78** (2026-03-27): Enhanced calibration UI with delay selector, live room view, recalibration, reset
 - **Revision 77** (2026-03-05): Security & performance fixes
@@ -390,14 +385,16 @@ src/
 
 These are tracked from a project-wide audit. Each touches surface area that affects production data or auth flow, so they were not changed without explicit approval.
 
-- **Plaintext passwords in `app_users` BigQuery table.** Login query does `WHERE TRIM(password) = @password`. Needs bcrypt/argon2 migration.
+- ~~Plaintext passwords in `app_users`~~ **FIXED 2026-07-16**: bcrypt at creation; legacy plaintext rows auto-upgrade on next successful login.
+- **Zoom REST API broken (open, accepted 2026-07-17)**: Cloud Run Zoom creds are not a Server-to-Server OAuth app → token fails `unsupported_grant_type`. No reconcile cross-check, no QoS/camera data. `reconcile-zoom-nightly` PAUSED. Fix = create S2S app (scopes `meeting:read:admin`, `report:read:admin`, `dashboard_meetings:read:admin`), update env vars, resume job.
 - ~~`DEFAULT_USERS` fallback in the JS bundle~~ **FIXED 2026-07-16**: removed; login is server-side only.
 - ~~Webhook signature can be bypassed by omitting headers~~ **FIXED 2026-07-16**: missing `x-zm-signature`/`x-zm-request-timestamp` now 401s; only `endpoint.url_validation` is exempt.
 - ~~`/chat` accepts client-supplied `role`~~ **FIXED 2026-07-16**: role/user come from the verified auth token when present.
 - ~~All POST/PUT/DELETE endpoints unauthenticated~~ **FIXED 2026-07-16**: `require_auth` (HMAC-signed Bearer token from `/auth/login`) on 45 mutating routes; admin/superadmin roles enforced on user-management + `/admin/*` + test/debug endpoints. Deliberately left open: `/webhook` (Zoom-signed), `/monitor/snapshot` + `/calibration/*` (bot/SDK app, no login context), scheduler-called builders (`/intervals/*`, `/qos/scheduled`, `/report/generate`, `/reconcile/zoom`), and `/admin/ops/partition-events` (temporary — DELETE after the 2026-07-17 partition swap completes).
 - **Session + auth token in `sessionStorage`** instead of httpOnly cookie. XSS = account takeover. (Token expires after 12h, limiting blast radius.)
 - **IST midnight timezone drift** on multi-meeting day boundaries (deferred — touches date math used by every report query).
-- **Scout Bot detection is substring match**. "Real Person Scout Bot" bypasses tracking. Should be exact match.
+- ~~Scout Bot detection is substring match~~ **FIXED 2026-07-16**: exact match (after rejoin-suffix strip) in backend + calibrator.
+- **`/qos/status` broken**: `qos_data` table has no named schema (`string_field_0..13`) → `Unrecognized name: event_date`. Dead feature (see Zoom API item); low priority.
 
 ## graphify
 

@@ -24,8 +24,9 @@ ZOOM MEETING → DATA CAPTURED → TEAM VIEW SHOWS HOURS
 
 ### Step 3: View in Frontend
 - Open: `https://attendance-frontend-4e5na4tdha-uc.a.run.app`
-- Login: `admin` / `verve2026`
+- Login with your dashboard username/password (ask an admin if you don't have one)
 - Go to Team View → See hours for each person
+- Hours marked ⚠ are estimated from webhook data (bot wasn't running)
 
 ---
 
@@ -36,7 +37,7 @@ ZOOM MEETING → DATA CAPTURED → TEAM VIEW SHOWS HOURS
 | **Frontend** (what you see) | Google Cloud Run | `attendance-frontend-4e5na4tdha-uc.a.run.app` |
 | **Backend** (API server) | Google Cloud Run | `breakout-room-calibrator-4e5na4tdha-uc.a.run.app` |
 | **Database** | Google BigQuery | Project: `verve-attendance-tracker` |
-| **Bot VM** | Google Compute Engine | IP: `34.47.178.82` |
+| **Bot VM** | Google Compute Engine | `scout-bot-2` (us-central1-a) |
 
 ---
 
@@ -67,9 +68,9 @@ Team View: "John - Total: 8 hours 30 minutes"
 
 | When | What Happens |
 |------|--------------|
-| Every hour (9 AM - 11 PM) | Rebuilds today's data |
-| 12:30 AM | Rebuilds yesterday's final data |
-| When you open Team View | Auto-fixes if data is stale |
+| Every 2 minutes (8 AM - midnight) | Rebuilds today's data |
+| Every 15 minutes | Self-heals any of the last 35 days (missing/stale/late data) |
+| When you open Team View | Auto-fixes if data is stale (backstop) |
 
 ---
 
