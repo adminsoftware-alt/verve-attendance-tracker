@@ -96,7 +96,7 @@ gcloud.cmd run services logs tail breakout-room-calibrator --region us-central1 
 | Table | Schema | Purpose |
 |-------|--------|---------|
 | `room_snapshots` | snapshot_id, snapshot_time, event_date, meeting_id, room_name, participant_name, participant_email, participant_uuid, inserted_at | **PRIMARY** - SDK polling data (every 30s) |
-| `participant_events` | event_id, event_type, event_timestamp, event_date, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, room_uuid, room_name, inserted_at | Webhook join/leave events |
+| `participant_events_p` | event_id, event_type, event_timestamp, event_date, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, room_uuid, room_name, inserted_at | Webhook join/leave events (partitioned by event_date, clustered; replaced unpartitioned `participant_events` on 2026-07-17 — always reference via `BQ_EVENTS_TABLE`) |
 | `room_mappings` | mapping_id, meeting_id, meeting_uuid, room_uuid, room_name, room_index, mapping_date, mapped_at, source | UUID -> room name (legacy calibration) |
 | `camera_events` | event_id, event_type, event_timestamp, event_date, event_time, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, camera_on, room_name, duration_seconds, inserted_at | Camera ON/OFF events |
 | `qos_data` | qos_id, meeting_uuid, participant_id, participant_name, participant_email, join_time, leave_time, duration_minutes, attentiveness_score, camera_on_count, camera_on_minutes, camera_on_intervals, recorded_at, event_date | Quality of Service metrics from Dashboard API |
