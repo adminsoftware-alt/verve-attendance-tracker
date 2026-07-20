@@ -810,6 +810,15 @@ def build_presence_intervals(date_str):
     ) - timedelta(minutes=IST_OFFSET_MINUTES)  # 00:00 IST = 18:30 UTC prev day
     _day_end_utc = _day_start_utc + timedelta(days=1)
 
+    # MIDNIGHT-CROSSING FIX: The meeting runs ~9AM to ~9AM+1 day (24h continuous).
+    # Events between midnight and early morning (00:00-08:00 IST) are likely from
+    # the previous day's meeting continuing past midnight, NOT a fresh session.
+    # For webhook-only participants (no snapshots), skip events before the
+    # "safe" work start time to avoid double-counting attendance.
+    # This is in addition to the boundary checks below.
+    EARLY_MORNING_CUTOFF_IST_HOURS = 8  # Skip webhook-only events before 08:00 IST
+    _early_cutoff_utc = _day_start_utc + timedelta(hours=EARLY_MORNING_CUTOFF_IST_HOURS)
+
     for pkey, wh in webhook_by_key.items():
         if pkey in snapshot_keys:
             continue  # bot data exists — snapshot path already covered them
@@ -831,6 +840,11 @@ def build_presence_intervals(date_str):
                 # Verify the join is within this IST day (not a stale event
                 # with wrong event_date due to timezone edge cases)
                 if wh.meeting_joined >= _day_start_utc and wh.meeting_joined < _day_end_utc:
+                    # EARLY-MORNING FILTER: For webhook-only participants, skip
+                    # if their join is before 08:00 IST — likely a continuation
+                    # from yesterday's meeting that crossed midnight.
+                    if wh.meeting_joined < _early_cutoff_utc:
+                        continue
                     windows = [(wh.meeting_joined, wh.meeting_left)]
                 else:
                     # Join timestamp is outside this IST day — skip
@@ -842,6 +856,9 @@ def build_presence_intervals(date_str):
                 # intervals — the person's time is counted on the start day.
                 first_evt_ts = _evt(breakout_evts[0], 'ts')
                 if first_evt_ts >= _day_start_utc and first_evt_ts < _day_end_utc:
+                    # EARLY-MORNING FILTER: Same check for breakout fallback
+                    if first_evt_ts < _early_cutoff_utc:
+                        continue
                     windows = [(first_evt_ts, None)]
                 else:
                     continue
@@ -861,6 +878,17 @@ def build_presence_intervals(date_str):
                 # If the window ends within today, clamp to day start
                 if w_leave and w_leave > _day_start_utc:
                     w_start = _day_start_utc
+                else:
+                    continue
+
+            # EARLY-MORNING FILTER: For webhook-only participants, skip windows
+            # that start before 08:00 IST — likely a continuation from yesterday's
+            # meeting. This catches cases where presence_windows_by_key has early
+            # morning windows from events that got event_date = today.
+            if w_start < _early_cutoff_utc:
+                # Clamp to early cutoff if the window extends past it
+                if w_leave and w_leave > _early_cutoff_utc:
+                    w_start = _early_cutoff_utc
                 else:
                     continue
 
