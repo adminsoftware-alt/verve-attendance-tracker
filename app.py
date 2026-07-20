@@ -393,6 +393,8 @@ class MeetingState:
         # SEQUENCE-BASED MATCHING: Room sequence and next expected index
         self.calibration_sequence = []  # Ordered list of room names ["Room 1", "Room 2", ...]
         self.calibration_next_index = 0  # Index of next expected webhook (0, 1, 2, ...)
+        # WEBHOOK-PRIMARY MODE: Pending mapping requests (SDK resolves these)
+        self.pending_mapping_requests = []  # List of {request_id, webhook_uuid, participant_name, participant_email, timestamp}
         # Note: Don't reset dedup cache on meeting reset - keep it for cross-meeting dedup
         print("[MeetingState] Reset for new meeting")
 
@@ -1775,6 +1777,32 @@ def handle_participant_left(data):
     print(f"  -> LEAVE: {p['participant_name']} {'[OK]' if success else '[FAILED]'}")
 
 
+# WEBHOOK-PRIMARY MODE: mapping-request queue tuning
+MAPPING_REQUEST_TTL_S = 600      # drop unresolved requests after 10 min
+MAPPING_REQUEST_RESERVE_S = 30   # don't re-serve a request handed to the SDK within 30s
+
+
+def _queue_mapping_request(room_uuid, participant_name, participant_email, meeting_id):
+    """Queue a webhook-uuid -> room-name lookup for the SDK panel to resolve
+    (webhook-primary mode). Deduped by webhook_uuid; bounded queue."""
+    with meeting_state._lock:
+        if any(req['webhook_uuid'] == room_uuid
+               for req in meeting_state.pending_mapping_requests):
+            return
+        meeting_state.pending_mapping_requests.append({
+            'request_id': str(uuid_lib.uuid4()),
+            'webhook_uuid': room_uuid,
+            'participant_name': participant_name,
+            'participant_email': participant_email,
+            'meeting_id': meeting_id,
+            'timestamp': datetime.utcnow().isoformat(),
+            'queued_ts': time.time(),
+            'served_ts': None,
+        })
+        if len(meeting_state.pending_mapping_requests) > 100:
+            meeting_state.pending_mapping_requests = meeting_state.pending_mapping_requests[-100:]
+
+
 def handle_breakout_room_join(data):
     """Handle participant joined breakout room"""
     p = extract_participant_data(data)
@@ -1905,8 +1933,20 @@ def handle_breakout_room_join(data):
         return
 
     # Get room name from mapping
+    room_name_known = False
     if room_uuid:
-        room_name = meeting_state.get_room_name(room_uuid) or f'Room-{room_uuid[:8]}'
+        room_name = meeting_state.get_room_name(room_uuid)
+        if room_name:
+            room_name_known = True
+        else:
+            # Unknown room_uuid - use placeholder and queue mapping request.
+            # The SDK panel will look up which room this participant is in;
+            # zt_intervals also resolves placeholders via room_mappings at
+            # build time, so the event is safe to store as-is.
+            room_name = f'Room-{room_uuid[:8]}'
+            print(f"  -> Unknown room_uuid, queueing mapping request")
+            _queue_mapping_request(room_uuid, p['participant_name'],
+                                   p['participant_email'], p['meeting_id'])
     else:
         room_name = 'Unknown Room'
         print(f"  -> WARNING: No room_uuid in event data")
@@ -1931,7 +1971,8 @@ def handle_breakout_room_join(data):
     state['current_room'] = room_name
 
     success = insert_participant_event(event_data)
-    print(f"  -> ROOM JOIN: {p['participant_name']} -> {room_name} {'[OK]' if success else '[FAILED]'}")
+    status_suffix = ' (mapping queued)' if room_uuid and not room_name_known else ''
+    print(f"  -> ROOM JOIN: {p['participant_name']} -> {room_name}{status_suffix} {'[OK]' if success else '[FAILED]'}")
 
 
 def handle_breakout_room_leave(data):
@@ -1957,6 +1998,13 @@ def handle_breakout_room_leave(data):
     room_name = meeting_state.get_room_name(room_uuid) if room_uuid else 'Unknown Room'
     if not room_name and room_uuid:
         room_name = f'Room-{room_uuid[:8]}'
+        # WEBHOOK-PRIMARY MODE: unknown uuid on a LEAVE happens after server
+        # restarts mid-day (mappings not yet reloaded). Queue a lookup; note
+        # the participant has already LEFT this room, so the SDK lookup only
+        # succeeds if someone else is still in it — sync-time resolution and
+        # the build-time room_mappings join cover the rest.
+        _queue_mapping_request(room_uuid, p['participant_name'],
+                               p['participant_email'], p['meeting_id'])
 
     event_data = {
         'event_id': str(uuid_lib.uuid4()),
@@ -4823,7 +4871,7 @@ def check_room_mapped():
         FROM `{project}.{dataset}.room_mappings`
         WHERE room_name = @room_name
           AND mapping_date = @mapping_date
-          AND source IN ('webhook_calibration', 'pending_move_calibration', 'sequence_calibration')
+          AND source IN ('webhook_calibration', 'pending_move_calibration', 'sequence_calibration', 'webhook_primary_sdk_lookup')
         ORDER BY mapped_at DESC
         LIMIT 1
         """.format(project=GCP_PROJECT_ID, dataset=BQ_DATASET)
@@ -4880,6 +4928,362 @@ def get_mappings():
         ],
         'total': len(meeting_state.name_to_uuid)
     })
+
+
+# ==============================================================================
+# WEBHOOK-PRIMARY MODE: ROOM MAPPING ENDPOINTS
+# ==============================================================================
+# These endpoints support the webhook-primary architecture where:
+# - Webhooks are the PRIMARY data source (exact timestamps)
+# - SDK is ONLY used to map room UUIDs to room names
+# - Bot sits idle, responds to mapping requests
+# ==============================================================================
+
+@app.route('/mapping/sync', methods=['POST'])
+def mapping_sync():
+    """
+    SDK sends full room list with SDK UUIDs.
+    Used for proactive room name sync (runs every ~1 minute).
+
+    Payload:
+    {
+        "meeting_id": "123456789",
+        "meeting_uuid": "abc123...",
+        "rooms": [
+            {"room_name": "Team Alpha", "sdk_uuid": "e7f123fc...", "participant_count": 5},
+            ...
+        ],
+        "synced_at": "2026-07-20T10:30:00Z"
+    }
+
+    Note: This stores SDK UUIDs, not webhook UUIDs. The actual mapping happens
+    when /mapping/resolve is called with a webhook_uuid and we match by participant.
+    """
+    try:
+        data = request.get_json() or {}
+        meeting_id = data.get('meeting_id') or meeting_state.meeting_id
+        meeting_uuid = data.get('meeting_uuid', '')
+        rooms = data.get('rooms', [])
+
+        if not rooms:
+            return jsonify({'success': True, 'message': 'No rooms to sync', 'count': 0})
+
+        # DO NOT call set_meeting() here: the SDK panel's meeting id can be the
+        # meeting UUID while webhooks carry the numeric id. set_meeting treats a
+        # mismatch as a NEW meeting and reset()s — wiping uuid_to_name and the
+        # pending mapping queue on every sync. Webhooks own meeting identity;
+        # only fill it in if nothing set it yet.
+        if not meeting_state.meeting_id and meeting_id:
+            meeting_state.meeting_id = meeting_id
+            meeting_state.meeting_uuid = meeting_state.meeting_uuid or meeting_uuid
+            meeting_state.meeting_date = get_ist_date()
+
+        # Store room names (SDK UUIDs are different from webhook UUIDs, so we just
+        # cache the room list for reference - actual mapping uses participant lookup)
+        for room in rooms:
+            room_name = room.get('room_name')
+            sdk_uuid = room.get('sdk_uuid', '')
+            if room_name and sdk_uuid:
+                # Store SDK UUID mapping (useful for debugging, not for webhook matching)
+                meeting_state.uuid_to_name[f"sdk:{sdk_uuid}"] = room_name
+
+        # SYNC-TIME RESOLUTION: the payload embeds each room's current
+        # participants, so any pending webhook-uuid request whose participant
+        # appears in a room can be resolved right here — no round trip through
+        # /mapping/pending. This also heals the multi-worker case: whichever
+        # gunicorn worker receives this sync resolves ITS OWN pending queue.
+        def _norm_pname(n):
+            return _re.sub(r'-\d+$', '', (n or '').strip().lower()).strip()
+
+        room_by_person = {}
+        for room in rooms:
+            rname = room.get('room_name')
+            if not rname:
+                continue
+            for part in (room.get('participants') or []):
+                nm = _norm_pname(part.get('name'))
+                em = (part.get('email') or '').strip().lower()
+                if nm:
+                    room_by_person[('n', nm)] = rname
+                if em:
+                    room_by_person[('e', em)] = rname
+
+        matched = []
+        if room_by_person:
+            with meeting_state._lock:
+                remaining = []
+                for req in meeting_state.pending_mapping_requests:
+                    rname = (room_by_person.get(('e', (req.get('participant_email') or '').strip().lower()))
+                             or room_by_person.get(('n', _norm_pname(req.get('participant_name')))))
+                    if rname:
+                        matched.append((req, rname))
+                    else:
+                        remaining.append(req)
+                meeting_state.pending_mapping_requests = remaining
+
+        # BQ writes happen OUTSIDE the lock (insert_room_mappings runs queries)
+        today = get_ist_date()
+        for req, rname in matched:
+            meeting_state.add_webhook_room_mapping(req['webhook_uuid'], rname)
+            insert_room_mappings([{
+                'mapping_id': str(uuid_lib.uuid4()),
+                'meeting_id': str(req.get('meeting_id') or meeting_id or ''),
+                'meeting_uuid': meeting_state.meeting_uuid or '',
+                'room_uuid': req['webhook_uuid'],
+                'room_name': rname,
+                'room_index': -1,
+                'mapping_date': today,
+                'mapped_at': datetime.utcnow().isoformat(),
+                'source': 'webhook_primary_sdk_lookup'
+            }])
+            print(f"[mapping/sync] Resolved from sync payload: {req['webhook_uuid'][:20]}... -> {rname}")
+
+        print(f"[mapping/sync] Synced {len(rooms)} rooms for meeting {meeting_id} "
+              f"({len(matched)} pending request(s) resolved)")
+
+        return jsonify({
+            'success': True,
+            'count': len(rooms),
+            'resolved': len(matched),
+            'meeting_id': meeting_id
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/mapping/pending', methods=['GET'])
+def mapping_pending():
+    """
+    SDK checks for pending mapping requests.
+    When webhook has unknown room_uuid, it queues a request here.
+
+    Query params:
+    - meeting_id: Meeting ID to filter requests
+
+    Returns:
+    {
+        "pending": [
+            {
+                "request_id": "uuid",
+                "webhook_uuid": "6kAkE8jO...",
+                "participant_name": "John Doe",
+                "participant_email": "john@example.com",
+                "timestamp": "2026-07-20T10:30:00Z"
+            },
+            ...
+        ]
+    }
+    """
+    try:
+        now = time.time()
+
+        with meeting_state._lock:
+            # Expire stale requests (participant probably left / moved on;
+            # zt_intervals resolves leftover placeholders via room_mappings
+            # at build time anyway).
+            meeting_state.pending_mapping_requests = [
+                req for req in meeting_state.pending_mapping_requests
+                if now - req.get('queued_ts', now) < MAPPING_REQUEST_TTL_S
+            ]
+
+            # Serve requests not currently being worked on. Requests are NOT
+            # deleted here — only /mapping/resolve (or sync-time resolution,
+            # or TTL expiry) removes them, so a crashed SDK lookup retries.
+            pending = []
+            for req in meeting_state.pending_mapping_requests:
+                served = req.get('served_ts')
+                if served and now - served < MAPPING_REQUEST_RESERVE_S:
+                    continue  # recently handed to the SDK, give it time
+                req['served_ts'] = now
+                pending.append({
+                    'request_id': req['request_id'],
+                    'webhook_uuid': req['webhook_uuid'],
+                    'participant_name': req['participant_name'],
+                    'participant_email': req['participant_email'],
+                    'meeting_id': req.get('meeting_id'),
+                    'timestamp': req.get('timestamp'),
+                })
+                if len(pending) >= 10:
+                    break
+
+        if pending:
+            print(f"[mapping/pending] Returning {len(pending)} pending requests")
+        return jsonify({'pending': pending})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/mapping/resolve', methods=['POST'])
+def mapping_resolve():
+    """
+    SDK resolves a mapping request - tells us which room a participant is in.
+
+    Payload:
+    {
+        "request_id": "uuid",
+        "webhook_uuid": "6kAkE8jO...",
+        "room_name": "Team Alpha",  // null if participant not in any breakout
+        "sdk_uuid": "e7f123fc...",  // SDK's room UUID (for reference)
+        "meeting_id": "123456789"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        request_id = data.get('request_id')
+        webhook_uuid = data.get('webhook_uuid')
+        room_name = data.get('room_name')
+        sdk_uuid = data.get('sdk_uuid', '')
+        meeting_id = data.get('meeting_id') or meeting_state.meeting_id
+
+        if not webhook_uuid:
+            return jsonify({'error': 'webhook_uuid required'}), 400
+
+        # Remove the request from the pending queue (whatever the outcome —
+        # if room_name is null the participant is in Main Room / already moved,
+        # and re-serving the same lookup would just spin forever).
+        with meeting_state._lock:
+            meeting_state.pending_mapping_requests = [
+                req for req in meeting_state.pending_mapping_requests
+                if req['webhook_uuid'] != webhook_uuid
+            ]
+
+        if room_name:
+            # Store the mapping: webhook_uuid -> room_name
+            meeting_state.add_webhook_room_mapping(webhook_uuid, room_name)
+
+            # Also save to BigQuery for persistence
+            today = get_ist_date()
+            mapping_row = {
+                'mapping_id': str(uuid_lib.uuid4()),
+                'meeting_id': str(meeting_id),
+                'meeting_uuid': meeting_state.meeting_uuid or '',
+                'room_uuid': webhook_uuid,
+                'room_name': room_name,
+                'room_index': -1,  # Unknown index in webhook-primary mode
+                'mapping_date': today,
+                'mapped_at': datetime.utcnow().isoformat(),
+                'source': 'webhook_primary_sdk_lookup'
+            }
+            insert_room_mappings([mapping_row])
+
+            print(f"[mapping/resolve] Mapped {webhook_uuid[:20]}... -> {room_name}")
+
+            # Update any events that were stored with Room-XXXXX placeholder
+            # This is async/best-effort - events are still valid with placeholder names
+            try:
+                _update_events_with_room_name(webhook_uuid, room_name, today)
+            except Exception as e:
+                print(f"[mapping/resolve] Warning: Could not update existing events: {e}")
+        else:
+            print(f"[mapping/resolve] No room found for {webhook_uuid[:20]}... (participant may be in Main Room)")
+
+        return jsonify({
+            'success': True,
+            'webhook_uuid': webhook_uuid[:20] + '...' if webhook_uuid else None,
+            'room_name': room_name
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/mapping/request', methods=['POST'])
+def mapping_request():
+    """
+    Queue a mapping request for the SDK to resolve.
+    Called internally when webhook has unknown room_uuid.
+
+    Payload:
+    {
+        "webhook_uuid": "6kAkE8jO...",
+        "participant_name": "John Doe",
+        "participant_email": "john@example.com",
+        "meeting_id": "123456789"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        webhook_uuid = data.get('webhook_uuid')
+        participant_name = data.get('participant_name')
+        participant_email = data.get('participant_email', '')
+        meeting_id = data.get('meeting_id') or meeting_state.meeting_id
+
+        if not webhook_uuid or not participant_name:
+            return jsonify({'error': 'webhook_uuid and participant_name required'}), 400
+
+        request_entry = {
+            'request_id': str(uuid_lib.uuid4()),
+            'webhook_uuid': webhook_uuid,
+            'participant_name': participant_name,
+            'participant_email': participant_email,
+            'meeting_id': meeting_id,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+
+        with meeting_state._lock:
+            # Avoid duplicate requests for same webhook_uuid
+            existing = any(
+                req['webhook_uuid'] == webhook_uuid
+                for req in meeting_state.pending_mapping_requests
+            )
+            if not existing:
+                meeting_state.pending_mapping_requests.append(request_entry)
+                # Keep queue bounded
+                if len(meeting_state.pending_mapping_requests) > 100:
+                    meeting_state.pending_mapping_requests = meeting_state.pending_mapping_requests[-100:]
+
+        print(f"[mapping/request] Queued mapping request for {webhook_uuid[:20]}... ({participant_name})")
+
+        return jsonify({
+            'success': True,
+            'request_id': request_entry['request_id']
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+def _update_events_with_room_name(webhook_uuid, room_name, event_date):
+    """
+    Update participant_events that have Room-XXXXX placeholder with actual room name.
+    Best-effort ONLY: BigQuery rejects UPDATEs on rows still in the streaming
+    buffer (up to ~90 min after insert), so this usually fails for fresh events.
+    That is fine — zt_intervals resolves placeholder names via a room_mappings
+    JOIN at build time, so reports are correct regardless.
+    """
+    try:
+        # Only update events from today with the placeholder name
+        placeholder = f'Room-{webhook_uuid[:8]}'
+
+        update_query = f"""
+        UPDATE `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}`
+        SET room_name = @room_name
+        WHERE event_date = @event_date
+          AND room_uuid = @webhook_uuid
+          AND room_name = @placeholder
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("room_name", "STRING", room_name),
+                bigquery.ScalarQueryParameter("event_date", "DATE", event_date),
+                bigquery.ScalarQueryParameter("webhook_uuid", "STRING", webhook_uuid),
+                bigquery.ScalarQueryParameter("placeholder", "STRING", placeholder),
+            ]
+        )
+
+        bq_client.query(update_query, job_config=job_config).result()
+        print(f"[_update_events_with_room_name] Updated events: {placeholder} -> {room_name}")
+
+    except Exception as e:
+        # Non-fatal - events still have the webhook_uuid for later mapping
+        print(f"[_update_events_with_room_name] Warning: {e}")
 
 
 # ==============================================================================
@@ -11990,6 +12394,48 @@ def intervals_rebuild():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         print(f"[Intervals] Build error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/intervals/build-sql', methods=['GET', 'POST'])
+def intervals_build_sql():
+    """WEBHOOK-PRIMARY: build intervals for one IST date ENTIRELY in BigQuery
+    (JS-UDF state machine, no Python processing), writing to the SEPARATE
+    presence_intervals_sql table, then compare per-participant daily totals
+    against the production presence_intervals table.
+
+    Params (query string or JSON body):
+      date=YYYY-MM-DD   explicit date (default: today IST)
+      days_ago=N        N days before today IST
+      compare=false     skip the comparison step
+
+    Production reports are NOT affected — this is a side-by-side verifier.
+    Once webhook-only rows match the Python builder for a few days, the
+    Python builder can be retired in favor of this query.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        args = request.args
+        days_ago = data.get('days_ago', args.get('days_ago'))
+        date_in = data.get('date', args.get('date'))
+        if days_ago is not None:
+            target = (datetime.strptime(get_ist_date(), '%Y-%m-%d').date()
+                      - timedelta(days=int(days_ago)))
+            date_str = target.isoformat()
+        else:
+            date_str = date_in or get_ist_date()
+
+        result = build_presence_intervals_sql(date_str)
+
+        do_compare = str(data.get('compare', args.get('compare', 'true'))).lower() != 'false'
+        comparison = compare_sql_vs_python(date_str) if do_compare else None
+
+        return jsonify({'success': True, 'build': result, 'comparison': comparison})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[Intervals] SQL build error: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 

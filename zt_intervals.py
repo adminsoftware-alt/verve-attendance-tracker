@@ -38,6 +38,9 @@ __all__ = [
     '_ensure_presence_intervals_table',
     'build_presence_intervals',
     '_auto_build_dates_in_range',
+    'PRESENCE_INTERVALS_SQL_TABLE',
+    'build_presence_intervals_sql',
+    'compare_sql_vs_python',
 ]
 
 PRESENCE_INTERVALS_TABLE = 'presence_intervals'
@@ -378,6 +381,12 @@ def build_presence_intervals(date_str):
     # only credits Main Room time when they were ACTUALLY in the meeting.
     # Without this, a participant who left for an hour between breakouts
     # gets credited that whole hour as phantom Main Room time.
+    # Room names are resolved at BUILD time via room_mappings: webhook events
+    # that arrived before a room's uuid->name mapping existed are stored with
+    # a 'Room-xxxxxxxx' placeholder, and UPDATEing them in place fails while
+    # rows sit in the streaming buffer. COALESCE picks the mapped name when
+    # one exists for that day (webhook-primary SDK lookups land here too),
+    # falling back to whatever the event stored.
     events_q = f"""
     SELECT
       {norm_pn} AS participant_key,
@@ -385,11 +394,21 @@ def build_presence_intervals(date_str):
         STRUCT(
           CAST(pe.event_timestamp AS TIMESTAMP) AS ts,
           pe.event_type AS et,
-          pe.room_name AS room
+          COALESCE(rm.mapped_name, pe.room_name) AS room
         )
         ORDER BY pe.event_timestamp
       ) AS events
     FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+    LEFT JOIN (
+      SELECT room_uuid,
+             ARRAY_AGG(room_name ORDER BY mapped_at DESC LIMIT 1)[OFFSET(0)] AS mapped_name
+      FROM `{dataset_ref}.{BQ_MAPPINGS_TABLE}`
+      WHERE CAST(mapping_date AS STRING) = CAST(@date AS STRING)
+        AND room_uuid IS NOT NULL AND room_uuid != ''
+        AND room_name IS NOT NULL AND room_name != ''
+        AND room_name NOT LIKE 'Room-%'
+      GROUP BY room_uuid
+    ) rm ON pe.room_uuid = rm.room_uuid
     WHERE pe.event_date = @date
       AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
       AND LOWER(pe.participant_name) NOT LIKE '%scout%'
@@ -1230,5 +1249,408 @@ def _auto_build_dates_in_range(start_date, end_date, max_builds=15, force=False)
     # is honest: never-built dates and stale-but-built dates beyond the cap.
     still_missing = max(0, len(missing) + len(outdated) - max_builds)
     return built, still_missing
+
+
+# ============================================================================
+# PURE-BQ-SQL INTERVAL BUILDER (webhook-primary, 2026-07-20)
+# ============================================================================
+# Replicates the webhook-timeline logic of build_presence_intervals (Step 5 +
+# identity map + midnight/early-morning filters) entirely INSIDE BigQuery:
+# the state machine runs as a JavaScript UDF in the query engine, so no event
+# data flows through Python. Output goes to a SEPARATE table
+# (presence_intervals_sql) for side-by-side comparison - production reports
+# keep reading presence_intervals until the numbers are verified equal.
+#
+# Deliberate scope: webhook events ONLY (the webhook-primary future). On days
+# where the bot also produced snapshots, snapshot participants' hours WILL
+# differ from the Python table (which prefers snapshots) - the compare
+# endpoint flags those rows with had_bot_data=TRUE.
+
+PRESENCE_INTERVALS_SQL_TABLE = 'presence_intervals_sql'
+
+
+def _validate_date(date_str):
+    import re as _re_mod
+    if not _re_mod.match(r'^\d{4}-\d{2}-\d{2}$', str(date_str or '')):
+        raise ValueError(f"invalid date: {date_str!r} (expected YYYY-MM-DD)")
+    return str(date_str)
+
+
+# The JS body is a plain (non-f) string: it is full of braces and must reach
+# BigQuery verbatim. Constants mirror the Python builder's defaults.
+_BUILD_INTERVALS_JS = r"""
+var COALESCE_GAP_MS = 30 * 1000;        // COALESCE_GAP_S
+var SEG_MIN_MS      = 60 * 1000;        // WEBHOOK_SEGMENT_MIN_SECONDS
+var SEG_CAP_MS      = 600 * 60 * 1000;  // MAIN_ROOM_SYNTH_CAP_MINUTES
+var NO_LEAVE_CAP_MS = 240 * 60 * 1000;  // WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES
+
+if (!events || events.length === 0) return [];
+events = events.slice().sort(function(a, b) { return a.ts - b.ts; });
+
+var JOINS = ['participant_joined', 'meeting.participant_joined'];
+var LEFTS = ['participant_left', 'meeting.participant_left'];
+
+var brk = events.filter(function(e) {
+  return e.et === 'breakout_room_joined' || e.et === 'breakout_room_left';
+});
+
+// ---- presence windows (= _build_presence_windows) ----
+var raw = [];
+var cur = null;
+events.forEach(function(e) {
+  if (JOINS.indexOf(e.et) >= 0) {
+    if (cur === null) cur = e.ts;
+  } else if (LEFTS.indexOf(e.et) >= 0) {
+    if (cur !== null) { raw.push([cur, e.ts]); cur = null; }
+  }
+});
+if (cur !== null) raw.push([cur, null]);
+
+var windows = [];
+raw.forEach(function(w) {
+  if (windows.length > 0) {
+    var prev = windows[windows.length - 1];
+    if (prev[1] !== null && w[0] !== null && (w[0] - prev[1]) < COALESCE_GAP_MS) {
+      prev[1] = w[1];   // micro-disconnect: merge into previous window
+      return;
+    }
+  }
+  windows.push([w[0], w[1]]);
+});
+
+// ---- fallbacks when no join/leave pairs exist (= Step 5 head) ----
+if (windows.length === 0) {
+  var joinTs = null, leftTs = null;
+  events.forEach(function(e) {
+    if (JOINS.indexOf(e.et) >= 0 && (joinTs === null || e.ts < joinTs)) joinTs = e.ts;
+    if (LEFTS.indexOf(e.et) >= 0 && (leftTs === null || e.ts > leftTs)) leftTs = e.ts;
+  });
+  if (joinTs !== null) {
+    if (joinTs >= day_start && joinTs < day_end) {
+      if (joinTs < early_cutoff) return [];   // midnight-crossing continuation
+      windows.push([joinTs, leftTs]);
+    } else { return []; }
+  } else if (brk.length > 0) {
+    var first = brk[0].ts;
+    if (first >= day_start && first < day_end) {
+      if (first < early_cutoff) return [];
+      windows.push([first, null]);
+    } else { return []; }
+  } else { return []; }
+}
+
+function classify(room) {
+  if (!room) return 'breakout';
+  var n = room.trim().toLowerCase();
+  if (n.indexOf('break time') >= 0) return 'break';
+  if (n === 'main room' || n.indexOf('0.main') === 0) return 'main';
+  return 'breakout';
+}
+
+var out = [];
+function emit(room, s, e, noLeave) {
+  var ms = e - s;
+  if (ms < SEG_MIN_MS) return;
+  if (ms > SEG_CAP_MS) ms = SEG_CAP_MS;
+  var cat = classify(room);
+  var s_ms = (s.getTime ? s.getTime() : s);
+  out.push({
+    room_name: cat === 'main' ? '0.Main Room' : room,
+    room_category: cat,
+    source: cat === 'main' ? 'webhook_fill' : 'webhook_room',
+    confidence: noLeave ? 0.35 : 0.5,
+    start_ts: new Date(s_ms),
+    end_ts: new Date(s_ms + ms)
+  });
+}
+
+windows.forEach(function(w) {
+  var wStart = w[0], wLeave = w[1];
+  if (wStart === null) return;
+
+  // midnight-crossing: window started before this IST day
+  if (wStart < day_start) {
+    if (wLeave !== null && wLeave > day_start) { wStart = day_start; } else { return; }
+  }
+  // early-morning filter: before 08:00 IST = yesterday's meeting continuing
+  if (wStart < early_cutoff) {
+    if (wLeave !== null && wLeave > early_cutoff) { wStart = early_cutoff; } else { return; }
+  }
+
+  var noLeave = (wLeave === null);
+  var wEnd = (wLeave !== null) ? wLeave : monitoring_end;
+  if (wEnd === null || wEnd === undefined) return;
+  if (monitoring_end !== null && wEnd > monitoring_end) wEnd = monitoring_end;
+  if (noLeave && (wEnd - wStart) > NO_LEAVE_CAP_MS) {
+    wEnd = new Date(wStart.getTime() + NO_LEAVE_CAP_MS);
+  }
+  if (wEnd <= wStart) return;
+
+  // ---- tile the window (= _tile_window_with_rooms) ----
+  var curRoom = 'Main Room';
+  var segStart = wStart;
+  var prevEt = null, prevRoom = null, prevTs = null;
+  var tiles = [];
+  brk.forEach(function(e) {
+    var ts = e.ts;
+    if (ts < wStart || ts > wEnd) return;
+    // Zoom double-send: identical event repeated < 5s apart
+    if (prevEt === e.et && (prevRoom || '') === (e.room || '') &&
+        prevTs !== null && (ts - prevTs) < 5000) return;
+    prevEt = e.et; prevRoom = e.room; prevTs = ts;
+    if (e.et === 'breakout_room_joined') {
+      var newRoom = e.room || 'Unknown Room';
+      if (newRoom === curRoom) return;
+      tiles.push([curRoom, segStart, ts]);
+      curRoom = newRoom; segStart = ts;
+    } else {
+      if (curRoom === 'Main Room') return;   // stray left: join was missed
+      tiles.push([curRoom, segStart, ts]);
+      curRoom = 'Main Room'; segStart = ts;
+    }
+  });
+  tiles.push([curRoom, segStart, wEnd]);
+  tiles.forEach(function(t) { if (t[2] > t[1]) emit(t[0], t[1], t[2], noLeave); });
+});
+
+return out;
+"""
+
+
+def build_presence_intervals_sql(date_str):
+    """Build presence intervals for one IST date ENTIRELY in BigQuery,
+    writing to presence_intervals_sql. Returns dict with counts + timing."""
+    started = time.time()
+    date_str = _validate_date(date_str)
+    client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+    norm_pn = _sql_normalize_name('pe.participant_name')
+    norm_sn = _sql_normalize_name('s.participant_name')
+
+    # date_str is regex-validated above, safe to inline as a DATE literal.
+    # (Inline literal because multi-statement scripts + query params are
+    # brittle; the regex makes injection impossible.)
+    d = f"DATE '{date_str}'"
+    day_start = f"TIMESTAMP_SUB(TIMESTAMP({d}), INTERVAL {IST_OFFSET_MINUTES} MINUTE)"
+
+    js_quote = '"""'
+    script = f"""
+    CREATE TEMP FUNCTION build_intervals(
+        events ARRAY<STRUCT<ts TIMESTAMP, et STRING, room STRING>>,
+        monitoring_end TIMESTAMP,
+        day_start TIMESTAMP,
+        day_end TIMESTAMP,
+        early_cutoff TIMESTAMP)
+    RETURNS ARRAY<STRUCT<room_name STRING, room_category STRING,
+                         source STRING, confidence FLOAT64,
+                         start_ts TIMESTAMP, end_ts TIMESTAMP>>
+    LANGUAGE js AS r{js_quote}{_BUILD_INTERVALS_JS}{js_quote};
+
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{PRESENCE_INTERVALS_SQL_TABLE}` (
+        interval_id        STRING NOT NULL,
+        event_date         DATE   NOT NULL,
+        meeting_id         STRING,
+        meeting_uuid       STRING,
+        participant_key    STRING NOT NULL,
+        participant_name   STRING,
+        participant_email  STRING,
+        room_name          STRING,
+        room_category      STRING,
+        start_ts           TIMESTAMP NOT NULL,
+        end_ts             TIMESTAMP NOT NULL,
+        duration_seconds   INT64,
+        alone_seconds      INT64,
+        snapshot_count     INT64,
+        source             STRING,
+        confidence         FLOAT64,
+        built_at           TIMESTAMP
+    )
+    PARTITION BY event_date
+    CLUSTER BY meeting_id, participant_key;
+
+    DELETE FROM `{dataset_ref}.{PRESENCE_INTERVALS_SQL_TABLE}`
+    WHERE event_date = {d};
+
+    INSERT INTO `{dataset_ref}.{PRESENCE_INTERVALS_SQL_TABLE}`
+        (interval_id, event_date, meeting_id, meeting_uuid, participant_key,
+         participant_name, participant_email, room_name, room_category,
+         start_ts, end_ts, duration_seconds, alone_seconds, snapshot_count,
+         source, confidence, built_at)
+    WITH base AS (
+      SELECT
+        {norm_pn} AS name_key,
+        pe.participant_name,
+        pe.participant_email,
+        -- meeting_id is INT64 in participant_events_p (same quirk that bit
+        -- load_mappings_from_bigquery on 2026-07-17) — target column is STRING
+        CAST(pe.meeting_id AS STRING) AS meeting_id,
+        CAST(pe.event_timestamp AS TIMESTAMP) AS ts,
+        pe.event_type AS et,
+        COALESCE(rm.mapped_name, pe.room_name) AS room
+      FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
+      LEFT JOIN (
+        SELECT room_uuid,
+               ARRAY_AGG(room_name ORDER BY mapped_at DESC LIMIT 1)[OFFSET(0)] AS mapped_name
+        FROM `{dataset_ref}.{BQ_MAPPINGS_TABLE}`
+        WHERE CAST(mapping_date AS STRING) = CAST({d} AS STRING)
+          AND room_uuid IS NOT NULL AND room_uuid != ''
+          AND room_name IS NOT NULL AND room_name != ''
+          AND room_name NOT LIKE 'Room-%'
+        GROUP BY room_uuid
+      ) rm ON pe.room_uuid = rm.room_uuid
+      WHERE pe.event_date = {d}
+        AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
+        AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+        AND pe.event_type IN ('participant_joined','participant_left',
+                              'meeting.participant_joined','meeting.participant_left',
+                              'breakout_room_joined','breakout_room_left')
+    ),
+    -- day-scoped name->email identity map (same rule as the Python builder:
+    -- a name maps to an email only when it maps to EXACTLY ONE email that
+    -- day, pairs drawn from both webhooks and bot snapshots)
+    ident_pairs AS (
+      SELECT DISTINCT name_key, LOWER(TRIM(participant_email)) AS email
+      FROM base
+      WHERE participant_email IS NOT NULL AND TRIM(participant_email) != ''
+      UNION DISTINCT
+      SELECT DISTINCT {norm_sn} AS name_key, LOWER(TRIM(s.participant_email)) AS email
+      FROM `{dataset_ref}.room_snapshots_v2` s
+      WHERE s.event_date = {d}
+        AND s.participant_name IS NOT NULL AND s.participant_name != ''
+        AND s.participant_email IS NOT NULL AND TRIM(s.participant_email) != ''
+        AND LOWER(s.participant_name) NOT LIKE '%scout%'
+    ),
+    ident AS (
+      -- alias is mapped_email, NOT email: HAVING COUNT(DISTINCT email) with
+      -- an aggregate alias named email trips BigQuery (2026-07-16 incident)
+      SELECT name_key, ANY_VALUE(email) AS mapped_email
+      FROM ident_pairs
+      GROUP BY name_key
+      HAVING COUNT(DISTINCT email) = 1
+    ),
+    participants AS (
+      SELECT
+        COALESCE(i.mapped_email, b.name_key) AS participant_key,
+        ANY_VALUE(b.participant_name) AS participant_name,
+        ANY_VALUE(NULLIF(TRIM(COALESCE(b.participant_email, '')), '')) AS participant_email,
+        ANY_VALUE(NULLIF(COALESCE(b.meeting_id, ''), '')) AS meeting_id,
+        ARRAY_AGG(STRUCT(b.ts AS ts, b.et AS et, b.room AS room) ORDER BY b.ts) AS events
+      FROM base b
+      LEFT JOIN ident i ON b.name_key = i.name_key
+      GROUP BY participant_key
+    ),
+    -- capture end = last leave webhook of the day (Step 2c, no-snapshot day)
+    mon AS (
+      SELECT MAX(ts) AS monitoring_end
+      FROM base
+      WHERE et IN ('participant_left', 'meeting.participant_left')
+    )
+    SELECT
+      GENERATE_UUID(),
+      {d},
+      p.meeting_id,
+      CAST(NULL AS STRING),
+      p.participant_key,
+      p.participant_name,
+      p.participant_email,
+      t.room_name,
+      t.room_category,
+      t.start_ts,
+      t.end_ts,
+      TIMESTAMP_DIFF(t.end_ts, t.start_ts, SECOND),
+      0,
+      0,
+      t.source,
+      t.confidence,
+      CURRENT_TIMESTAMP()
+    FROM participants p
+    CROSS JOIN mon
+    CROSS JOIN UNNEST(build_intervals(
+        p.events,
+        mon.monitoring_end,
+        {day_start},
+        TIMESTAMP_ADD({day_start}, INTERVAL 24 HOUR),
+        TIMESTAMP_ADD({day_start}, INTERVAL 8 HOUR)
+    )) AS t;
+    """
+    client.query(script).result()
+
+    stats = list(client.query(f"""
+        SELECT COUNT(*) AS n_rows,
+               COUNT(DISTINCT participant_key) AS n_participants,
+               ROUND(SUM(duration_seconds) / 3600, 1) AS total_hours
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_SQL_TABLE}`
+        WHERE event_date = {d}
+    """).result())[0]
+
+    return {
+        'date': date_str,
+        'table': PRESENCE_INTERVALS_SQL_TABLE,
+        'rows': stats.n_rows,
+        'participants': stats.n_participants,
+        'total_hours': float(stats.total_hours or 0),
+        'seconds': round(time.time() - started, 1),
+    }
+
+
+def compare_sql_vs_python(date_str, top_n=20):
+    """Per-participant daily totals: presence_intervals_sql vs
+    presence_intervals. had_bot_data=TRUE rows are EXPECTED to differ while
+    the snapshot pipeline still runs (Python prefers bot data there)."""
+    date_str = _validate_date(date_str)
+    client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+    q = f"""
+    WITH s AS (
+      SELECT participant_key, ANY_VALUE(participant_name) AS name,
+             SUM(duration_seconds) / 3600 AS hrs
+      FROM `{dataset_ref}.{PRESENCE_INTERVALS_SQL_TABLE}`
+      WHERE event_date = @d
+      GROUP BY participant_key
+    ),
+    p AS (
+      SELECT participant_key, ANY_VALUE(participant_name) AS name,
+             SUM(duration_seconds) / 3600 AS hrs,
+             LOGICAL_OR(source = 'snapshot') AS had_bot
+      FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+      WHERE event_date = @d
+      GROUP BY participant_key
+    )
+    SELECT participant_key,
+           COALESCE(s.name, p.name) AS participant_name,
+           ROUND(IFNULL(s.hrs, 0), 2) AS sql_hours,
+           ROUND(IFNULL(p.hrs, 0), 2) AS python_hours,
+           ROUND(IFNULL(s.hrs, 0) - IFNULL(p.hrs, 0), 2) AS diff_hours,
+           IFNULL(p.had_bot, FALSE) AS had_bot_data
+    FROM s
+    FULL OUTER JOIN p USING (participant_key)
+    ORDER BY ABS(IFNULL(s.hrs, 0) - IFNULL(p.hrs, 0)) DESC
+    """
+    rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", date_str)]
+    )).result())
+
+    all_rows = [{
+        'participant_key': r.participant_key,
+        'participant_name': r.participant_name,
+        'sql_hours': float(r.sql_hours),
+        'python_hours': float(r.python_hours),
+        'diff_hours': float(r.diff_hours),
+        'had_bot_data': bool(r.had_bot_data),
+    } for r in rows]
+
+    webhook_only = [r for r in all_rows if not r['had_bot_data']]
+    matched = [r for r in webhook_only if abs(r['diff_hours']) <= 0.1]
+    return {
+        'date': date_str,
+        'participants_total': len(all_rows),
+        'webhook_only_participants': len(webhook_only),
+        'webhook_only_matched_within_6min': len(matched),
+        'webhook_only_mismatched': len(webhook_only) - len(matched),
+        'note': ('had_bot_data=TRUE rows are EXPECTED to differ: the Python '
+                 'builder uses bot snapshots for them, the SQL builder is '
+                 'webhook-only by design. Judge parity on webhook-only rows.'),
+        'top_differences': all_rows[:top_n],
+    }
 
 
