@@ -399,6 +399,12 @@ class MeetingState:
         # /mapping/sync retries any in-memory mapping not in this set, so a
         # failed BQ insert self-heals on the next sync instead of being lost.
         self.persisted_webhook_uuids = set()
+        # Correction ledger + dispute freeze (anti ping-pong, 2026-07-21):
+        # last_uuid_corrections: uuid -> {'old','new','ts'}; if a later
+        # correction proposes REVERSING a recent one, the uuid goes into
+        # mapping_disputes and is frozen for the day (logged DISPUTED).
+        self.last_uuid_corrections = {}
+        self.mapping_disputes = {}
         # Where each participant is RIGHT NOW according to webhooks:
         # 'e:<email>' / 'n:<normalized name>' -> {'room_uuid', 'ts', 'meeting_uuid'}.
         # Lets /mapping/sync resolve unknown uuids from CURRENT state (SDK says
@@ -5163,8 +5169,17 @@ def mapping_sync():
                     # STABILITY GUARD: only trust a position webhooks have
                     # shown stable for 2+ min — mapping someone mid-hop is how
                     # wrong labels get saved (UEWhtBkXN92Q case, 2026-07-21).
+                    # FRESHNESS CAP: ignore positions older than 30 min — a
+                    # participant whose move-webhook was never delivered keeps
+                    # a permanently-stale entry and would fight corrections
+                    # forever (1.1<->8.0 ping-pong observed on a single
+                    # worker, 2026-07-21 evening).
                     MAPPING_STABLE_MIN_S = 120
+                    MAPPING_FRESH_MAX_S = 1800
                     now_ts = time.time()
+                    with meeting_state._lock:
+                        disputes = dict(meeting_state.mapping_disputes)
+                        prior_corrections = dict(meeting_state.last_uuid_corrections)
                     claims = {}       # unknown uuid -> claimed room names
                     corrections = {}  # mapped uuid that DISAGREES -> claims
                     for (kind, ident), rname in room_by_person.items():
@@ -5179,12 +5194,15 @@ def mapping_sync():
                         if (current_instance and entry.get('meeting_uuid')
                                 and entry['meeting_uuid'] != current_instance):
                             continue
-                        if (now_ts - (entry.get('ts') or 0)) < MAPPING_STABLE_MIN_S:
+                        age_s = now_ts - (entry.get('ts') or 0)
+                        if age_s < MAPPING_STABLE_MIN_S or age_s > MAPPING_FRESH_MAX_S:
                             continue
                         current = (uuid_names.get(wu) or '').strip()
                         if not current:
                             claims.setdefault(wu, set()).add(rname)
                         elif current != rname.strip():
+                            if wu in disputes:
+                                continue  # frozen for the day (see below)
                             # VERIFY-AND-CORRECT: existing mapping contradicts
                             # what the SDK sees for a stable participant.
                             corrections.setdefault(wu, set()).add(rname)
@@ -5209,6 +5227,19 @@ def mapping_sync():
                             continue
                         rname = next(iter(names))
                         old_name = uuid_names.get(wu)
+                        # ANTI PING-PONG: a correction that REVERSES a recent
+                        # one means two participants' webhook states disagree
+                        # about this uuid (one is stale). Truth is undecidable
+                        # automatically -> freeze the uuid for the day, keep
+                        # whichever name is currently saved, log DISPUTED.
+                        prior = prior_corrections.get(wu)
+                        if (prior and prior.get('old') == rname
+                                and now_ts - (prior.get('ts') or 0) < 3600):
+                            with meeting_state._lock:
+                                meeting_state.mapping_disputes[wu] = now_ts
+                            print(f"[mapping/sync] DISPUTED (frozen for today): {wu[:20]}... "
+                                  f"oscillating between '{rname}' and '{prior.get('new')}'")
+                            continue
                         # BQ first: memory is only corrected once the mapping
                         # row is durably fixed — otherwise the build-time JOIN
                         # (which prefers room_mappings) would keep re-applying
@@ -5218,6 +5249,8 @@ def mapping_sync():
                             meeting_state.add_webhook_room_mapping(wu, rname)
                             with meeting_state._lock:
                                 meeting_state.persisted_webhook_uuids.add(wu)
+                                meeting_state.last_uuid_corrections[wu] = {
+                                    'old': old_name, 'new': rname, 'ts': now_ts}
                             state_corrected += 1
                             print(f"[mapping/sync] CORRECTED: {wu[:20]}... "
                                   f"'{old_name}' -> '{rname}'")
