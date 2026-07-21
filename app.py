@@ -5426,7 +5426,12 @@ def mapping_health():
           (SELECT COUNT(DISTINCT room_uuid)
            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}`
            WHERE event_date = '{today}'
-             AND room_name LIKE 'Room-%') AS unresolved_rooms
+             AND room_name LIKE 'Room-%'
+             AND room_uuid NOT IN (
+               SELECT room_uuid
+               FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+               WHERE CAST(mapping_date AS STRING) = '{today}'
+             )) AS unresolved_rooms
         """
         row = list(client.query(q).result())[0]
         mappings_today = int(row.mappings_today or 0)
