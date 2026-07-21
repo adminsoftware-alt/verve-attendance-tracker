@@ -5100,161 +5100,159 @@ def mapping_sync():
                         remaining.append(req)
                 meeting_state.pending_mapping_requests = remaining
 
-        # BQ writes happen OUTSIDE the lock (insert_room_mappings runs queries)
+        # Memory updates happen HERE (instant — webhooks resolve names right
+        # away). ALL BigQuery persistence runs in a background thread: the
+        # first sync after a restart does a ~50-mapping warm-up backfill
+        # (sequential BQ checks, ~1s each) which blew past the panel's 15s
+        # request timeout when done inline (seen live 2026-07-21).
         today = get_ist_date()
         for req, rname in matched:
             meeting_state.add_webhook_room_mapping(req['webhook_uuid'], rname)
-            saved = insert_room_mappings([{
-                'mapping_id': str(uuid_lib.uuid4()),
-                'meeting_id': str(req.get('meeting_id') or meeting_id or ''),
-                'meeting_uuid': meeting_state.meeting_uuid or '',
-                'room_uuid': req['webhook_uuid'],
-                'room_name': rname,
-                'room_index': -1,
-                'mapping_date': today,
-                'mapped_at': datetime.utcnow().isoformat(),
-                'source': 'webhook_primary_sdk_lookup'
-            }])
-            if saved:
-                with meeting_state._lock:
-                    meeting_state.persisted_webhook_uuids.add(req['webhook_uuid'])
             print(f"[mapping/sync] Resolved from sync payload: {req['webhook_uuid'][:20]}... -> {rname}")
 
-        # STATE RESOLUTION (2026-07-21): map every occupied room in ONE sync by
-        # cross-matching CURRENT positions — SDK payload says "person P is in
-        # room R now", webhook state says "P is in uuid U now" => U = R.
-        # Unlike the pending-request queue (10-min TTL, needs a join to happen
-        # while the bot is online), this works no matter when the bot comes
-        # online — enabling short daily bot sessions instead of a 24/7 VM.
-        # A uuid claimed for two DIFFERENT rooms (someone mid-move / stale
-        # entry) is skipped this round; next sync settles it.
-        # REVERT: set SYNC_STATE_RESOLUTION_ENABLED = False (defined above
-        # _queue_mapping_request) to go back to pending-request-only mapping.
-        state_resolved = 0
-        state_corrected = 0
-        if SYNC_STATE_RESOLUTION_ENABLED and room_by_person:
-            # STABILITY GUARD: only trust a person's position if webhooks say
-            # they have been in that room for 2+ minutes. Mapping someone
-            # mid-hop is how wrong labels get saved (e.g. webhook says "X
-            # joined U" but by SDK-lookup time X hopped again -> U mapped to
-            # the wrong room, seen live on 2026-07-21 with UEWhtBkXN92Q...).
-            MAPPING_STABLE_MIN_S = 120
-            now_ts = time.time()
-            with meeting_state._lock:
-                bo_state = dict(meeting_state.participant_current_breakout)
-                uuid_names = dict(meeting_state.uuid_to_name)
-                current_instance = meeting_state.last_breakout_instance_uuid
-            claims = {}       # unknown uuid -> set of claimed room names
-            corrections = {}  # mapped uuid whose SDK room DISAGREES -> claims
-            for (kind, ident), rname in room_by_person.items():
-                entry = bo_state.get(kind + ':' + ident)
-                if not entry:
-                    continue
-                wu = entry.get('room_uuid')
-                if not wu:
-                    continue
-                # RESTART GUARD: ignore positions recorded under a previous
-                # meeting instance (meeting ended + restarted -> new rooms).
-                # A worker that missed the participant's rejoin would otherwise
-                # "correct" a dead room's mapping with a new room's name.
-                if (current_instance and entry.get('meeting_uuid')
-                        and entry['meeting_uuid'] != current_instance):
-                    continue
-                if (now_ts - (entry.get('ts') or 0)) < MAPPING_STABLE_MIN_S:
-                    continue  # person moved recently — not trustworthy yet
-                current = (uuid_names.get(wu) or '').strip()
-                if not current:
-                    claims.setdefault(wu, set()).add(rname)
-                elif current != rname.strip():
-                    # VERIFY-AND-CORRECT: existing mapping contradicts what the
-                    # SDK sees right now for a stable participant.
-                    corrections.setdefault(wu, set()).add(rname)
-
-            def _persist_mapping(wu, rname):
-                return insert_room_mappings([{
-                    'mapping_id': str(uuid_lib.uuid4()),
-                    'meeting_id': str(meeting_state.meeting_id or meeting_id or ''),
-                    'meeting_uuid': meeting_state.meeting_uuid or '',
-                    'room_uuid': wu,
-                    'room_name': rname,
-                    'room_index': -1,
-                    'mapping_date': today,
-                    'mapped_at': datetime.utcnow().isoformat(),
-                    'source': 'webhook_primary_sdk_lookup'
-                }])
-
-            for wu, names in claims.items():
-                if len(names) != 1:
-                    print(f"[mapping/sync] State-resolution SKIP {wu[:20]}...: "
-                          f"conflicting rooms {sorted(names)}")
-                    continue
-                rname = next(iter(names))
-                meeting_state.add_webhook_room_mapping(wu, rname)
-                saved = _persist_mapping(wu, rname)
-                if saved:
-                    with meeting_state._lock:
-                        meeting_state.persisted_webhook_uuids.add(wu)
-                state_resolved += 1
-                print(f"[mapping/sync] State-resolved: {wu[:20]}... -> {rname}")
-
-            for wu, names in corrections.items():
-                if len(names) != 1:
-                    print(f"[mapping/sync] Correction SKIP {wu[:20]}...: "
-                          f"conflicting rooms {sorted(names)}")
-                    continue
-                rname = next(iter(names))
-                old_name = uuid_names.get(wu)
-                # BQ first: memory is only corrected once the mapping row is
-                # durably fixed — otherwise the build-time JOIN (which prefers
-                # room_mappings) would keep re-applying the stale name while
-                # memory stopped flagging the mismatch. If the UPDATE fails
-                # (e.g. row still in streaming buffer), we retry every sync.
-                saved = _persist_mapping(wu, rname)
-                if saved:
-                    meeting_state.add_webhook_room_mapping(wu, rname)
-                    with meeting_state._lock:
-                        meeting_state.persisted_webhook_uuids.add(wu)
-                    state_corrected += 1
-                    print(f"[mapping/sync] CORRECTED: {wu[:20]}... "
-                          f"'{old_name}' -> '{rname}'")
-                else:
-                    print(f"[mapping/sync] Correction PENDING {wu[:20]}... "
-                          f"'{old_name}' -> '{rname}' (BQ save failed, retrying next sync)")
-
-        # BACKFILL: persist any in-memory webhook-uuid mapping not yet confirmed
-        # in BQ. Covers mappings resolved while inserts were failing, and ones a
-        # webhook answered from memory (no pending request -> /mapping/resolve
-        # never fires again for that uuid). Retries automatically every sync
-        # until the insert succeeds. Skips 'sdk:'-prefixed and 8-char short keys.
+        # Snapshot state now; the thread works off this consistent copy.
         with meeting_state._lock:
-            unpersisted = [
-                (u, n) for u, n in meeting_state.uuid_to_name.items()
-                if len(u) > 8 and not u.startswith('sdk:')
-                and u not in meeting_state.persisted_webhook_uuids
-            ]
-        backfilled = 0
-        for wu, rname in unpersisted:
-            saved = insert_room_mappings([{
-                'mapping_id': str(uuid_lib.uuid4()),
-                'meeting_id': str(meeting_state.meeting_id or meeting_id or ''),
-                'meeting_uuid': meeting_state.meeting_uuid or '',
-                'room_uuid': wu,
-                'room_name': rname,
-                'room_index': -1,
-                'mapping_date': today,
-                'mapped_at': datetime.utcnow().isoformat(),
-                'source': 'webhook_primary_sdk_lookup'
-            }])
-            if saved:
+            bo_state = dict(meeting_state.participant_current_breakout)
+            uuid_names = dict(meeting_state.uuid_to_name)
+            current_instance = meeting_state.last_breakout_instance_uuid
+
+        def _persist_sync_bq():
+            state_resolved = 0
+            state_corrected = 0
+            try:
+                def _persist_mapping(wu, rname):
+                    return insert_room_mappings([{
+                        'mapping_id': str(uuid_lib.uuid4()),
+                        'meeting_id': str(meeting_state.meeting_id or meeting_id or ''),
+                        'meeting_uuid': meeting_state.meeting_uuid or '',
+                        'room_uuid': wu,
+                        'room_name': rname,
+                        'room_index': -1,
+                        'mapping_date': today,
+                        'mapped_at': datetime.utcnow().isoformat(),
+                        'source': 'webhook_primary_sdk_lookup'
+                    }])
+
+                # 1) Persist pending-request matches (memory already updated)
+                for req, rname in matched:
+                    if _persist_mapping(req['webhook_uuid'], rname):
+                        with meeting_state._lock:
+                            meeting_state.persisted_webhook_uuids.add(req['webhook_uuid'])
+
+                # 2) STATE RESOLUTION (2026-07-21): map every occupied room in
+                # ONE sync by cross-matching CURRENT positions — SDK payload
+                # says "person P is in room R now", webhook state says "P is in
+                # uuid U now" => U = R. Works no matter when the bot comes
+                # online — enables short daily panel sessions instead of a
+                # 24/7 VM. A uuid claimed for two DIFFERENT rooms is skipped
+                # this round; next sync settles it.
+                # REVERT: SYNC_STATE_RESOLUTION_ENABLED = False (defined above
+                # _queue_mapping_request).
+                if SYNC_STATE_RESOLUTION_ENABLED and room_by_person:
+                    # STABILITY GUARD: only trust a position webhooks have
+                    # shown stable for 2+ min — mapping someone mid-hop is how
+                    # wrong labels get saved (UEWhtBkXN92Q case, 2026-07-21).
+                    MAPPING_STABLE_MIN_S = 120
+                    now_ts = time.time()
+                    claims = {}       # unknown uuid -> claimed room names
+                    corrections = {}  # mapped uuid that DISAGREES -> claims
+                    for (kind, ident), rname in room_by_person.items():
+                        entry = bo_state.get(kind + ':' + ident)
+                        if not entry:
+                            continue
+                        wu = entry.get('room_uuid')
+                        if not wu:
+                            continue
+                        # RESTART GUARD: ignore positions recorded under a
+                        # previous meeting instance (meeting ended+restarted).
+                        if (current_instance and entry.get('meeting_uuid')
+                                and entry['meeting_uuid'] != current_instance):
+                            continue
+                        if (now_ts - (entry.get('ts') or 0)) < MAPPING_STABLE_MIN_S:
+                            continue
+                        current = (uuid_names.get(wu) or '').strip()
+                        if not current:
+                            claims.setdefault(wu, set()).add(rname)
+                        elif current != rname.strip():
+                            # VERIFY-AND-CORRECT: existing mapping contradicts
+                            # what the SDK sees for a stable participant.
+                            corrections.setdefault(wu, set()).add(rname)
+
+                    for wu, names in claims.items():
+                        if len(names) != 1:
+                            print(f"[mapping/sync] State-resolution SKIP {wu[:20]}...: "
+                                  f"conflicting rooms {sorted(names)}")
+                            continue
+                        rname = next(iter(names))
+                        meeting_state.add_webhook_room_mapping(wu, rname)
+                        if _persist_mapping(wu, rname):
+                            with meeting_state._lock:
+                                meeting_state.persisted_webhook_uuids.add(wu)
+                        state_resolved += 1
+                        print(f"[mapping/sync] State-resolved: {wu[:20]}... -> {rname}")
+
+                    for wu, names in corrections.items():
+                        if len(names) != 1:
+                            print(f"[mapping/sync] Correction SKIP {wu[:20]}...: "
+                                  f"conflicting rooms {sorted(names)}")
+                            continue
+                        rname = next(iter(names))
+                        old_name = uuid_names.get(wu)
+                        # BQ first: memory is only corrected once the mapping
+                        # row is durably fixed — otherwise the build-time JOIN
+                        # (which prefers room_mappings) would keep re-applying
+                        # the stale name. If the UPDATE fails (e.g. row still
+                        # in streaming buffer), we retry every sync.
+                        if _persist_mapping(wu, rname):
+                            meeting_state.add_webhook_room_mapping(wu, rname)
+                            with meeting_state._lock:
+                                meeting_state.persisted_webhook_uuids.add(wu)
+                            state_corrected += 1
+                            print(f"[mapping/sync] CORRECTED: {wu[:20]}... "
+                                  f"'{old_name}' -> '{rname}'")
+                        else:
+                            print(f"[mapping/sync] Correction PENDING {wu[:20]}... "
+                                  f"'{old_name}' -> '{rname}' (BQ save failed, retrying next sync)")
+
+                # 3) BACKFILL: persist any in-memory webhook-uuid mapping not
+                # yet confirmed in BQ. Retries every sync until saved.
                 with meeting_state._lock:
-                    meeting_state.persisted_webhook_uuids.add(wu)
-                backfilled += 1
-        if unpersisted:
-            print(f"[mapping/sync] Backfilled {backfilled}/{len(unpersisted)} in-memory mapping(s) to BigQuery")
+                    unpersisted = [
+                        (u, n) for u, n in meeting_state.uuid_to_name.items()
+                        if len(u) > 8 and not u.startswith('sdk:')
+                        and u not in meeting_state.persisted_webhook_uuids
+                    ]
+                backfilled = 0
+                for wu, rname in unpersisted:
+                    if _persist_mapping(wu, rname):
+                        with meeting_state._lock:
+                            meeting_state.persisted_webhook_uuids.add(wu)
+                        backfilled += 1
+                if unpersisted:
+                    print(f"[mapping/sync] Backfilled {backfilled}/{len(unpersisted)} in-memory mapping(s) to BigQuery")
+
+                if state_resolved or state_corrected:
+                    print(f"[mapping/sync] BQ persistence done: "
+                          f"{state_resolved} state-resolved, {state_corrected} corrected")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                with meeting_state._lock:
+                    meeting_state._mapping_bq_busy = False
+
+        # One persistence thread at a time per worker; a skipped round is
+        # harmless — the next sync (60s) re-snapshots and retries everything.
+        with meeting_state._lock:
+            busy = getattr(meeting_state, '_mapping_bq_busy', False)
+            if not busy:
+                meeting_state._mapping_bq_busy = True
+        if busy:
+            print("[mapping/sync] BQ persistence still running from a previous sync - skipped this round")
+        else:
+            threading.Thread(target=_persist_sync_bq, daemon=True).start()
 
         print(f"[mapping/sync] Synced {len(rooms)} rooms for meeting {meeting_id} "
-              f"({len(matched)} pending request(s) resolved, "
-              f"{state_resolved} state-resolved, {state_corrected} corrected)")
+              f"({len(matched)} pending request(s) resolved; BQ persistence in background)")
 
         return jsonify({
             'success': True,
