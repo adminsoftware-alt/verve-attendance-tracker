@@ -5100,6 +5100,17 @@ def mapping_sync():
                         remaining.append(req)
                 meeting_state.pending_mapping_requests = remaining
 
+        # DIAGNOSTIC: keep the raw payload so /mapping/last-sync can show
+        # exactly what the SDK claims (who is in which room) — used to verify
+        # whether getBreakoutRoomList reports ACTUAL positions or stale
+        # ASSIGNMENTS (ground-truth check, 2026-07-21).
+        with meeting_state._lock:
+            meeting_state.last_sync_payload = {
+                'received_at_utc': datetime.utcnow().isoformat(),
+                'meeting_id': meeting_id,
+                'rooms': rooms,
+            }
+
         # Memory updates happen HERE (instant — webhooks resolve names right
         # away). ALL BigQuery persistence runs in a background thread: the
         # first sync after a restart does a ~50-mapping warm-up backfill
@@ -5461,6 +5472,44 @@ def mapping_request():
             'request_id': request_entry['request_id']
         })
 
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/mapping/last-sync', methods=['GET'])
+def mapping_last_sync():
+    """
+    DIAGNOSTIC (2026-07-21): show the raw room->participants payload from the
+    panel's most recent /mapping/sync. Used to ground-truth whether the SDK
+    reports ACTUAL current positions or stale ASSIGNMENTS.
+
+    GET /mapping/last-sync            -> full payload
+    GET /mapping/last-sync?name=anj   -> only rooms containing that person
+    """
+    try:
+        with meeting_state._lock:
+            payload = getattr(meeting_state, 'last_sync_payload', None)
+        if not payload:
+            return jsonify({'success': True, 'message': 'No sync received yet on this worker (2 workers - retry once)'})
+        name_filter = (request.args.get('name') or '').strip().lower()
+        rooms = payload.get('rooms', [])
+        if name_filter:
+            rooms = [
+                {'room_name': r.get('room_name'),
+                 'participants': [p for p in (r.get('participants') or [])
+                                  if name_filter in (p.get('name') or '').lower()]}
+                for r in rooms
+                if any(name_filter in (p.get('name') or '').lower()
+                       for p in (r.get('participants') or []))
+            ]
+        return jsonify({
+            'success': True,
+            'received_at_utc': payload.get('received_at_utc'),
+            'meeting_id': payload.get('meeting_id'),
+            'room_count': len(payload.get('rooms', [])),
+            'rooms': rooms
+        })
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
