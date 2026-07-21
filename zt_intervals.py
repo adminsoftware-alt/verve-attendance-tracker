@@ -1505,6 +1505,13 @@ def build_presence_intervals_sql(date_str, target_table=None):
     PARTITION BY event_date
     CLUSTER BY meeting_id, participant_key;
 
+    -- Transaction makes DELETE+INSERT atomic: two overlapping builds used to
+    -- interleave (both DELETE old rows, both INSERT) => every interval
+    -- DUPLICATED in the UI (seen live 2026-07-21, scheduler + page-load
+    -- rebuild firing 10s apart). Now a concurrent run aborts with a
+    -- serialization error instead; the next 2-min tick rebuilds cleanly.
+    BEGIN TRANSACTION;
+
     DELETE FROM `{dataset_ref}.{out_table}`
     WHERE event_date = {d};
 
@@ -1609,6 +1616,8 @@ def build_presence_intervals_sql(date_str, target_table=None):
         TIMESTAMP_ADD({day_start}, INTERVAL 24 HOUR),
         TIMESTAMP_ADD({day_start}, INTERVAL 8 HOUR)
     )) AS t;
+
+    COMMIT TRANSACTION;
     """
     client.query(script).result()
 

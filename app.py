@@ -12811,6 +12811,14 @@ def intervals_rebuild():
             date_str = target.isoformat()
         else:
             date_str = validate_date_format(data.get('date'))
+        # Today goes through the process-wide guard so the 2-min scheduler and
+        # dashboard page-load rebuilds can't run two builds concurrently
+        # (overlapping DELETE+INSERT duplicated every interval, 2026-07-21).
+        if date_str == get_ist_date():
+            ran = _rebuild_today_guarded(date_str)
+            return jsonify({'success': True, 'date': date_str, 'built': ran,
+                            'skipped': not ran,
+                            'reason': None if ran else 'built recently (guard)'})
         result = build_presence_intervals(date_str)
         return jsonify({'success': True, **result})
     except ValueError as e:
