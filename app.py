@@ -5401,6 +5401,70 @@ def mapping_request():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/mapping/health', methods=['GET', 'POST'])
+def mapping_health():
+    """
+    Daily safety net for the HR-runs-the-panel workflow (no 24/7 bot).
+    Cloud Scheduler calls this around noon IST. If NO room mappings were
+    saved today, nobody has opened the Room Mapper app yet -> email an
+    alert so an HR opens it for 5 minutes. Hours are never at risk
+    (webhooks capture everything); only room LABELS stay placeholders
+    until someone runs the panel — mapping is retroactive for the day.
+
+    GET/POST /mapping/health           -> check + email if unhealthy
+    GET/POST /mapping/health?alert=false -> check only, never email
+    """
+    today = get_ist_date()
+    send_alert = (request.args.get('alert', 'true').lower() != 'false')
+    try:
+        client = get_bq_client()
+        q = f"""
+        SELECT
+          (SELECT COUNT(*)
+           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
+           WHERE CAST(mapping_date AS STRING) = '{today}') AS mappings_today,
+          (SELECT COUNT(DISTINCT room_uuid)
+           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}`
+           WHERE event_date = '{today}'
+             AND room_name LIKE 'Room-%') AS unresolved_rooms
+        """
+        row = list(client.query(q).result())[0]
+        mappings_today = int(row.mappings_today or 0)
+        unresolved_rooms = int(row.unresolved_rooms or 0)
+        healthy = mappings_today > 0
+
+        alerted = False
+        if not healthy and send_alert:
+            html = (
+                f"<h3>Zoom Tracker: no room mappings saved today ({today})</h3>"
+                f"<p>Nobody has opened the <b>Room Mapper</b> Zoom app yet today, "
+                f"so {unresolved_rooms} room(s) are still showing as "
+                f"placeholder names (Room-xxxxxxxx) in reports.</p>"
+                f"<p><b>Attendance hours are NOT affected</b> — webhooks track "
+                f"everything. Only the room names need mapping.</p>"
+                f"<p><b>Fix (5 minutes, any co-host):</b> in the Zoom meeting, "
+                f"open Apps &rarr; Room Mapper, wait ~2 minutes until the log "
+                f"shows rooms synced, then close it. This retroactively fixes "
+                f"the whole day.</p>"
+            )
+            result = send_email_alert(
+                f"[Zoom Tracker] Room Mapper not run today ({today})", html)
+            alerted = bool(result.get('success'))
+
+        return jsonify({
+            'success': True,
+            'date': today,
+            'healthy': healthy,
+            'mappings_today': mappings_today,
+            'unresolved_placeholder_rooms': unresolved_rooms,
+            'alert_sent': alerted
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 def _update_events_with_room_name(webhook_uuid, room_name, event_date):
     """
     Update participant_events that have Room-XXXXX placeholder with actual room name.
