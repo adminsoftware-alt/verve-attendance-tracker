@@ -1,10 +1,15 @@
 # Zoom Breakout Room Tracker
 
 A production system for tracking participant attendance in Zoom meetings and breakout
-rooms. Deployed on Google Cloud Run with BigQuery storage. The Zoom SDK app polls every
-30 seconds to capture who is in which room; Zoom webhooks provide a second independent
-event stream; a background pipeline merges both into `presence_intervals` — the single
-source of truth every report reads from.
+rooms. Deployed on Google Cloud Run with BigQuery storage.
+
+**Since 2026-07-20 the system is webhook-primary:** Zoom webhooks (exact-to-the-second
+join/leave events) are the primary attendance source; the Zoom SDK app is only used to
+map webhook room UUIDs to human room names — the Scout Bot sits idle, it no longer
+polls every 30s or moves between rooms. Hours can be computed entirely inside BigQuery
+(`/intervals/build-sql`, JS-UDF state machine) into `presence_intervals_sql`, verified
+side-by-side against the legacy Python builder that still populates
+`presence_intervals` — the single source of truth every report reads from.
 
 ---
 
@@ -40,20 +45,21 @@ No credentials are stored in this repo.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              Scout Bot VM (GCP, Windows, scout-bot-2)            │
-│   Zoom Desktop client + SDK monitoring app                       │
-│   Joins the meeting; the in-client Zoom App polls rooms /30s     │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │ POST /monitor/snapshot (every 30s)
-                            ▼
+│                          ZOOM MEETING                            │
+│  Participants + Scout Bot (IDLE — sits in any room, never moves) │
+│  Bot's Zoom App = Room Mapper panel (RoomMapperPanel.jsx)        │
+└──────────┬───────────────────────────────┬──────────────────────┘
+           │ webhooks (PRIMARY:            │ SDK, on demand only:
+           │ exact join/leave timestamps)  │ room UUID → room NAME
+           ▼                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                Cloud Run (verve-attendance-tracker)              │
 │                                                                  │
 │  attendance-frontend        breakout-room-calibrator             │
 │  (React + Vite)             (Flask, app.py + zt_* modules)       │
-│  - Login (12h HMAC token)   - /webhook   (Zoom-signed events)    │
-│  - Team/Day/Month views     - /monitor/* (SDK snapshots)         │
-│  - CSV / Excel exports      - /intervals/* (presence builder)    │
+│  - Login (12h HMAC token)   - /webhook    (Zoom-signed events)   │
+│  - Team/Day/Month views     - /mapping/*  (room-name resolution) │
+│  - CSV / Excel exports      - /intervals/* (presence builders)   │
 │                             - /teams/* /employees/* (reports)    │
 │                             - /auth/*  (token issue/verify)      │
 └──────────────┬──────────────────────────────────────────────────┘
@@ -61,16 +67,21 @@ No credentials are stored in this repo.
                ▼                    │ every 2 min / 15 min (Cloud Scheduler)
 ┌──────────────────────────┐        │
 │        BigQuery          │────────┘
-│ room_snapshots_v2 (bot)  │
-│ participant_events_p     │   Both partitioned by date. Merged by
-│  (webhooks)              │   build_presence_intervals() into:
+│ participant_events_p     │  PRIMARY (webhooks, exact times)
+│ room_mappings            │  webhook room UUID → name (SDK lookups)
+│ room_snapshots_v2        │  legacy bot polling (kept for rollback)
 │ presence_intervals ──────┼─► single source of truth for ALL hours
+│ presence_intervals_sql   │  pure-BQ builder output (verification)
 └──────────────────────────┘
 ```
 
-**Data flow:** bot snapshots are primary; webhook events fill gaps (bot off / crashed
-→ hours are estimated and flagged ⚠ in the UI). People are identified by email when
-known, display name otherwise.
+**Data flow (webhook-primary since 2026-07-20):** every join/leave/breakout event is
+stored with its exact timestamp. When a webhook carries an unknown room UUID, the
+event is stored with a `Room-xxxxxxxx` placeholder and a mapping request is queued;
+the idle bot's Room Mapper panel resolves it via one SDK lookup ("which room is this
+person in?") and the name lands in `room_mappings`. Placeholder names are resolved at
+build time via a `room_mappings` JOIN — reports always show real room names. People
+are identified by email when known, display name otherwise.
 
 ---
 
@@ -90,7 +101,8 @@ verve-attendance-tracker/
 ├── cloudbuild.yaml           # Auto-deploy on push to main
 ├── CLAUDE.md                 # Claude Code instructions (the deep reference)
 ├── docs/                     # Change logs (see CHANGES-2026-07-16.md)
-├── breakout-calibrator/      # React Zoom App (SDK monitoring) — served at /app
+├── breakout-calibrator/      # React Zoom App — served at /app; RoomMapperPanel (active,
+│                             #   webhook-primary) + MonitorPanel (legacy, kept for rollback)
 ├── attedance_manager/        # React dashboard frontend
 ├── scripts/create_teams.py   # One-off team import script
 └── vm-setup/                 # Scout Bot VM setup scripts (Windows)
@@ -105,9 +117,10 @@ verve-attendance-tracker/
 | Table | Purpose |
 |-------|---------|
 | `presence_intervals` | **SOURCE OF TRUTH** — merged per-person room intervals; every report reads this. Partitioned by `event_date`. |
-| `room_snapshots_v2` | Bot SDK polling data (every 30s). Partitioned. |
-| `participant_events_p` | Webhook join/leave events. Partitioned + clustered. Replaced unpartitioned `participant_events` on 2026-07-17 — always reference via `BQ_EVENTS_TABLE`. |
-| `room_mappings` | Room UUID → name (calibration). `meeting_id` is INT64. |
+| `presence_intervals_sql` | Output of the pure-BigQuery builder (`/intervals/build-sql`, JS-UDF state machine). Same schema; used for side-by-side verification before it replaces the Python builder. |
+| `participant_events_p` | **PRIMARY** — webhook join/leave events with exact timestamps. Partitioned + clustered. Replaced unpartitioned `participant_events` on 2026-07-17 — always reference via `BQ_EVENTS_TABLE`. `event_timestamp` is TIMESTAMP; `meeting_id` is INT64. |
+| `room_mappings` | Webhook room UUID → room name. New rows come from the idle-bot SDK lookup (`source='webhook_primary_sdk_lookup'`); legacy calibration sources still honored. `meeting_id` is INT64. |
+| `room_snapshots_v2` | Legacy bot SDK polling data (every 30s). No longer written since 2026-07-20 (Room Mapper replaced the polling panel); kept for history + rollback. |
 | `teams`, `team_members`, `team_tags` | Team definitions and metadata |
 | `team_holidays`, `employee_leave`, `team_leave_records` | Leave/holiday tracking |
 | `attendance_overrides` | Manual attendance corrections |
@@ -127,8 +140,10 @@ Full endpoint tables live in `CLAUDE.md`. The essentials:
 | Mutating endpoints (~45) | create/edit/delete everything | `@require_auth` Bearer token |
 | Admin data browser / user mgmt | `/admin/*`, `/auth/users*` | admin / superadmin |
 | Webhook | `POST /webhook` | Zoom HMAC signature (all events, incl. url_validation) |
-| Bot / SDK app | `/monitor/snapshot`, `/calibration/*` | open (no login context exists) |
+| Room mapping (webhook-primary) | `/mapping/sync`, `/mapping/pending`, `/mapping/resolve` — idle bot's SDK panel resolves room UUIDs to names | open (no login context exists) |
+| Bot / SDK app (legacy) | `/monitor/snapshot`, `/calibration/*` | open (no login context exists) |
 | Builders (scheduler-called) | `/intervals/rebuild`, `/intervals/auto-build` | open |
+| Pure-BQ builder + verifier | `GET/POST /intervals/build-sql?date=…` — builds `presence_intervals_sql` inside BigQuery and returns a comparison vs the Python builder | open |
 | Reports | `/teams/<id>/report/monthly`, `/employees/*`, CSVs | reads `presence_intervals` |
 
 ---
@@ -175,7 +190,14 @@ curl "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/monitor/health"
 
 ---
 
-## Known Issues / Current State (2026-07-17)
+## Known Issues / Current State (2026-07-20)
+
+- **Webhook-primary rollout (2026-07-20, in verification):** Room Mapper panel is
+  live; snapshot polling stopped. Watch the panel log for `Mapped … -> <room name>`
+  lines during a live meeting. Rollback = swap one import in
+  `breakout-calibrator/src/App.js` (MonitorPanel is intact) and rebuild.
+- **Do not run two `/intervals/build-sql` calls concurrently** — both scripts do
+  DELETE+INSERT on `presence_intervals_sql`; BigQuery aborts conflicting DML.
 
 - **Zoom REST API is broken**: the Cloud Run Zoom credentials are not from a
   Server-to-Server OAuth app → token requests fail (`unsupported_grant_type`).
@@ -186,7 +208,6 @@ curl "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/monitor/health"
   `reconcile-zoom-nightly` job.
 - **Session token in sessionStorage** (not httpOnly cookie) — XSS = takeover;
   token expires in 12h. Planned fix.
-- **IST-midnight date attribution** on overnight meetings — needs design.
 - Scout Bot VM auto-rejoin-on-boot does **not** work reliably in practice —
   VM/Zoom on-off is handled manually.
 
@@ -194,6 +215,7 @@ curl "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/monitor/health"
 
 | Date | Changes |
 |------|---------|
+| 2026-07-20 | **Webhook-primary architecture**: webhooks = attendance source (exact timestamps), SDK = room-name mapping only via new Room Mapper panel (bot idle, no polling, no bot movement); `/mapping/*` endpoints; placeholder room names resolved at build time via `room_mappings` JOIN; **pure-BigQuery interval builder** (`/intervals/build-sql`, JS-UDF state machine → `presence_intervals_sql`) verified against the Python builder on Jul 17–19 (all webhook-only participants matched; 2 Jul-17 diffs were stale pre-fix Python rows). Also: IST midnight-crossing fix (skip webhook-only events before 08:00 IST — phantom-hours bug) |
 | 2026-07-17 | Events table switched to partitioned `participant_events_p` (code-pointer swap, zero downtime); old table dropped; duplicate builder jobs paused; BigQuery now ~free-tier |
 | 2026-07-16 | Major day (see `docs/CHANGES-2026-07-16.md`): webhook-fallback hours rebuild, single source of hours, auth on 45 endpoints, bcrypt passwords, email-based identity, ⚠ estimated flags, module split (`zt_*`), scheduler jobs, webhook signature hardening |
 | 2026-05-11 | Break detection rework, name/email matching, login rate limit |
@@ -217,7 +239,9 @@ curl "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/monitor/health"
 1. **`presence_intervals` is the source of truth** — never compute hours from raw
    snapshots in new code; read the intervals table.
 2. **Always use `BQ_EVENTS_TABLE`** (zt_config) — never hardcode the events table name.
-3. **Bot data primary, webhooks fallback** — bot-off days are estimated + flagged ⚠.
+3. **Webhooks primary (since 2026-07-20), SDK = room names only** — the bot sits idle;
+   SDK/webhook room UUIDs are different formats, so names are mapped by participant
+   lookup, never by UUID conversion. Snapshot data still wins for historical days.
 4. **Identity = email when known**, display name otherwise; consumers match on both.
 5. **IST dates** — all `event_date` fields are IST (UTC+5:30).
 6. **The meeting never "ends" during the day** — one recurring instance runs ~24h and

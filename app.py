@@ -395,6 +395,10 @@ class MeetingState:
         self.calibration_next_index = 0  # Index of next expected webhook (0, 1, 2, ...)
         # WEBHOOK-PRIMARY MODE: Pending mapping requests (SDK resolves these)
         self.pending_mapping_requests = []  # List of {request_id, webhook_uuid, participant_name, participant_email, timestamp}
+        # Webhook uuids whose mapping is confirmed saved in room_mappings (BQ).
+        # /mapping/sync retries any in-memory mapping not in this set, so a
+        # failed BQ insert self-heals on the next sync instead of being lost.
+        self.persisted_webhook_uuids = set()
         # Note: Don't reset dedup cache on meeting reset - keep it for cross-meeting dedup
         print("[MeetingState] Reset for new meeting")
 
@@ -1266,6 +1270,7 @@ def insert_room_mappings(mappings):
 
         inserted_count = 0
         updated_count = 0
+        skipped_count = 0  # already present with same/better data — counts as success
 
         for mapping in cleaned_mappings:
             meeting_id = mapping['meeting_id']
@@ -1275,12 +1280,16 @@ def insert_room_mappings(mappings):
             mapping_date = mapping['mapping_date']
 
             # Check for existing mapping with same room_uuid
+            # CAST on the column side: meeting_id is INT64 in BQ (mapping_date
+            # type also varies) — comparing to STRING params without the CAST
+            # throws "No matching signature for operator =" and the whole
+            # insert silently fails (root cause of empty room_mappings, fixed 2026-07-21)
             check_query = f"""
             SELECT mapping_id, room_name, source
             FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_MAPPINGS_TABLE}`
-            WHERE meeting_id = @meeting_id
+            WHERE CAST(meeting_id AS STRING) = @meeting_id
               AND room_uuid = @room_uuid
-              AND mapping_date = @mapping_date
+              AND CAST(mapping_date AS STRING) = @mapping_date
             ORDER BY
               CASE WHEN source = 'webhook_calibration' THEN 0 ELSE 1 END,
               mapped_at DESC
@@ -1304,11 +1313,13 @@ def insert_room_mappings(mappings):
                 # If existing is webhook_calibration and new is not, skip
                 if existing_source == 'webhook_calibration' and source != 'webhook_calibration':
                     print(f"[BigQuery] SKIP: {room_name} - webhook_calibration mapping already exists")
+                    skipped_count += 1
                     continue
 
                 # If same source and same name, skip
                 if existing_source == source and existing_name == room_name:
                     print(f"[BigQuery] SKIP: {room_name} - identical mapping exists")
+                    skipped_count += 1
                     continue
 
                 # Update existing mapping (new source wins or same source with new name)
@@ -1317,9 +1328,9 @@ def insert_room_mappings(mappings):
                 SET room_name = @room_name,
                     source = @source,
                     mapped_at = @mapped_at
-                WHERE meeting_id = @meeting_id
+                WHERE CAST(meeting_id AS STRING) = @meeting_id
                   AND room_uuid = @room_uuid
-                  AND mapping_date = @mapping_date
+                  AND CAST(mapping_date AS STRING) = @mapping_date
                 """
                 update_config = bigquery.QueryJobConfig(
                     query_parameters=[
@@ -1343,8 +1354,10 @@ def insert_room_mappings(mappings):
                     inserted_count += 1
                     print(f"[BigQuery] INSERTED: {room_name} ({source})")
 
-        print(f"[BigQuery] Mappings: {inserted_count} inserted, {updated_count} updated")
-        return inserted_count > 0 or updated_count > 0
+        print(f"[BigQuery] Mappings: {inserted_count} inserted, {updated_count} updated, {skipped_count} already saved")
+        # Success = every mapping is durably in BQ (freshly written OR already there).
+        # A row that hit an insert error increments nothing -> False -> caller retries.
+        return (inserted_count + updated_count + skipped_count) > 0
     except Exception as e:
         print(f"[BigQuery] Mapping error: {e}")
         traceback.print_exc()
@@ -5025,7 +5038,7 @@ def mapping_sync():
         today = get_ist_date()
         for req, rname in matched:
             meeting_state.add_webhook_room_mapping(req['webhook_uuid'], rname)
-            insert_room_mappings([{
+            saved = insert_room_mappings([{
                 'mapping_id': str(uuid_lib.uuid4()),
                 'meeting_id': str(req.get('meeting_id') or meeting_id or ''),
                 'meeting_uuid': meeting_state.meeting_uuid or '',
@@ -5036,7 +5049,41 @@ def mapping_sync():
                 'mapped_at': datetime.utcnow().isoformat(),
                 'source': 'webhook_primary_sdk_lookup'
             }])
+            if saved:
+                with meeting_state._lock:
+                    meeting_state.persisted_webhook_uuids.add(req['webhook_uuid'])
             print(f"[mapping/sync] Resolved from sync payload: {req['webhook_uuid'][:20]}... -> {rname}")
+
+        # BACKFILL: persist any in-memory webhook-uuid mapping not yet confirmed
+        # in BQ. Covers mappings resolved while inserts were failing, and ones a
+        # webhook answered from memory (no pending request -> /mapping/resolve
+        # never fires again for that uuid). Retries automatically every sync
+        # until the insert succeeds. Skips 'sdk:'-prefixed and 8-char short keys.
+        with meeting_state._lock:
+            unpersisted = [
+                (u, n) for u, n in meeting_state.uuid_to_name.items()
+                if len(u) > 8 and not u.startswith('sdk:')
+                and u not in meeting_state.persisted_webhook_uuids
+            ]
+        backfilled = 0
+        for wu, rname in unpersisted:
+            saved = insert_room_mappings([{
+                'mapping_id': str(uuid_lib.uuid4()),
+                'meeting_id': str(meeting_state.meeting_id or meeting_id or ''),
+                'meeting_uuid': meeting_state.meeting_uuid or '',
+                'room_uuid': wu,
+                'room_name': rname,
+                'room_index': -1,
+                'mapping_date': today,
+                'mapped_at': datetime.utcnow().isoformat(),
+                'source': 'webhook_primary_sdk_lookup'
+            }])
+            if saved:
+                with meeting_state._lock:
+                    meeting_state.persisted_webhook_uuids.add(wu)
+                backfilled += 1
+        if unpersisted:
+            print(f"[mapping/sync] Backfilled {backfilled}/{len(unpersisted)} in-memory mapping(s) to BigQuery")
 
         print(f"[mapping/sync] Synced {len(rooms)} rooms for meeting {meeting_id} "
               f"({len(matched)} pending request(s) resolved)")
@@ -5168,9 +5215,13 @@ def mapping_resolve():
                 'mapped_at': datetime.utcnow().isoformat(),
                 'source': 'webhook_primary_sdk_lookup'
             }
-            insert_room_mappings([mapping_row])
+            saved = insert_room_mappings([mapping_row])
+            if saved:
+                with meeting_state._lock:
+                    meeting_state.persisted_webhook_uuids.add(webhook_uuid)
 
-            print(f"[mapping/resolve] Mapped {webhook_uuid[:20]}... -> {room_name}")
+            print(f"[mapping/resolve] Mapped {webhook_uuid[:20]}... -> {room_name}"
+                  + ('' if saved else ' (BQ save FAILED - will retry on next sync)'))
 
             # Update any events that were stored with Room-XXXXX placeholder
             # This is async/best-effort - events are still valid with placeholder names
