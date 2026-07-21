@@ -5117,27 +5117,39 @@ def mapping_sync():
         # REVERT: set SYNC_STATE_RESOLUTION_ENABLED = False (defined above
         # _queue_mapping_request) to go back to pending-request-only mapping.
         state_resolved = 0
+        state_corrected = 0
         if SYNC_STATE_RESOLUTION_ENABLED and room_by_person:
+            # STABILITY GUARD: only trust a person's position if webhooks say
+            # they have been in that room for 2+ minutes. Mapping someone
+            # mid-hop is how wrong labels get saved (e.g. webhook says "X
+            # joined U" but by SDK-lookup time X hopped again -> U mapped to
+            # the wrong room, seen live on 2026-07-21 with UEWhtBkXN92Q...).
+            MAPPING_STABLE_MIN_S = 120
+            now_ts = time.time()
             with meeting_state._lock:
                 bo_state = dict(meeting_state.participant_current_breakout)
-                known_uuids = set(meeting_state.uuid_to_name.keys())
-            claims = {}  # webhook_uuid -> set of claimed room names
+                uuid_names = dict(meeting_state.uuid_to_name)
+            claims = {}       # unknown uuid -> set of claimed room names
+            corrections = {}  # mapped uuid whose SDK room DISAGREES -> claims
             for (kind, ident), rname in room_by_person.items():
                 entry = bo_state.get(kind + ':' + ident)
                 if not entry:
                     continue
                 wu = entry.get('room_uuid')
-                if not wu or wu in known_uuids:
-                    continue  # unknown state or already mapped
-                claims.setdefault(wu, set()).add(rname)
-            for wu, names in claims.items():
-                if len(names) != 1:
-                    print(f"[mapping/sync] State-resolution SKIP {wu[:20]}...: "
-                          f"conflicting rooms {sorted(names)}")
+                if not wu:
                     continue
-                rname = next(iter(names))
-                meeting_state.add_webhook_room_mapping(wu, rname)
-                saved = insert_room_mappings([{
+                if (now_ts - (entry.get('ts') or 0)) < MAPPING_STABLE_MIN_S:
+                    continue  # person moved recently — not trustworthy yet
+                current = (uuid_names.get(wu) or '').strip()
+                if not current:
+                    claims.setdefault(wu, set()).add(rname)
+                elif current != rname.strip():
+                    # VERIFY-AND-CORRECT: existing mapping contradicts what the
+                    # SDK sees right now for a stable participant.
+                    corrections.setdefault(wu, set()).add(rname)
+
+            def _persist_mapping(wu, rname):
+                return insert_room_mappings([{
                     'mapping_id': str(uuid_lib.uuid4()),
                     'meeting_id': str(meeting_state.meeting_id or meeting_id or ''),
                     'meeting_uuid': meeting_state.meeting_uuid or '',
@@ -5148,11 +5160,44 @@ def mapping_sync():
                     'mapped_at': datetime.utcnow().isoformat(),
                     'source': 'webhook_primary_sdk_lookup'
                 }])
+
+            for wu, names in claims.items():
+                if len(names) != 1:
+                    print(f"[mapping/sync] State-resolution SKIP {wu[:20]}...: "
+                          f"conflicting rooms {sorted(names)}")
+                    continue
+                rname = next(iter(names))
+                meeting_state.add_webhook_room_mapping(wu, rname)
+                saved = _persist_mapping(wu, rname)
                 if saved:
                     with meeting_state._lock:
                         meeting_state.persisted_webhook_uuids.add(wu)
                 state_resolved += 1
                 print(f"[mapping/sync] State-resolved: {wu[:20]}... -> {rname}")
+
+            for wu, names in corrections.items():
+                if len(names) != 1:
+                    print(f"[mapping/sync] Correction SKIP {wu[:20]}...: "
+                          f"conflicting rooms {sorted(names)}")
+                    continue
+                rname = next(iter(names))
+                old_name = uuid_names.get(wu)
+                # BQ first: memory is only corrected once the mapping row is
+                # durably fixed — otherwise the build-time JOIN (which prefers
+                # room_mappings) would keep re-applying the stale name while
+                # memory stopped flagging the mismatch. If the UPDATE fails
+                # (e.g. row still in streaming buffer), we retry every sync.
+                saved = _persist_mapping(wu, rname)
+                if saved:
+                    meeting_state.add_webhook_room_mapping(wu, rname)
+                    with meeting_state._lock:
+                        meeting_state.persisted_webhook_uuids.add(wu)
+                    state_corrected += 1
+                    print(f"[mapping/sync] CORRECTED: {wu[:20]}... "
+                          f"'{old_name}' -> '{rname}'")
+                else:
+                    print(f"[mapping/sync] Correction PENDING {wu[:20]}... "
+                          f"'{old_name}' -> '{rname}' (BQ save failed, retrying next sync)")
 
         # BACKFILL: persist any in-memory webhook-uuid mapping not yet confirmed
         # in BQ. Covers mappings resolved while inserts were failing, and ones a
@@ -5187,7 +5232,7 @@ def mapping_sync():
 
         print(f"[mapping/sync] Synced {len(rooms)} rooms for meeting {meeting_id} "
               f"({len(matched)} pending request(s) resolved, "
-              f"{state_resolved} state-resolved)")
+              f"{state_resolved} state-resolved, {state_corrected} corrected)")
 
         return jsonify({
             'success': True,
