@@ -400,12 +400,18 @@ class MeetingState:
         # failed BQ insert self-heals on the next sync instead of being lost.
         self.persisted_webhook_uuids = set()
         # Where each participant is RIGHT NOW according to webhooks:
-        # 'e:<email>' / 'n:<normalized name>' -> {'room_uuid', 'ts'}.
+        # 'e:<email>' / 'n:<normalized name>' -> {'room_uuid', 'ts', 'meeting_uuid'}.
         # Lets /mapping/sync resolve unknown uuids from CURRENT state (SDK says
         # X is in room R now + webhooks say X is in uuid U now => U = R), so a
         # short bot session maps every occupied room at once — no fresh join
         # events needed. Set on breakout join, cleared on breakout leave.
         self.participant_current_breakout = {}
+        # Meeting INSTANCE uuid of the most recent breakout webhook. When the
+        # meeting ends and restarts (same numeric id, new instance uuid),
+        # entries recorded under the old instance become untrustworthy on
+        # workers that missed the participant's rejoin — sync resolution only
+        # trusts entries from the current instance.
+        self.last_breakout_instance_uuid = None
         # Note: Don't reset dedup cache on meeting reset - keep it for cross-meeting dedup
         print("[MeetingState] Reset for new meeting")
 
@@ -1825,17 +1831,23 @@ def _bo_state_keys(participant_name, participant_email):
     return keys
 
 
-def _track_breakout_state(participant_name, participant_email, room_uuid):
+def _track_breakout_state(participant_name, participant_email, room_uuid,
+                          meeting_uuid=None):
     """Remember (or forget, when room_uuid is None) which webhook room uuid a
-    participant is in right now. Consumed by /mapping/sync state resolution."""
+    participant is in right now. Consumed by /mapping/sync state resolution.
+    meeting_uuid = the meeting INSTANCE uuid from the webhook — entries from a
+    previous instance (meeting ended + restarted) are ignored by resolution."""
     keys = _bo_state_keys(participant_name, participant_email)
     if not keys:
         return
     with meeting_state._lock:
+        if meeting_uuid:
+            meeting_state.last_breakout_instance_uuid = meeting_uuid
         for k in keys:
             if room_uuid:
                 meeting_state.participant_current_breakout[k] = {
-                    'room_uuid': room_uuid, 'ts': time.time()
+                    'room_uuid': room_uuid, 'ts': time.time(),
+                    'meeting_uuid': meeting_uuid or ''
                 }
             else:
                 meeting_state.participant_current_breakout.pop(k, None)
@@ -2030,7 +2042,8 @@ def handle_breakout_room_join(data):
     state['current_room'] = room_name
 
     # Track current webhook-room uuid for /mapping/sync state resolution
-    _track_breakout_state(p['participant_name'], p['participant_email'], room_uuid)
+    _track_breakout_state(p['participant_name'], p['participant_email'],
+                          room_uuid, p['meeting_uuid'])
 
     success = insert_participant_event(event_data)
     status_suffix = ' (mapping queued)' if room_uuid and not room_name_known else ''
@@ -2084,7 +2097,8 @@ def handle_breakout_room_leave(data):
     }
 
     # Participant is back in the main room (or leaving) — forget their breakout uuid
-    _track_breakout_state(p['participant_name'], p['participant_email'], None)
+    _track_breakout_state(p['participant_name'], p['participant_email'],
+                          None, p['meeting_uuid'])
 
     success = insert_participant_event(event_data)
     print(f"  -> ROOM LEAVE: {p['participant_name']} <- {room_name} {'[OK]' if success else '[FAILED]'}")
@@ -5129,6 +5143,7 @@ def mapping_sync():
             with meeting_state._lock:
                 bo_state = dict(meeting_state.participant_current_breakout)
                 uuid_names = dict(meeting_state.uuid_to_name)
+                current_instance = meeting_state.last_breakout_instance_uuid
             claims = {}       # unknown uuid -> set of claimed room names
             corrections = {}  # mapped uuid whose SDK room DISAGREES -> claims
             for (kind, ident), rname in room_by_person.items():
@@ -5137,6 +5152,13 @@ def mapping_sync():
                     continue
                 wu = entry.get('room_uuid')
                 if not wu:
+                    continue
+                # RESTART GUARD: ignore positions recorded under a previous
+                # meeting instance (meeting ended + restarted -> new rooms).
+                # A worker that missed the participant's rejoin would otherwise
+                # "correct" a dead room's mapping with a new room's name.
+                if (current_instance and entry.get('meeting_uuid')
+                        and entry['meeting_uuid'] != current_instance):
                     continue
                 if (now_ts - (entry.get('ts') or 0)) < MAPPING_STABLE_MIN_S:
                     continue  # person moved recently — not trustworthy yet
