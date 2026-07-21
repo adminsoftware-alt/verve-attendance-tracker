@@ -195,8 +195,23 @@ def _ensure_presence_intervals_table():
     client.query(ddl).result()
 
 
+# ALL-BQ CUTOVER (2026-07-21): for IST dates >= this, the production
+# presence_intervals partition is built ENTIRELY inside BigQuery
+# (build_presence_intervals_sql -> JS-UDF state machine). Those dates are
+# webhook-primary (the bot stopped polling 2026-07-20), so the Python
+# snapshot pipeline below has nothing extra to contribute — it remains
+# ONLY for rebuilding historical (pre-cutover) dates from room_snapshots_v2.
+# REVERT: set env SQL_BUILDER_CUTOVER_DATE=9999-12-31 (or edit here) and
+# redeploy — every date goes back through the Python builder.
+SQL_BUILDER_CUTOVER_DATE = os.environ.get('SQL_BUILDER_CUTOVER_DATE', '2026-07-21')
+
+
 def build_presence_intervals(date_str):
     """Materialize presence_intervals for one IST date.
+
+    Webhook-primary dates (>= SQL_BUILDER_CUTOVER_DATE) are delegated to the
+    pure-BigQuery builder — no interval math happens in Python for them.
+    The Python pipeline below only serves historical snapshot-era dates.
 
     Steps:
       1. Pull bucketed snapshot data (per participant+room+30s bucket).
@@ -215,6 +230,25 @@ def build_presence_intervals(date_str):
 
     Returns dict with counts and timing.
     """
+    # ----- ALL-BQ path (webhook-primary dates) -----------------------------
+    if SQL_BUILDER_CUTOVER_DATE and str(date_str) >= SQL_BUILDER_CUTOVER_DATE:
+        r = build_presence_intervals_sql(
+            date_str, target_table=PRESENCE_INTERVALS_TABLE)
+        print(f"[Intervals] {date_str} built by BigQuery SQL engine: "
+              f"{r['rows']} rows, {r['participants']} participants, "
+              f"{r['total_hours']}h in {r['seconds']}s")
+        # Keys mirror the Python builder's return so existing callers
+        # (endpoints, auto-build, report_generator) keep working unchanged.
+        return {
+            'date': date_str,
+            'engine': 'bigquery_sql',
+            'table': r['table'],
+            'intervals_built': r['rows'],
+            'participants': r['participants'],
+            'duration_seconds_total': int(round(r['total_hours'] * 3600)),
+            'elapsed_seconds': r['seconds'],
+        }
+
     started = time.time()
     _ensure_presence_intervals_table()
     client = get_bq_client()
@@ -1417,11 +1451,14 @@ return out;
 """
 
 
-def build_presence_intervals_sql(date_str):
-    """Build presence intervals for one IST date ENTIRELY in BigQuery,
-    writing to presence_intervals_sql. Returns dict with counts + timing."""
+def build_presence_intervals_sql(date_str, target_table=None):
+    """Build presence intervals for one IST date ENTIRELY in BigQuery.
+    Writes to presence_intervals_sql by default (side-by-side verification);
+    pass target_table=PRESENCE_INTERVALS_TABLE to build the PRODUCTION
+    partition (the all-BQ cutover path). Returns dict with counts + timing."""
     started = time.time()
     date_str = _validate_date(date_str)
+    out_table = target_table or PRESENCE_INTERVALS_SQL_TABLE
     client = get_bq_client()
     dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
     norm_pn = _sql_normalize_name('pe.participant_name')
@@ -1446,7 +1483,7 @@ def build_presence_intervals_sql(date_str):
                          start_ts TIMESTAMP, end_ts TIMESTAMP>>
     LANGUAGE js AS r{js_quote}{_BUILD_INTERVALS_JS}{js_quote};
 
-    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{PRESENCE_INTERVALS_SQL_TABLE}` (
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{out_table}` (
         interval_id        STRING NOT NULL,
         event_date         DATE   NOT NULL,
         meeting_id         STRING,
@@ -1468,10 +1505,10 @@ def build_presence_intervals_sql(date_str):
     PARTITION BY event_date
     CLUSTER BY meeting_id, participant_key;
 
-    DELETE FROM `{dataset_ref}.{PRESENCE_INTERVALS_SQL_TABLE}`
+    DELETE FROM `{dataset_ref}.{out_table}`
     WHERE event_date = {d};
 
-    INSERT INTO `{dataset_ref}.{PRESENCE_INTERVALS_SQL_TABLE}`
+    INSERT INTO `{dataset_ref}.{out_table}`
         (interval_id, event_date, meeting_id, meeting_uuid, participant_key,
          participant_name, participant_email, room_name, room_category,
          start_ts, end_ts, duration_seconds, alone_seconds, snapshot_count,
@@ -1579,13 +1616,13 @@ def build_presence_intervals_sql(date_str):
         SELECT COUNT(*) AS n_rows,
                COUNT(DISTINCT participant_key) AS n_participants,
                ROUND(SUM(duration_seconds) / 3600, 1) AS total_hours
-        FROM `{dataset_ref}.{PRESENCE_INTERVALS_SQL_TABLE}`
+        FROM `{dataset_ref}.{out_table}`
         WHERE event_date = {d}
     """).result())[0]
 
     return {
         'date': date_str,
-        'table': PRESENCE_INTERVALS_SQL_TABLE,
+        'table': out_table,
         'rows': stats.n_rows,
         'participants': stats.n_participants,
         'total_hours': float(stats.total_hours or 0),
