@@ -46,7 +46,11 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 
 # Production server with gunicorn
-# --workers 2: Handle concurrent requests
-# --threads 4: Thread pool per worker
+# --workers 1 (2026-07-21): MUST be a single worker. With 2 workers each
+#   process saw only ~half the webhooks, so their in-memory participant
+#   positions disagreed and mapping corrections PING-PONGED (each worker
+#   "fixing" the other's correct value with its own stale view). One worker
+#   = one consistent memory for tracking, pending queues, and dedup.
+# --threads 8: IO-bound app; threads give the concurrency workers used to
 # --timeout 120: Allow slow webhook processing
-CMD exec gunicorn --bind :$PORT --workers 2 --threads 4 --timeout 120 app:app
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 120 app:app
