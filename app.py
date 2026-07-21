@@ -399,6 +399,13 @@ class MeetingState:
         # /mapping/sync retries any in-memory mapping not in this set, so a
         # failed BQ insert self-heals on the next sync instead of being lost.
         self.persisted_webhook_uuids = set()
+        # Where each participant is RIGHT NOW according to webhooks:
+        # 'e:<email>' / 'n:<normalized name>' -> {'room_uuid', 'ts'}.
+        # Lets /mapping/sync resolve unknown uuids from CURRENT state (SDK says
+        # X is in room R now + webhooks say X is in uuid U now => U = R), so a
+        # short bot session maps every occupied room at once — no fresh join
+        # events needed. Set on breakout join, cleared on breakout leave.
+        self.participant_current_breakout = {}
         # Note: Don't reset dedup cache on meeting reset - keep it for cross-meeting dedup
         print("[MeetingState] Reset for new meeting")
 
@@ -1795,6 +1802,45 @@ MAPPING_REQUEST_TTL_S = 600      # drop unresolved requests after 10 min
 MAPPING_REQUEST_RESERVE_S = 30   # don't re-serve a request handed to the SDK within 30s
 
 
+# SYNC-STATE RESOLUTION (2026-07-21): lets a SHORT bot session map every
+# occupied room at once by cross-matching the SDK sync payload ("X is in room R
+# now") against webhook state ("X is in uuid U now") => U = R. Without this,
+# rooms only get mapped when a join happens while the bot is online, forcing
+# the VM to run 24/7. REVERT: set to False — behavior returns to exactly the
+# pending-request-only flow (tracking dict is passive, harmless to leave on).
+SYNC_STATE_RESOLUTION_ENABLED = True
+
+
+def _bo_state_keys(participant_name, participant_email):
+    """Lookup keys for participant_current_breakout: email (preferred) + name
+    normalized the same way /mapping/sync normalizes the SDK payload
+    (strip Zoom rejoin suffix '-N', lowercase)."""
+    keys = []
+    em = (participant_email or '').strip().lower()
+    if em:
+        keys.append('e:' + em)
+    nm = _re.sub(r'-\d+$', '', (participant_name or '').strip().lower()).strip()
+    if nm:
+        keys.append('n:' + nm)
+    return keys
+
+
+def _track_breakout_state(participant_name, participant_email, room_uuid):
+    """Remember (or forget, when room_uuid is None) which webhook room uuid a
+    participant is in right now. Consumed by /mapping/sync state resolution."""
+    keys = _bo_state_keys(participant_name, participant_email)
+    if not keys:
+        return
+    with meeting_state._lock:
+        for k in keys:
+            if room_uuid:
+                meeting_state.participant_current_breakout[k] = {
+                    'room_uuid': room_uuid, 'ts': time.time()
+                }
+            else:
+                meeting_state.participant_current_breakout.pop(k, None)
+
+
 def _queue_mapping_request(room_uuid, participant_name, participant_email, meeting_id):
     """Queue a webhook-uuid -> room-name lookup for the SDK panel to resolve
     (webhook-primary mode). Deduped by webhook_uuid; bounded queue."""
@@ -1983,6 +2029,9 @@ def handle_breakout_room_join(data):
     state = meeting_state.get_participant_state(p['participant_id'])
     state['current_room'] = room_name
 
+    # Track current webhook-room uuid for /mapping/sync state resolution
+    _track_breakout_state(p['participant_name'], p['participant_email'], room_uuid)
+
     success = insert_participant_event(event_data)
     status_suffix = ' (mapping queued)' if room_uuid and not room_name_known else ''
     print(f"  -> ROOM JOIN: {p['participant_name']} -> {room_name}{status_suffix} {'[OK]' if success else '[FAILED]'}")
@@ -2033,6 +2082,9 @@ def handle_breakout_room_leave(data):
         'room_name': room_name,
         'inserted_at': datetime.utcnow().isoformat()
     }
+
+    # Participant is back in the main room (or leaving) — forget their breakout uuid
+    _track_breakout_state(p['participant_name'], p['participant_email'], None)
 
     success = insert_participant_event(event_data)
     print(f"  -> ROOM LEAVE: {p['participant_name']} <- {room_name} {'[OK]' if success else '[FAILED]'}")
@@ -5054,6 +5106,54 @@ def mapping_sync():
                     meeting_state.persisted_webhook_uuids.add(req['webhook_uuid'])
             print(f"[mapping/sync] Resolved from sync payload: {req['webhook_uuid'][:20]}... -> {rname}")
 
+        # STATE RESOLUTION (2026-07-21): map every occupied room in ONE sync by
+        # cross-matching CURRENT positions — SDK payload says "person P is in
+        # room R now", webhook state says "P is in uuid U now" => U = R.
+        # Unlike the pending-request queue (10-min TTL, needs a join to happen
+        # while the bot is online), this works no matter when the bot comes
+        # online — enabling short daily bot sessions instead of a 24/7 VM.
+        # A uuid claimed for two DIFFERENT rooms (someone mid-move / stale
+        # entry) is skipped this round; next sync settles it.
+        # REVERT: set SYNC_STATE_RESOLUTION_ENABLED = False (defined above
+        # _queue_mapping_request) to go back to pending-request-only mapping.
+        state_resolved = 0
+        if SYNC_STATE_RESOLUTION_ENABLED and room_by_person:
+            with meeting_state._lock:
+                bo_state = dict(meeting_state.participant_current_breakout)
+                known_uuids = set(meeting_state.uuid_to_name.keys())
+            claims = {}  # webhook_uuid -> set of claimed room names
+            for (kind, ident), rname in room_by_person.items():
+                entry = bo_state.get(kind + ':' + ident)
+                if not entry:
+                    continue
+                wu = entry.get('room_uuid')
+                if not wu or wu in known_uuids:
+                    continue  # unknown state or already mapped
+                claims.setdefault(wu, set()).add(rname)
+            for wu, names in claims.items():
+                if len(names) != 1:
+                    print(f"[mapping/sync] State-resolution SKIP {wu[:20]}...: "
+                          f"conflicting rooms {sorted(names)}")
+                    continue
+                rname = next(iter(names))
+                meeting_state.add_webhook_room_mapping(wu, rname)
+                saved = insert_room_mappings([{
+                    'mapping_id': str(uuid_lib.uuid4()),
+                    'meeting_id': str(meeting_state.meeting_id or meeting_id or ''),
+                    'meeting_uuid': meeting_state.meeting_uuid or '',
+                    'room_uuid': wu,
+                    'room_name': rname,
+                    'room_index': -1,
+                    'mapping_date': today,
+                    'mapped_at': datetime.utcnow().isoformat(),
+                    'source': 'webhook_primary_sdk_lookup'
+                }])
+                if saved:
+                    with meeting_state._lock:
+                        meeting_state.persisted_webhook_uuids.add(wu)
+                state_resolved += 1
+                print(f"[mapping/sync] State-resolved: {wu[:20]}... -> {rname}")
+
         # BACKFILL: persist any in-memory webhook-uuid mapping not yet confirmed
         # in BQ. Covers mappings resolved while inserts were failing, and ones a
         # webhook answered from memory (no pending request -> /mapping/resolve
@@ -5086,7 +5186,8 @@ def mapping_sync():
             print(f"[mapping/sync] Backfilled {backfilled}/{len(unpersisted)} in-memory mapping(s) to BigQuery")
 
         print(f"[mapping/sync] Synced {len(rooms)} rooms for meeting {meeting_id} "
-              f"({len(matched)} pending request(s) resolved)")
+              f"({len(matched)} pending request(s) resolved, "
+              f"{state_resolved} state-resolved)")
 
         return jsonify({
             'success': True,
@@ -6472,11 +6573,18 @@ def test_camera_qos():
 # ATTENDANCE DASHBOARD - Live View + Heatmap + Direct BigQuery Access
 # ==============================================================================
 
+# Dates >= this use presence_intervals (webhook-primary) for live/heatmap views;
+# earlier dates still read room_snapshots_v2, which stopped being written when
+# the bot went idle on 2026-07-20 (Room Mapper replaced the 30s polling panel).
+WEBHOOK_PRIMARY_CUTOVER = '2026-07-21'
+
+
 @app.route('/attendance/live', methods=['GET'])
 def attendance_live():
     """
     Real-time: Who's in which room RIGHT NOW.
-    Returns latest snapshot data grouped by room.
+    Webhook-primary dates: latest presence_intervals state (rebuilt every 2 min).
+    Historical dates: latest snapshot data grouped by room.
 
     GET /attendance/live
     GET /attendance/live?date=2026-04-03
@@ -6489,7 +6597,54 @@ def attendance_live():
 
     try:
         client = get_bq_client()
-        query = f"""
+        if target_date >= WEBHOOK_PRIMARY_CUTOVER:
+            # "Now" = the latest interval end_ts (the last 2-min rebuild).
+            # Anyone whose interval ends within 90s of that is still present;
+            # people who left earlier have older end_ts and drop out.
+            query = f"""
+            WITH ivs AS (
+              SELECT
+                participant_name,
+                participant_email,
+                room_name,
+                start_ts,
+                end_ts,
+                COALESCE(NULLIF(LOWER(TRIM(participant_email)), ''),
+                         LOWER(TRIM(participant_name))) AS pkey
+              FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{PRESENCE_INTERVALS_TABLE}`
+              WHERE event_date = '{target_date}'
+                AND participant_name NOT LIKE '%Scout%'
+                AND room_name IS NOT NULL AND room_name != ''
+            ),
+            latest AS (SELECT MAX(end_ts) AS max_time FROM ivs),
+            all_rooms AS (SELECT DISTINCT room_name FROM ivs),
+            current_state AS (
+              SELECT
+                room_name,
+                participant_name,
+                participant_email,
+                CAST(NULL AS STRING) AS participant_uuid,
+                end_ts AS snapshot_time
+              FROM ivs CROSS JOIN latest
+              WHERE end_ts >= TIMESTAMP_SUB(latest.max_time, INTERVAL 90 SECOND)
+              QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY pkey ORDER BY end_ts DESC, start_ts DESC
+              ) = 1
+            )
+            SELECT
+              ar.room_name,
+              ARRAY_AGG(
+                STRUCT(cs.participant_name, cs.participant_email, cs.participant_uuid)
+              ) as participants,
+              COUNTIF(cs.participant_name IS NOT NULL) as participant_count,
+              MAX(cs.snapshot_time) as snapshot_time
+            FROM all_rooms ar
+            LEFT JOIN current_state cs ON ar.room_name = cs.room_name
+            GROUP BY ar.room_name
+            ORDER BY ar.room_name
+            """
+        else:
+            query = f"""
         WITH latest_snapshot AS (
           SELECT MAX(snapshot_time) as max_time
           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
@@ -6642,7 +6797,39 @@ def attendance_heatmap(date=None):
 
     try:
         client = get_bq_client()
-        query = f"""
+        if date >= WEBHOOK_PRIMARY_CUTOVER:
+            # Webhook-primary: occupancy from presence_intervals — each interval
+            # contributes to every time slot it overlaps. More accurate than the
+            # legacy 30s samples, and it's the same data every report reads.
+            head = f"""
+        WITH ivs AS (
+          SELECT
+            room_name,
+            COALESCE(NULLIF(LOWER(TRIM(participant_email)), ''),
+                     LOWER(TRIM(participant_name))) as participant_key,
+            TIMESTAMP_ADD(start_ts, INTERVAL 330 MINUTE) as start_ist,
+            TIMESTAMP_ADD(end_ts, INTERVAL 330 MINUTE) as end_ist
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{PRESENCE_INTERVALS_TABLE}`
+          WHERE event_date = '{date}'
+            AND participant_name NOT LIKE '%Scout%'
+            AND room_name IS NOT NULL AND room_name != ''
+        ),
+        -- Expand each interval into the {interval}-min slots it overlaps
+        time_bucketed AS (
+          SELECT
+            room_name,
+            participant_key,
+            FORMAT_TIMESTAMP('%H:%M', slot) as time_slot
+          FROM ivs,
+          UNNEST(GENERATE_TIMESTAMP_ARRAY(
+            TIMESTAMP_SECONDS(DIV(UNIX_SECONDS(start_ist), {interval} * 60) * {interval} * 60),
+            end_ist,
+            INTERVAL {interval} MINUTE
+          )) AS slot
+        ),
+            """
+        else:
+            head = f"""
         WITH snapshots AS (
           SELECT
             room_name,
@@ -6669,6 +6856,8 @@ def attendance_heatmap(date=None):
             ) as time_slot
           FROM snapshots
         ),
+            """
+        query = head + f"""
         -- Count distinct participants per room per slot (by UUID-based key)
         room_slot_counts AS (
           SELECT
