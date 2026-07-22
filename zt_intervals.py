@@ -418,10 +418,9 @@ def build_presence_intervals(date_str):
     # Room names are resolved at BUILD time via room_mappings: webhook events
     # that arrived before a room's uuid->name mapping existed are stored with
     # a 'Room-xxxxxxxx' placeholder, and UPDATEing them in place fails while
-    # rows sit in the streaming buffer. ONLY use the mapping when the webhook
-    # has a placeholder; webhooks deliver authoritative names from Zoom.
-    # Bug found 2026-07-22: wrong SDK mappings were overriding correct webhook
-    # names (UUID had '1.25' in webhooks but mapping said '1.24').
+    # rows sit in the streaming buffer. Room names resolve per-uuid by
+    # NEWEST KNOWLEDGE WINS (last event name vs mapping row, newer timestamp
+    # takes it) — see the SQL builder's base CTE for the full rationale.
     events_q = f"""
     SELECT
       {norm_pn} AS participant_key,
@@ -429,16 +428,22 @@ def build_presence_intervals(date_str):
         STRUCT(
           CAST(pe.event_timestamp AS TIMESTAMP) AS ts,
           pe.event_type AS et,
-          CASE WHEN pe.room_name LIKE 'Room-%' OR pe.room_name IS NULL
-               THEN COALESCE(rm.mapped_name, pe.room_name)
-               ELSE pe.room_name END AS room
+          CASE
+            WHEN pe.room_uuid IS NULL OR pe.room_uuid = '' THEN pe.room_name
+            WHEN un.ev_name IS NOT NULL AND rm.mapped_name IS NOT NULL THEN
+                 IF(rm.mapped_at > un.ev_ts, rm.mapped_name, un.ev_name)
+            WHEN un.ev_name IS NOT NULL THEN un.ev_name
+            WHEN rm.mapped_name IS NOT NULL THEN rm.mapped_name
+            ELSE pe.room_name
+          END AS room
         )
         ORDER BY pe.event_timestamp
       ) AS events
     FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
     LEFT JOIN (
       SELECT room_uuid,
-             ARRAY_AGG(room_name ORDER BY mapped_at DESC LIMIT 1)[OFFSET(0)] AS mapped_name
+             ARRAY_AGG(room_name ORDER BY mapped_at DESC LIMIT 1)[OFFSET(0)] AS mapped_name,
+             MAX(mapped_at) AS mapped_at
       FROM `{dataset_ref}.{BQ_MAPPINGS_TABLE}`
       WHERE CAST(mapping_date AS STRING) = CAST(@date AS STRING)
         AND room_uuid IS NOT NULL AND room_uuid != ''
@@ -446,6 +451,19 @@ def build_presence_intervals(date_str):
         AND room_name NOT LIKE 'Room-%'
       GROUP BY room_uuid
     ) rm ON pe.room_uuid = rm.room_uuid
+    LEFT JOIN (
+      SELECT room_uuid,
+             ARRAY_AGG(room_name ORDER BY event_timestamp DESC LIMIT 1)[OFFSET(0)] AS ev_name,
+             MAX(event_timestamp) AS ev_ts
+      FROM `{dataset_ref}.{BQ_EVENTS_TABLE}`
+      WHERE event_date = @date
+        AND room_uuid IS NOT NULL AND room_uuid != ''
+        AND room_name IS NOT NULL AND room_name != ''
+        AND room_name NOT LIKE 'Room-%'
+        AND room_name != 'Unknown Room'
+        AND event_type IN ('breakout_room_joined','breakout_room_left')
+      GROUP BY room_uuid
+    ) un ON pe.room_uuid = un.room_uuid
     WHERE pe.event_date = @date
       AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
       AND LOWER(pe.participant_name) NOT LIKE '%scout%'
@@ -1533,14 +1551,29 @@ def build_presence_intervals_sql(date_str, target_table=None):
         CAST(pe.meeting_id AS STRING) AS meeting_id,
         CAST(pe.event_timestamp AS TIMESTAMP) AS ts,
         pe.event_type AS et,
-        -- Only use mapping when webhook has placeholder; webhooks are authoritative
-        CASE WHEN pe.room_name LIKE 'Room-%' OR pe.room_name IS NULL
-             THEN COALESCE(rm.mapped_name, pe.room_name)
-             ELSE pe.room_name END AS room
+        -- ROOM NAME RESOLUTION (2026-07-22): neither source is authoritative.
+        -- Zoom does NOT send room names in webhooks — the event's room_name
+        -- is the server's in-memory belief AT EVENT TIME; the mapping row is
+        -- the latest SAVED belief (which streaming-buffer UPDATE failures can
+        -- leave stale-wrong for ~90 min). Rule: per uuid, NEWEST KNOWLEDGE
+        -- WINS — compare last event ts vs mapped_at, take the newer name.
+        -- Fixes both observed failure modes: a stale-wrong BQ mapping row
+        -- overriding correct later events (1.24/1.25 Live View bug), and a
+        -- panel correction after a room emptied never applying (no newer
+        -- events to carry it).
+        CASE
+          WHEN pe.room_uuid IS NULL OR pe.room_uuid = '' THEN pe.room_name
+          WHEN un.ev_name IS NOT NULL AND rm.mapped_name IS NOT NULL THEN
+               IF(rm.mapped_at > un.ev_ts, rm.mapped_name, un.ev_name)
+          WHEN un.ev_name IS NOT NULL THEN un.ev_name
+          WHEN rm.mapped_name IS NOT NULL THEN rm.mapped_name
+          ELSE pe.room_name
+        END AS room
       FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
       LEFT JOIN (
         SELECT room_uuid,
-               ARRAY_AGG(room_name ORDER BY mapped_at DESC LIMIT 1)[OFFSET(0)] AS mapped_name
+               ARRAY_AGG(room_name ORDER BY mapped_at DESC LIMIT 1)[OFFSET(0)] AS mapped_name,
+               MAX(mapped_at) AS mapped_at
         FROM `{dataset_ref}.{BQ_MAPPINGS_TABLE}`
         WHERE CAST(mapping_date AS STRING) = CAST({d} AS STRING)
           AND room_uuid IS NOT NULL AND room_uuid != ''
@@ -1548,6 +1581,20 @@ def build_presence_intervals_sql(date_str, target_table=None):
           AND room_name NOT LIKE 'Room-%'
         GROUP BY room_uuid
       ) rm ON pe.room_uuid = rm.room_uuid
+      LEFT JOIN (
+        -- per-uuid last non-placeholder name seen in the event stream itself
+        SELECT room_uuid,
+               ARRAY_AGG(room_name ORDER BY event_timestamp DESC LIMIT 1)[OFFSET(0)] AS ev_name,
+               MAX(event_timestamp) AS ev_ts
+        FROM `{dataset_ref}.{BQ_EVENTS_TABLE}`
+        WHERE event_date = {d}
+          AND room_uuid IS NOT NULL AND room_uuid != ''
+          AND room_name IS NOT NULL AND room_name != ''
+          AND room_name NOT LIKE 'Room-%'
+          AND room_name != 'Unknown Room'
+          AND event_type IN ('breakout_room_joined','breakout_room_left')
+        GROUP BY room_uuid
+      ) un ON pe.room_uuid = un.room_uuid
       WHERE pe.event_date = {d}
         AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
         AND LOWER(pe.participant_name) NOT LIKE '%scout%'
