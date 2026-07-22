@@ -33,6 +33,7 @@ __all__ = [
     'TODAY_REBUILD_FAILURE_BACKOFF_S',
     '_rebuild_today_guarded',
     '_sql_whole_minutes',
+    '_sql_billed_seconds',
     '_classify_room',
     '_sql_normalize_name',
     '_ensure_presence_intervals_table',
@@ -132,8 +133,18 @@ def _rebuild_today_guarded(date_str):
 
 
 def _sql_whole_minutes(seconds_expr):
-    # Round half-up — must stay identical to _whole_minutes_from_seconds.
+    # Round half-up. NOTE (2026-07-22): user-facing attendance queries now
+    # SUM billed seconds (see _sql_billed_seconds) before calling this, so
+    # the input is a multiple of 60 and this conversion is exact.
     return f"CAST(FLOOR((COALESCE({seconds_expr}, 0) + 30) / 60.0) AS INT64)"
+
+
+def _sql_billed_seconds(seconds_expr):
+    # ZOOM-REPORT PARITY (2026-07-22, user decision): Zoom's attendance
+    # report rounds every session UP to the next full minute. To make our
+    # reports reconcile with Zoom's, each interval bills as CEIL(sec/60)
+    # minutes; totals are the SUM of billed intervals (never ceil-of-sum).
+    return f"(CAST(CEIL(COALESCE({seconds_expr}, 0) / 60.0) AS INT64) * 60)"
 
 
 def _classify_room(room_name):

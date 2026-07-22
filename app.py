@@ -12804,14 +12804,16 @@ from zt_intervals import *  # noqa: F401,F403 — split from app.py, see zt_inte
 
 
 def _whole_minutes_from_seconds(seconds):
-    """Convert stored duration seconds to whole minutes, rounding HALF-UP.
-    Was floor(): durations are multiples of 30s, so flooring threw away the
-    :30 of every odd half-minute — an always-downward bias that compounded
-    when per-day values were summed into monthly totals (10-22 min lost per
-    person per month). Half-up keeps the error zero-mean and matches the
-    SQL twin _sql_whole_minutes below (Python round() is banker's rounding,
-    so we use floor(x + 0.5) to stay deterministic and identical to SQL)."""
-    return int(((seconds or 0) + 30) // 60)
+    """Convert one interval's duration to whole minutes, rounding UP.
+
+    ZOOM-REPORT PARITY (2026-07-22, user decision): Zoom's official
+    attendance report bills every session as full minutes rounded UP
+    (a 20m10s session = 21 min). Our reports must reconcile with that
+    document, so each interval bills the same way, and totals are the
+    SUM of billed intervals — never round the total itself. SQL twin:
+    _sql_billed_seconds in zt_intervals.py."""
+    secs = int(seconds or 0)
+    return -(-secs // 60)  # ceiling division
 
 
 
@@ -13242,12 +13244,13 @@ def team_attendance_v2(team_id, date):
                 mb.member_email,
                 ANY_VALUE(pi.participant_name) AS display_name,
                 MAX(pi.participant_email) AS display_email,
-                SUM(IF(pi.room_category='main',     pi.duration_seconds, 0)) AS main_seconds,
-                SUM(IF(pi.room_category='breakout', pi.duration_seconds, 0)) AS breakout_seconds,
-                SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
+                -- Zoom-report parity: each interval bills UP to full minutes
+                SUM(IF(pi.room_category='main',     {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS main_seconds,
+                SUM(IF(pi.room_category='breakout', {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS breakout_seconds,
+                SUM(IF(pi.room_category='break',    {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS break_seconds,
                 SUM(pi.alone_seconds) AS isolation_seconds,
-                SUM(pi.duration_seconds) AS total_seconds,
-                SUM(IF(pi.confidence < 0.6, pi.duration_seconds, 0)) AS lowconf_seconds,
+                SUM({_sql_billed_seconds('pi.duration_seconds')}) AS total_seconds,
+                SUM(IF(pi.confidence < 0.6, {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS lowconf_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
             FROM member_bridge mb
@@ -13490,12 +13493,13 @@ def team_attendance_range_v2(team_id):
                 mb.member_name, mb.member_email, mb.event_date,
                 ANY_VALUE(pi.participant_name) AS display_name,
                 MAX(pi.participant_email) AS display_email,
-                SUM(IF(pi.room_category='main',     pi.duration_seconds, 0)) AS main_seconds,
-                SUM(IF(pi.room_category='breakout', pi.duration_seconds, 0)) AS breakout_seconds,
-                SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
+                -- Zoom-report parity: each interval bills UP to full minutes
+                SUM(IF(pi.room_category='main',     {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS main_seconds,
+                SUM(IF(pi.room_category='breakout', {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS breakout_seconds,
+                SUM(IF(pi.room_category='break',    {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS break_seconds,
                 SUM(pi.alone_seconds) AS isolation_seconds,
-                SUM(pi.duration_seconds) AS total_seconds,
-                SUM(IF(pi.confidence < 0.6, pi.duration_seconds, 0)) AS lowconf_seconds,
+                SUM({_sql_billed_seconds('pi.duration_seconds')}) AS total_seconds,
+                SUM(IF(pi.confidence < 0.6, {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS lowconf_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
             FROM member_bridge mb
@@ -13703,12 +13707,13 @@ def team_monthly_report_v2(team_id):
         per_day AS (
             SELECT
                 mb.member_name, mb.member_email, mb.event_date,
-                SUM(IF(pi.room_category='main',     pi.duration_seconds, 0)) AS main_seconds,
-                SUM(IF(pi.room_category='breakout', pi.duration_seconds, 0)) AS breakout_seconds,
-                SUM(IF(pi.room_category='break',    pi.duration_seconds, 0)) AS break_seconds,
+                -- Zoom-report parity: each interval bills UP to full minutes
+                SUM(IF(pi.room_category='main',     {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS main_seconds,
+                SUM(IF(pi.room_category='breakout', {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS breakout_seconds,
+                SUM(IF(pi.room_category='break',    {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS break_seconds,
                 SUM(pi.alone_seconds)             AS isolation_seconds,
-                SUM(pi.duration_seconds)          AS total_seconds,
-                SUM(IF(pi.confidence < 0.6, pi.duration_seconds, 0)) AS lowconf_seconds,
+                SUM({_sql_billed_seconds('pi.duration_seconds')}) AS total_seconds,
+                SUM(IF(pi.confidence < 0.6, {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS lowconf_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
             FROM member_bridge mb
@@ -13958,7 +13963,9 @@ def attendance_summary_v2(date):
                 'email':               info['email'] or '',
                 'first_seen_ist':      _fmt_ist(first_seen),
                 'last_seen_ist':       _fmt_ist(last_seen),
-                'total_duration_mins': _whole_minutes_from_seconds(total_seconds),
+                # Zoom parity: total = SUM of per-room billed minutes,
+                # exactly how Zoom's report totals its session rows
+                'total_duration_mins': sum(v['room_duration_mins'] for v in room_visits),
                 'total_duration_seconds': int(total_seconds),
                 'isolation_minutes':   _whole_minutes_from_seconds(isolation_seconds),
                 'room_visits':         room_visits,
