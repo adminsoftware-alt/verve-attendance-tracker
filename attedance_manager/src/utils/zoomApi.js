@@ -68,12 +68,13 @@ export function transformSummaryToEmployees(summaryData) {
         session: p.name,
       }));
 
-    // Use the backend aggregate total. Prefer raw seconds when the backend
-    // sends them (rounded once, here) so the header matches the room rows;
-    // summing per-visit rounded minutes drifts from Team View.
-    const totalMin = p.total_duration_seconds != null
-      ? Math.round(p.total_duration_seconds / 60)
-      : (p.total_duration_mins || 0);
+    // ZOOM-REPORT PARITY (2026-07-22): total_duration_mins from the backend
+    // is the SUM of per-room minutes each rounded UP, exactly how Zoom's
+    // downloaded daily report totals its rows. Use it as-is — recomputing
+    // from raw seconds made the header drift below the visible room rows.
+    const totalMin = p.total_duration_mins != null
+      ? p.total_duration_mins
+      : Math.round((p.total_duration_seconds || 0) / 60);
     const h = Math.floor(totalMin / 60);
     const m = Math.round(totalMin % 60);
 

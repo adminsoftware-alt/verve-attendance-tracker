@@ -62,7 +62,11 @@ MAIN_ROOM_SYNTH_MIN_SECONDS = 120    # Don't synthesize gaps smaller than 2min
 WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES = int(os.environ.get('WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES', '240'))
 
 
-WEBHOOK_SEGMENT_MIN_SECONDS = 60     # Webhook-timeline segments shorter than this are noise
+# Was 60s. Zoom's downloaded daily report shows sub-minute room visits as
+# their own 1-minute rows; dropping them made our reports run 1-2 min and
+# 1-2 rows short of Zoom's document (Fiza 15:19-15:20 case, 2026-07-22).
+# 5s still kills Zoom's double-fire noise; real short hops now bill 1 min.
+WEBHOOK_SEGMENT_MIN_SECONDS = 5
 
 
 PAGELOAD_AUTO_BUILD = os.environ.get('PAGELOAD_AUTO_BUILD', 'true').lower() != 'false'
@@ -1346,7 +1350,7 @@ def _validate_date(date_str):
 # BigQuery verbatim. Constants mirror the Python builder's defaults.
 _BUILD_INTERVALS_JS = r"""
 var COALESCE_GAP_MS = 30 * 1000;        // COALESCE_GAP_S
-var SEG_MIN_MS      = 60 * 1000;        // WEBHOOK_SEGMENT_MIN_SECONDS
+var SEG_MIN_MS      = 5 * 1000;         // WEBHOOK_SEGMENT_MIN_SECONDS (Zoom parity: short hops bill 1 min)
 var SEG_CAP_MS      = 600 * 60 * 1000;  // MAIN_ROOM_SYNTH_CAP_MINUTES
 var NO_LEAVE_CAP_MS = 240 * 60 * 1000;  // WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES
 
