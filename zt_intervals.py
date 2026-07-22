@@ -418,9 +418,10 @@ def build_presence_intervals(date_str):
     # Room names are resolved at BUILD time via room_mappings: webhook events
     # that arrived before a room's uuid->name mapping existed are stored with
     # a 'Room-xxxxxxxx' placeholder, and UPDATEing them in place fails while
-    # rows sit in the streaming buffer. COALESCE picks the mapped name when
-    # one exists for that day (webhook-primary SDK lookups land here too),
-    # falling back to whatever the event stored.
+    # rows sit in the streaming buffer. ONLY use the mapping when the webhook
+    # has a placeholder; webhooks deliver authoritative names from Zoom.
+    # Bug found 2026-07-22: wrong SDK mappings were overriding correct webhook
+    # names (UUID had '1.25' in webhooks but mapping said '1.24').
     events_q = f"""
     SELECT
       {norm_pn} AS participant_key,
@@ -428,7 +429,9 @@ def build_presence_intervals(date_str):
         STRUCT(
           CAST(pe.event_timestamp AS TIMESTAMP) AS ts,
           pe.event_type AS et,
-          COALESCE(rm.mapped_name, pe.room_name) AS room
+          CASE WHEN pe.room_name LIKE 'Room-%' OR pe.room_name IS NULL
+               THEN COALESCE(rm.mapped_name, pe.room_name)
+               ELSE pe.room_name END AS room
         )
         ORDER BY pe.event_timestamp
       ) AS events
@@ -1530,7 +1533,10 @@ def build_presence_intervals_sql(date_str, target_table=None):
         CAST(pe.meeting_id AS STRING) AS meeting_id,
         CAST(pe.event_timestamp AS TIMESTAMP) AS ts,
         pe.event_type AS et,
-        COALESCE(rm.mapped_name, pe.room_name) AS room
+        -- Only use mapping when webhook has placeholder; webhooks are authoritative
+        CASE WHEN pe.room_name LIKE 'Room-%' OR pe.room_name IS NULL
+             THEN COALESCE(rm.mapped_name, pe.room_name)
+             ELSE pe.room_name END AS room
       FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
       LEFT JOIN (
         SELECT room_uuid,
