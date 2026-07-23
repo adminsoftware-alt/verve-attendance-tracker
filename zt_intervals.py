@@ -1461,16 +1461,14 @@ windows.forEach(function(w) {
   var wStart = w[0], wLeave = w[1];
   if (wStart === null) return;
 
-  // ROW-DATE ATTRIBUTION (Zoom-report parity, 2026-07-23): Zoom's report
-  // credits each ROW to the date the row STARTS — a 22:12->00:39 row sits
-  // on the 22nd, but a 00:19 rejoin's rows sit on the 23rd (verified with
-  // Puneet/Anurag 22-23/07). So we tile windows that start on the PREVIOUS
-  // day too: their after-midnight tiles start on this day and belong to
-  // this partition. The SQL layer keeps only tiles whose IST start date ==
-  // build date, so each partition is fully owned by its own build
-  // (idempotent — no build ever deletes another day's rows).
-  var prevDayStart = new Date(day_start.getTime() - 86400000);
-  if (wStart < prevDayStart) return;
+  // LOGIN-DATE ATTRIBUTION (Zoom-report parity, 2026-07-23): a session
+  // belongs ENTIRELY to the IST day the person logged in — including work
+  // before 08:00 and tails past midnight (Zoom's daily report does the
+  // same). Sessions that started before this day were counted by
+  // yesterday's build (each build reads two partitions to close its own
+  // midnight-crossing sessions); sessions starting after day_end belong
+  // to tomorrow's build.
+  if (wStart < day_start) return;
   if (wStart >= day_end) return;
 
   var noLeave = (wLeave === null);
@@ -1616,9 +1614,7 @@ def build_presence_intervals_sql(date_str, target_table=None):
                ARRAY_AGG(room_name ORDER BY mapped_at DESC LIMIT 1)[OFFSET(0)] AS mapped_name,
                MAX(mapped_at) AS mapped_at
         FROM `{dataset_ref}.{BQ_MAPPINGS_TABLE}`
-        -- D-1 too: yesterday-login windows tile with yesterday's room uuids
-        WHERE CAST(mapping_date AS STRING) IN
-              (CAST({d} AS STRING), CAST(DATE_SUB({d}, INTERVAL 1 DAY) AS STRING))
+        WHERE CAST(mapping_date AS STRING) = CAST({d} AS STRING)
           AND room_uuid IS NOT NULL AND room_uuid != ''
           AND room_name IS NOT NULL AND room_name != ''
           AND room_name NOT LIKE 'Room-%'
@@ -1630,8 +1626,7 @@ def build_presence_intervals_sql(date_str, target_table=None):
                ARRAY_AGG(room_name ORDER BY event_timestamp DESC LIMIT 1)[OFFSET(0)] AS ev_name,
                MAX(event_timestamp) AS ev_ts
         FROM `{dataset_ref}.{BQ_EVENTS_TABLE}`
-        WHERE event_date BETWEEN DATE_SUB({d}, INTERVAL 1 DAY)
-                             AND DATE_ADD({d}, INTERVAL 1 DAY)
+        WHERE event_date BETWEEN {d} AND DATE_ADD({d}, INTERVAL 1 DAY)
           AND room_uuid IS NOT NULL AND room_uuid != ''
           AND room_name IS NOT NULL AND room_name != ''
           AND room_name NOT LIKE 'Room-%'
@@ -1639,13 +1634,11 @@ def build_presence_intervals_sql(date_str, target_table=None):
           AND event_type IN ('breakout_room_joined','breakout_room_left')
         GROUP BY room_uuid
       ) un ON pe.room_uuid = un.room_uuid
-      -- THREE partitions (D-1, D, D+1): yesterday-login sessions crossing
-      -- midnight contribute their after-midnight tiles to D; D-login
-      -- sessions need D+1 events to close at their real leave. The final
-      -- SELECT keeps only tiles whose IST start date == D, so adjacent
-      -- days never double-count.
-      WHERE pe.event_date BETWEEN DATE_SUB({d}, INTERVAL 1 DAY)
-                              AND DATE_ADD({d}, INTERVAL 1 DAY)
+      -- TWO partitions (D and D+1): sessions that log in on D and run past
+      -- midnight have their leave + breakout events in D+1's partition.
+      -- The JS keeps only windows STARTING on D (login-date attribution),
+      -- so D+1's own sessions are never double-counted here.
+      WHERE pe.event_date BETWEEN {d} AND DATE_ADD({d}, INTERVAL 1 DAY)
         AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
         AND LOWER(pe.participant_name) NOT LIKE '%scout%'
         AND pe.event_type IN ('participant_joined','participant_left',
@@ -1718,13 +1711,7 @@ def build_presence_intervals_sql(date_str, target_table=None):
         {day_start},
         TIMESTAMP_ADD({day_start}, INTERVAL 24 HOUR),
         TIMESTAMP_ADD({day_start}, INTERVAL 8 HOUR)
-    )) AS t
-    -- ROW-DATE ATTRIBUTION: this build owns exactly the tiles that START
-    -- on {date_str} IST (Zoom's report credits each row to its start date).
-    -- Tiles of yesterday-login windows starting before midnight belong to
-    -- yesterday's partition and are skipped here; after-midnight tiles of
-    -- today's windows will be inserted by tomorrow's build.
-    WHERE DATE(t.start_ts, 'Asia/Kolkata') = {d};
+    )) AS t;
 
     COMMIT TRANSACTION;
     """
