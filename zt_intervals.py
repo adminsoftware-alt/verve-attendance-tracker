@@ -1359,19 +1359,36 @@ events = events.slice().sort(function(a, b) { return a.ts - b.ts; });
 
 var JOINS = ['participant_joined', 'meeting.participant_joined'];
 var LEFTS = ['participant_left', 'meeting.participant_left'];
+var TRANSITION_GRACE_MS = 5000;  // 5s grace: participant_left after breakout_room_joined = room transition, not exit
 
 var brk = events.filter(function(e) {
   return e.et === 'breakout_room_joined' || e.et === 'breakout_room_left';
 });
 
 // ---- presence windows (= _build_presence_windows) ----
+// Zoom sends participant_left immediately after breakout_room_joined when moving
+// to a breakout room. Don't close the presence window for these transitions.
+// Also handle same-timestamp case: look ahead for breakout_room_joined at same ts.
 var raw = [];
 var cur = null;
+var lastBrkJoinTs = null;
+var brkJoinSet = {};  // map ts -> true if breakout_room_joined at that ts
+brk.forEach(function(e) { if (e.et === 'breakout_room_joined') brkJoinSet[e.ts.getTime()] = true; });
 events.forEach(function(e) {
+  if (e.et === 'breakout_room_joined') lastBrkJoinTs = e.ts;
   if (JOINS.indexOf(e.et) >= 0) {
     if (cur === null) cur = e.ts;
   } else if (LEFTS.indexOf(e.et) >= 0) {
-    if (cur !== null) { raw.push([cur, e.ts]); cur = null; }
+    if (cur !== null) {
+      // Room transition detection: breakout_room_joined within 5s OR at same timestamp
+      var recentBrk = (lastBrkJoinTs !== null && (e.ts - lastBrkJoinTs) < TRANSITION_GRACE_MS);
+      var sameTsBrk = brkJoinSet[e.ts.getTime()];
+      if (recentBrk || sameTsBrk) {
+        // ignore: person moved to breakout room, not leaving meeting
+      } else {
+        raw.push([cur, e.ts]); cur = null;
+      }
+    }
   }
 });
 if (cur !== null) raw.push([cur, null]);
