@@ -1413,12 +1413,18 @@ if (windows.length === 0) {
     if (LEFTS.indexOf(e.et) >= 0 && (leftTs === null || e.ts > leftTs)) leftTs = e.ts;
   });
   if (joinTs !== null) {
+    // LOGIN-DATE RULE: an explicit join on this IST day counts from that
+    // moment, whatever the hour — Zoom's report does the same (Pradip
+    // Bagate joined 01:17, Zoom billed all 467 min to that date).
     if (joinTs >= day_start && joinTs < day_end) {
-      if (joinTs < early_cutoff) return [];   // midnight-crossing continuation
-      windows.push([joinTs, leftTs]);
+      windows.push([joinTs, leftTs !== null && leftTs > joinTs ? leftTs : null]);
     } else { return []; }
   } else if (brk.length > 0) {
     var first = brk[0].ts;
+    // No explicit join at all: before 08:00 IST this is almost always the
+    // tail of YESTERDAY'S 24h meeting (yesterday's build owns it — it reads
+    // two partitions and closes the session at its real leave). After 08:00
+    // it's a genuine missed-join webhook: count it.
     if (first >= day_start && first < day_end) {
       if (first < early_cutoff) return [];
       windows.push([first, null]);
@@ -1455,14 +1461,15 @@ windows.forEach(function(w) {
   var wStart = w[0], wLeave = w[1];
   if (wStart === null) return;
 
-  // midnight-crossing: window started before this IST day
-  if (wStart < day_start) {
-    if (wLeave !== null && wLeave > day_start) { wStart = day_start; } else { return; }
-  }
-  // early-morning filter: before 08:00 IST = yesterday's meeting continuing
-  if (wStart < early_cutoff) {
-    if (wLeave !== null && wLeave > early_cutoff) { wStart = early_cutoff; } else { return; }
-  }
+  // LOGIN-DATE ATTRIBUTION (Zoom-report parity, 2026-07-23): a session
+  // belongs ENTIRELY to the IST day the person logged in — including work
+  // before 08:00 and tails past midnight (Zoom's daily report does the
+  // same). Sessions that started before this day were counted by
+  // yesterday's build (each build reads two partitions to close its own
+  // midnight-crossing sessions); sessions starting after day_end belong
+  // to tomorrow's build.
+  if (wStart < day_start) return;
+  if (wStart >= day_end) return;
 
   var noLeave = (wLeave === null);
   var wEnd = (wLeave !== null) ? wLeave : monitoring_end;
@@ -1619,7 +1626,7 @@ def build_presence_intervals_sql(date_str, target_table=None):
                ARRAY_AGG(room_name ORDER BY event_timestamp DESC LIMIT 1)[OFFSET(0)] AS ev_name,
                MAX(event_timestamp) AS ev_ts
         FROM `{dataset_ref}.{BQ_EVENTS_TABLE}`
-        WHERE event_date = {d}
+        WHERE event_date BETWEEN {d} AND DATE_ADD({d}, INTERVAL 1 DAY)
           AND room_uuid IS NOT NULL AND room_uuid != ''
           AND room_name IS NOT NULL AND room_name != ''
           AND room_name NOT LIKE 'Room-%'
@@ -1627,7 +1634,11 @@ def build_presence_intervals_sql(date_str, target_table=None):
           AND event_type IN ('breakout_room_joined','breakout_room_left')
         GROUP BY room_uuid
       ) un ON pe.room_uuid = un.room_uuid
-      WHERE pe.event_date = {d}
+      -- TWO partitions (D and D+1): sessions that log in on D and run past
+      -- midnight have their leave + breakout events in D+1's partition.
+      -- The JS keeps only windows STARTING on D (login-date attribution),
+      -- so D+1's own sessions are never double-counted here.
+      WHERE pe.event_date BETWEEN {d} AND DATE_ADD({d}, INTERVAL 1 DAY)
         AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
         AND LOWER(pe.participant_name) NOT LIKE '%scout%'
         AND pe.event_type IN ('participant_joined','participant_left',
