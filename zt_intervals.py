@@ -1373,6 +1373,18 @@ var brk = events.filter(function(e) {
 var brkJoinTimes = [];
 brk.forEach(function(e) { if (e.et === 'breakout_room_joined') brkJoinTimes.push(e.ts.getTime()); });
 function isRoomTransition(t) {
+  // FIX (2026-07-23): Only treat as room transition if there's a rejoin AFTER
+  // this left. A left within 5s of a breakout join but with NO subsequent
+  // rejoin is the real final exit (Sayli Sonone bug: 10hr phantom Main Room).
+  var hasRejoinAfter = false;
+  for (var j = 0; j < events.length; j++) {
+    if (JOINS.indexOf(events[j].et) >= 0 && events[j].ts.getTime() > t) {
+      hasRejoinAfter = true;
+      break;
+    }
+  }
+  if (!hasRejoinAfter) return false;  // no rejoin = real exit, not transition
+
   for (var i = 0; i < brkJoinTimes.length; i++) {
     var d = brkJoinTimes[i] - t;
     if (d > -TRANSITION_GRACE_MS && d < TRANSITION_GRACE_MS) return true;
