@@ -1366,28 +1366,28 @@ var brk = events.filter(function(e) {
 });
 
 // ---- presence windows (= _build_presence_windows) ----
-// Zoom sends participant_left immediately after breakout_room_joined when moving
-// to a breakout room. Don't close the presence window for these transitions.
-// Also handle same-timestamp case: look ahead for breakout_room_joined at same ts.
+// Zoom fires participant_left as part of every breakout-room transition, and
+// the ordering vs breakout_room_joined is nondeterministic (observed 292ms
+// EITHER side). A participant_left with any breakout_room_joined within
+// TRANSITION_GRACE_MS in EITHER direction is a room move, not a meeting exit.
+var brkJoinTimes = [];
+brk.forEach(function(e) { if (e.et === 'breakout_room_joined') brkJoinTimes.push(e.ts.getTime()); });
+function isRoomTransition(t) {
+  for (var i = 0; i < brkJoinTimes.length; i++) {
+    var d = brkJoinTimes[i] - t;
+    if (d > -TRANSITION_GRACE_MS && d < TRANSITION_GRACE_MS) return true;
+    if (d >= TRANSITION_GRACE_MS) break;  // sorted ascending: no later join can match
+  }
+  return false;
+}
 var raw = [];
 var cur = null;
-var lastBrkJoinTs = null;
-var brkJoinSet = {};  // map ts -> true if breakout_room_joined at that ts
-brk.forEach(function(e) { if (e.et === 'breakout_room_joined') brkJoinSet[e.ts.getTime()] = true; });
 events.forEach(function(e) {
-  if (e.et === 'breakout_room_joined') lastBrkJoinTs = e.ts;
   if (JOINS.indexOf(e.et) >= 0) {
     if (cur === null) cur = e.ts;
   } else if (LEFTS.indexOf(e.et) >= 0) {
-    if (cur !== null) {
-      // Room transition detection: breakout_room_joined within 5s OR at same timestamp
-      var recentBrk = (lastBrkJoinTs !== null && (e.ts - lastBrkJoinTs) < TRANSITION_GRACE_MS);
-      var sameTsBrk = brkJoinSet[e.ts.getTime()];
-      if (recentBrk || sameTsBrk) {
-        // ignore: person moved to breakout room, not leaving meeting
-      } else {
-        raw.push([cur, e.ts]); cur = null;
-      }
+    if (cur !== null && !isRoomTransition(e.ts.getTime())) {
+      raw.push([cur, e.ts]); cur = null;
     }
   }
 });
