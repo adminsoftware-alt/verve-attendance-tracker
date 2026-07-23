@@ -1373,17 +1373,22 @@ var brk = events.filter(function(e) {
 var brkJoinTimes = [];
 brk.forEach(function(e) { if (e.et === 'breakout_room_joined') brkJoinTimes.push(e.ts.getTime()); });
 function isRoomTransition(t) {
-  // FIX (2026-07-23): Only treat as room transition if there's a rejoin AFTER
-  // this left. A left within 5s of a breakout join but with NO subsequent
-  // rejoin is the real final exit (Sayli Sonone bug: 10hr phantom Main Room).
-  var hasRejoinAfter = false;
+  // FIX (2026-07-23, v2): a genuine breakout room move fires participant_left
+  // then participant_joined near-instantly (observed ~0.3s apart). A real final
+  // exit has NO rejoin for a long time. The earlier "any rejoin after" check
+  // failed because the builder reads TWO partitions (D and D+1), so the person's
+  // login the NEXT morning looked like a rejoin and kept suppressing their real
+  // exit (Sayli Sonone: left 12:41:37 UTC on the 22nd, next login 03:35 on the
+  // 23rd => 10hr phantom Main Room capped at 600min). Only suppress this left
+  // if the person rejoins WITHIN the coalesce gap (30s).
+  var hasRejoinSoon = false;
   for (var j = 0; j < events.length; j++) {
-    if (JOINS.indexOf(events[j].et) >= 0 && events[j].ts.getTime() > t) {
-      hasRejoinAfter = true;
-      break;
+    if (JOINS.indexOf(events[j].et) >= 0) {
+      var dj = events[j].ts.getTime() - t;
+      if (dj > 0 && dj < COALESCE_GAP_MS) { hasRejoinSoon = true; break; }
     }
   }
-  if (!hasRejoinAfter) return false;  // no rejoin = real exit, not transition
+  if (!hasRejoinSoon) return false;  // no quick rejoin = real exit, not transition
 
   for (var i = 0; i < brkJoinTimes.length; i++) {
     var d = brkJoinTimes[i] - t;
