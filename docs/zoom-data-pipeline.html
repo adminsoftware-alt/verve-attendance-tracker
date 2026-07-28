@@ -1,0 +1,1045 @@
+<title>Zoom Attendance Tracker - Data Pipeline Documentation</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<style>
+:root {
+  --bg: #fafbfc;
+  --bg-alt: #f6f8fa;
+  --text: #24292f;
+  --text-muted: #57606a;
+  --accent: #0969da;
+  --border: #d0d7de;
+  --code-bg: #f6f8fa;
+  --success: #1a7f37;
+  --warning: #bf8700;
+  --danger: #cf222e;
+  --table-stripe: #f6f8fa;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --bg-alt: #161b22;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --border: #30363d;
+    --code-bg: #161b22;
+    --success: #3fb950;
+    --warning: #d29922;
+    --danger: #f85149;
+    --table-stripe: #161b22;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0d1117;
+  --bg-alt: #161b22;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --accent: #58a6ff;
+  --border: #30363d;
+  --code-bg: #161b22;
+  --success: #3fb950;
+  --warning: #d29922;
+  --danger: #f85149;
+  --table-stripe: #161b22;
+}
+
+:root[data-theme="light"] {
+  --bg: #fafbfc;
+  --bg-alt: #f6f8fa;
+  --text: #24292f;
+  --text-muted: #57606a;
+  --accent: #0969da;
+  --border: #d0d7de;
+  --code-bg: #f6f8fa;
+  --success: #1a7f37;
+  --warning: #bf8700;
+  --danger: #cf222e;
+  --table-stripe: #f6f8fa;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--bg);
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 4rem;
+}
+
+h1, h2, h3, h4 {
+  text-wrap: balance;
+  margin-top: 2.5rem;
+  margin-bottom: 1rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+h1 {
+  font-size: 2rem;
+  margin-top: 0;
+  padding-bottom: 0.75rem;
+  border-bottom: 2px solid var(--border);
+}
+
+h2 {
+  font-size: 1.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+h3 { font-size: 1.25rem; }
+h4 { font-size: 1.1rem; color: var(--text-muted); }
+
+p { margin: 1rem 0; }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code {
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+  font-size: 0.875em;
+  background: var(--code-bg);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+pre code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.toc {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0 2rem;
+}
+
+.toc h4 {
+  margin: 0 0 0.75rem;
+  font-size: 0.875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.toc ul {
+  margin: 0;
+  padding-left: 1.25rem;
+  list-style-type: disc;
+}
+
+.toc li { margin: 0.35rem 0; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.5rem 0;
+  font-size: 0.9rem;
+}
+
+th, td {
+  text-align: left;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  vertical-align: top;
+}
+
+th {
+  background: var(--bg-alt);
+  font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+tr:nth-child(even) td { background: var(--table-stripe); }
+
+.table-wrap {
+  overflow-x: auto;
+  margin: 1.5rem 0;
+  border-radius: 6px;
+}
+
+.diagram-container {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin: 2rem 0;
+  overflow-x: auto;
+}
+
+.diagram-title {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 1rem;
+  font-weight: 600;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.2em 0.6em;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.badge-primary { background: var(--accent); color: white; }
+.badge-success { background: var(--success); color: white; }
+.badge-warning { background: var(--warning); color: white; }
+.badge-danger { background: var(--danger); color: white; }
+
+.callout {
+  padding: 1rem 1.25rem;
+  border-radius: 6px;
+  margin: 1.5rem 0;
+  border-left: 4px solid;
+}
+
+.callout-info {
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+  border-color: var(--accent);
+}
+
+.callout-warning {
+  background: color-mix(in srgb, var(--warning) 10%, var(--bg));
+  border-color: var(--warning);
+}
+
+.callout-danger {
+  background: color-mix(in srgb, var(--danger) 10%, var(--bg));
+  border-color: var(--danger);
+}
+
+.callout strong { display: block; margin-bottom: 0.25rem; }
+
+.value-box {
+  display: inline-block;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  margin: 0.25rem 0.5rem 0.25rem 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.value-box .label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.value-box .value {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.flow-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  margin: 1.5rem 0;
+  padding: 1rem;
+  background: var(--bg-alt);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.step-num {
+  flex-shrink: 0;
+  width: 2rem;
+  height: 2rem;
+  background: var(--accent);
+  color: white;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
+.step-content h4 { margin: 0 0 0.5rem; color: var(--text); }
+.step-content p { margin: 0; color: var(--text-muted); }
+
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 3rem 0;
+}
+
+.meta {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-top: 0.5rem;
+}
+</style>
+
+<h1>Zoom Attendance Tracker<br><span style="font-weight: 400; font-size: 0.6em; color: var(--text-muted);">Data Pipeline Documentation</span></h1>
+
+<p class="meta">Last updated: July 2026 | GCP Project: <code>verve-attendance-tracker</code> | Dataset: <code>breakout_room_calibrator</code></p>
+
+<nav class="toc">
+  <h4>Contents</h4>
+  <ul>
+    <li><a href="#overview">System Overview</a></li>
+    <li><a href="#data-flow">Data Flow Diagram</a></li>
+    <li><a href="#raw-tables">Raw Data Tables</a></li>
+    <li><a href="#room-mapping">Room Mapping Logic</a></li>
+    <li><a href="#presence-intervals">Presence Intervals (Final Table)</a></li>
+    <li><a href="#state-machine">State Machine Logic</a></li>
+    <li><a href="#business-rules">Business Rules & Constants</a></li>
+    <li><a href="#identity">Identity Resolution</a></li>
+    <li><a href="#edge-cases">Edge Cases & Fixes</a></li>
+  </ul>
+</nav>
+
+<h2 id="overview">System Overview</h2>
+
+<p>The Zoom Attendance Tracker calculates meeting attendance hours by processing two data sources:</p>
+
+<div style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1rem 0;">
+  <div class="value-box">
+    <div class="label">Primary Source</div>
+    <div class="value">Webhooks</div>
+  </div>
+  <div class="value-box">
+    <div class="label">Fallback Source</div>
+    <div class="value">Bot Snapshots</div>
+  </div>
+  <div class="value-box">
+    <div class="label">Final Output</div>
+    <div class="value">presence_intervals</div>
+  </div>
+</div>
+
+<p><strong>Key principle:</strong> All hours displayed to users come from the <code>presence_intervals</code> table. This table is rebuilt every 2 minutes by a BigQuery JS-UDF state machine that processes raw webhook events.</p>
+
+<h2 id="data-flow">Data Flow Diagram</h2>
+
+<div class="diagram-container">
+  <div class="diagram-title">End-to-End Data Pipeline</div>
+  <pre class="mermaid">
+flowchart TB
+    subgraph Sources["Data Sources"]
+        ZW["Zoom Webhooks<br/>(Real-time events)"]
+        BOT["Scout Bot<br/>(30s polling - legacy)"]
+    end
+
+    subgraph Raw["Raw Tables (BigQuery)"]
+        PE["participant_events_p<br/>(partitioned by event_date)"]
+        RS["room_snapshots_v2<br/>(partitioned by event_date)"]
+        RM["room_mappings<br/>(UUID → Room Name)"]
+    end
+
+    subgraph Processing["Processing Layer"]
+        JS["BigQuery JS-UDF<br/>State Machine"]
+        IDENT["Identity Resolution<br/>(name → email)"]
+        ROOM["Room Name Resolution<br/>(UUID → name)"]
+    end
+
+    subgraph Output["Output Table"]
+        PI["presence_intervals<br/>(partitioned by event_date)"]
+    end
+
+    subgraph Consumers["Consumers"]
+        DASH["Dashboard UI"]
+        API["REST API"]
+        RPT["Reports/Exports"]
+    end
+
+    ZW -->|participant_joined<br/>participant_left<br/>breakout_room_joined<br/>breakout_room_left| PE
+    BOT -->|30s snapshots| RS
+    BOT -->|calibration| RM
+
+    PE --> JS
+    RS -->|historical dates| JS
+    RM --> ROOM
+
+    ROOM --> JS
+    PE --> IDENT
+    RS --> IDENT
+    IDENT --> JS
+
+    JS --> PI
+
+    PI --> DASH
+    PI --> API
+    PI --> RPT
+  </pre>
+</div>
+
+<h2 id="raw-tables">Raw Data Tables</h2>
+
+<h3>1. participant_events_p <span class="badge badge-primary">PRIMARY</span></h3>
+<p>Raw webhook events from Zoom. This is the source of truth for attendance tracking.</p>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>Column</th>
+      <th>Type</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>event_date</code></td>
+      <td>DATE</td>
+      <td><strong>Partition key.</strong> IST date when event was received (UTC timestamp converted to IST)</td>
+    </tr>
+    <tr>
+      <td><code>event_timestamp</code></td>
+      <td>TIMESTAMP</td>
+      <td>Exact UTC time of the event</td>
+    </tr>
+    <tr>
+      <td><code>event_type</code></td>
+      <td>STRING</td>
+      <td>One of: <code>participant_joined</code>, <code>participant_left</code>, <code>meeting.participant_joined</code>, <code>meeting.participant_left</code>, <code>breakout_room_joined</code>, <code>breakout_room_left</code></td>
+    </tr>
+    <tr>
+      <td><code>meeting_id</code></td>
+      <td>INT64</td>
+      <td>Zoom meeting ID (the recurring ID like 89757349012)</td>
+    </tr>
+    <tr>
+      <td><code>meeting_uuid</code></td>
+      <td>STRING</td>
+      <td>Unique instance ID for this specific meeting session</td>
+    </tr>
+    <tr>
+      <td><code>participant_name</code></td>
+      <td>STRING</td>
+      <td>Display name shown in Zoom (can change mid-meeting)</td>
+    </tr>
+    <tr>
+      <td><code>participant_email</code></td>
+      <td>STRING</td>
+      <td>Email if available (often NULL for external participants)</td>
+    </tr>
+    <tr>
+      <td><code>participant_id</code></td>
+      <td>STRING</td>
+      <td>Zoom's internal participant ID (changes on reconnect)</td>
+    </tr>
+    <tr>
+      <td><code>room_uuid</code></td>
+      <td>STRING</td>
+      <td>Breakout room UUID (for breakout events only)</td>
+    </tr>
+    <tr>
+      <td><code>room_name</code></td>
+      <td>STRING</td>
+      <td>Room name at event time (may be placeholder like "Room-abc123")</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>2. room_snapshots_v2 <span class="badge badge-warning">LEGACY</span></h3>
+<p>Bot-captured snapshots from Scout Bot polling every 30 seconds. Used for historical dates before webhook-primary cutover (2026-07-20).</p>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>Column</th>
+      <th>Type</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>event_date</code></td>
+      <td>DATE</td>
+      <td><strong>Partition key.</strong> IST date of the snapshot</td>
+    </tr>
+    <tr>
+      <td><code>snapshot_time</code></td>
+      <td>TIMESTAMP</td>
+      <td>Exact UTC time when bot captured this snapshot</td>
+    </tr>
+    <tr>
+      <td><code>room_name</code></td>
+      <td>STRING</td>
+      <td>Room name (includes prefix like "0.Main Room", "5.2:Team Name")</td>
+    </tr>
+    <tr>
+      <td><code>participant_name</code></td>
+      <td>STRING</td>
+      <td>Display name shown in Zoom at snapshot time</td>
+    </tr>
+    <tr>
+      <td><code>participant_email</code></td>
+      <td>STRING</td>
+      <td>Email if visible to bot</td>
+    </tr>
+    <tr>
+      <td><code>alone_in_room</code></td>
+      <td>BOOLEAN</td>
+      <td>Whether participant was alone in this room at snapshot time</td>
+    </tr>
+    <tr>
+      <td><code>meeting_id</code></td>
+      <td>STRING</td>
+      <td>Zoom meeting ID</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>3. room_mappings</h3>
+<p>Maps breakout room UUIDs to human-readable names. UUIDs rotate daily when rooms are recreated.</p>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>Column</th>
+      <th>Type</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>mapping_date</code></td>
+      <td>DATE</td>
+      <td>IST date this mapping is valid for</td>
+    </tr>
+    <tr>
+      <td><code>room_uuid</code></td>
+      <td>STRING</td>
+      <td>Zoom's internal UUID for the breakout room</td>
+    </tr>
+    <tr>
+      <td><code>room_name</code></td>
+      <td>STRING</td>
+      <td>Human-readable room name (e.g., "5.2:Accurest-Meeting Room:Strategist")</td>
+    </tr>
+    <tr>
+      <td><code>mapped_at</code></td>
+      <td>TIMESTAMP</td>
+      <td>When this mapping was captured (newer = more accurate)</td>
+    </tr>
+    <tr>
+      <td><code>meeting_id</code></td>
+      <td>STRING</td>
+      <td>Meeting where this room exists</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout callout-info">
+  <strong>Why UUIDs rotate daily</strong>
+  When breakout rooms are closed and reopened, Zoom assigns new UUIDs. The same room name "5.2:Sales Team" might have UUID "abc123" on Monday and "xyz789" on Tuesday. The <code>room_mappings</code> table captures these daily mappings.
+</div>
+
+<hr>
+
+<h2 id="room-mapping">Room Mapping Logic</h2>
+
+<div class="diagram-container">
+  <div class="diagram-title">Room Name Resolution Priority</div>
+  <pre class="mermaid">
+flowchart LR
+    subgraph Input
+        UUID["room_uuid from webhook"]
+    end
+
+    subgraph Resolution["Resolution Order (Newest Knowledge Wins)"]
+        EV["1. Latest event with<br/>non-placeholder name"]
+        MAP["2. room_mappings table<br/>(newest mapped_at)"]
+        ORIG["3. Original event<br/>room_name"]
+    end
+
+    subgraph Output
+        NAME["Final room_name"]
+    end
+
+    UUID --> EV
+    EV -->|"compare timestamps"| MAP
+    MAP --> ORIG
+    ORIG --> NAME
+
+    EV -->|"ev_ts > mapped_at"| NAME
+    MAP -->|"mapped_at > ev_ts"| NAME
+  </pre>
+</div>
+
+<p><strong>Resolution rule:</strong> For each room UUID, compare the timestamp of the latest webhook event with a real name vs. the <code>mapped_at</code> timestamp in <code>room_mappings</code>. Whichever is newer wins.</p>
+
+<pre><code>CASE
+  WHEN room_uuid IS NULL THEN event.room_name
+  WHEN event_name IS NOT NULL AND mapping_name IS NOT NULL THEN
+       IF(mapped_at > event_ts, mapping_name, event_name)
+  WHEN event_name IS NOT NULL THEN event_name
+  WHEN mapping_name IS NOT NULL THEN mapping_name
+  ELSE event.room_name  -- fallback to placeholder
+END</code></pre>
+
+<h3>Room Name Prefixes</h3>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>Prefix</th>
+      <th>Category</th>
+      <th>Example</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>0.Main Room</code></td>
+      <td>main</td>
+      <td>Main meeting room</td>
+    </tr>
+    <tr>
+      <td><code>5.X:</code></td>
+      <td>breakout</td>
+      <td><code>5.2:Accurest-Meeting Room:Strategist</code></td>
+    </tr>
+    <tr>
+      <td><code>Break Time</code></td>
+      <td>break</td>
+      <td>Excluded from working hours</td>
+    </tr>
+    <tr>
+      <td><code>Room-xxxxxx</code></td>
+      <td>breakout</td>
+      <td>Placeholder when mapping not yet captured</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<hr>
+
+<h2 id="presence-intervals">Presence Intervals (Final Table)</h2>
+
+<p>The <code>presence_intervals</code> table is the <strong>single source of truth</strong> for all attendance hours. It contains one row per person per room segment.</p>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>Column</th>
+      <th>Type</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>interval_id</code></td>
+      <td>STRING</td>
+      <td>Unique UUID for this interval</td>
+    </tr>
+    <tr>
+      <td><code>event_date</code></td>
+      <td>DATE</td>
+      <td><strong>Partition key.</strong> IST date this interval is attributed to (login-date rule)</td>
+    </tr>
+    <tr>
+      <td><code>meeting_id</code></td>
+      <td>STRING</td>
+      <td>Zoom meeting ID</td>
+    </tr>
+    <tr>
+      <td><code>meeting_uuid</code></td>
+      <td>STRING</td>
+      <td>Specific meeting instance</td>
+    </tr>
+    <tr>
+      <td><code>participant_key</code></td>
+      <td>STRING</td>
+      <td><strong>Identity key:</strong> email when unambiguous, else normalized display name</td>
+    </tr>
+    <tr>
+      <td><code>participant_name</code></td>
+      <td>STRING</td>
+      <td>Display name (for UI display)</td>
+    </tr>
+    <tr>
+      <td><code>participant_email</code></td>
+      <td>STRING</td>
+      <td>Email if known</td>
+    </tr>
+    <tr>
+      <td><code>room_name</code></td>
+      <td>STRING</td>
+      <td>Room name (resolved via mapping logic)</td>
+    </tr>
+    <tr>
+      <td><code>room_category</code></td>
+      <td>STRING</td>
+      <td><code>main</code> | <code>breakout</code> | <code>break</code></td>
+    </tr>
+    <tr>
+      <td><code>start_ts</code></td>
+      <td>TIMESTAMP</td>
+      <td>When participant entered this room</td>
+    </tr>
+    <tr>
+      <td><code>end_ts</code></td>
+      <td>TIMESTAMP</td>
+      <td>When participant left this room</td>
+    </tr>
+    <tr>
+      <td><code>duration_seconds</code></td>
+      <td>INT64</td>
+      <td><code>end_ts - start_ts</code> in seconds</td>
+    </tr>
+    <tr>
+      <td><code>alone_seconds</code></td>
+      <td>INT64</td>
+      <td>Seconds spent alone in room (bot data only)</td>
+    </tr>
+    <tr>
+      <td><code>snapshot_count</code></td>
+      <td>INT64</td>
+      <td>Number of bot snapshots in this interval (0 for webhook-only)</td>
+    </tr>
+    <tr>
+      <td><code>source</code></td>
+      <td>STRING</td>
+      <td><code>webhook_fill</code> (main room) | <code>webhook_room</code> (breakout)</td>
+    </tr>
+    <tr>
+      <td><code>confidence</code></td>
+      <td>FLOAT64</td>
+      <td><code>0.5</code> (has leave event) | <code>0.35</code> (no leave event, capped)</td>
+    </tr>
+    <tr>
+      <td><code>built_at</code></td>
+      <td>TIMESTAMP</td>
+      <td>When this row was generated</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<hr>
+
+<h2 id="state-machine">State Machine Logic</h2>
+
+<p>The BigQuery JS-UDF processes events per participant and builds presence windows. Here's the step-by-step logic:</p>
+
+<div class="diagram-container">
+  <div class="diagram-title">State Machine Flow</div>
+  <pre class="mermaid">
+stateDiagram-v2
+    [*] --> Outside: Initial state
+
+    Outside --> InMeeting: participant_joined
+    InMeeting --> Outside: participant_left<br/>(if no rejoin after)
+    InMeeting --> InMeeting: participant_left<br/>(room transition, ignored)
+
+    InMeeting --> InBreakout: breakout_room_joined
+    InBreakout --> InMeeting: breakout_room_left
+    InBreakout --> InBreakout: breakout_room_joined<br/>(different room)
+
+    InMeeting --> [*]: meeting ends
+    InBreakout --> [*]: meeting ends
+  </pre>
+</div>
+
+<div class="flow-step">
+  <div class="step-num">1</div>
+  <div class="step-content">
+    <h4>Sort Events by Timestamp</h4>
+    <p>All events for a participant are sorted chronologically. Events span two partitions (D and D+1) to handle midnight-crossing meetings.</p>
+  </div>
+</div>
+
+<div class="flow-step">
+  <div class="step-num">2</div>
+  <div class="step-content">
+    <h4>Build Presence Windows</h4>
+    <p>Pair <code>participant_joined</code> → <code>participant_left</code> events. Each pair creates a "presence window" when the person was in the meeting.</p>
+  </div>
+</div>
+
+<div class="flow-step">
+  <div class="step-num">3</div>
+  <div class="step-content">
+    <h4>Apply 5-Second Room Transition Rule</h4>
+    <p>Zoom fires <code>participant_left</code> during room transitions. A <code>participant_left</code> within 5 seconds of a <code>breakout_room_joined</code> is ignored <strong>only if</strong> there's a <code>participant_joined</code> after it.</p>
+  </div>
+</div>
+
+<div class="flow-step">
+  <div class="step-num">4</div>
+  <div class="step-content">
+    <h4>Coalesce Micro-Disconnects</h4>
+    <p>If someone disconnects and rejoins within 30 seconds, merge into one continuous window (network glitch, not real exit).</p>
+  </div>
+</div>
+
+<div class="flow-step">
+  <div class="step-num">5</div>
+  <div class="step-content">
+    <h4>Tile Window with Breakout Events</h4>
+    <p>Within each presence window, use <code>breakout_room_joined</code>/<code>breakout_room_left</code> events to split time into room segments.</p>
+  </div>
+</div>
+
+<div class="flow-step">
+  <div class="step-num">6</div>
+  <div class="step-content">
+    <h4>Apply Caps and Filters</h4>
+    <p>Each segment is filtered by minimum duration (5s) and capped at maximum duration (10 hours for Main Room, 4 hours for no-leave segments).</p>
+  </div>
+</div>
+
+<h3>Window Tiling Example</h3>
+
+<pre><code>Presence Window: 09:00 ────────────────────────────────────── 17:00 (leave)
+
+Events:
+  09:00  participant_joined
+  10:30  breakout_room_joined (Room A)
+  12:00  breakout_room_left
+  14:00  breakout_room_joined (Room B)
+  16:00  breakout_room_left
+  17:00  participant_left
+
+Result Segments:
+  ├─ 09:00 - 10:30  Main Room     (1.5 hr)
+  ├─ 10:30 - 12:00  Room A        (1.5 hr)
+  ├─ 12:00 - 14:00  Main Room     (2.0 hr)
+  ├─ 14:00 - 16:00  Room B        (2.0 hr)
+  └─ 16:00 - 17:00  Main Room     (1.0 hr)
+                                  ────────
+                    Total:         8.0 hr</code></pre>
+
+<hr>
+
+<h2 id="business-rules">Business Rules & Constants</h2>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>Constant</th>
+      <th>Value</th>
+      <th>Purpose</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>TRANSITION_GRACE_MS</code></td>
+      <td>5,000 ms (5 sec)</td>
+      <td>Window to detect room transitions. A <code>participant_left</code> within 5s of a <code>breakout_room_joined</code> is considered a room move, not a meeting exit — <strong>but only if there's a subsequent rejoin</strong>.</td>
+    </tr>
+    <tr>
+      <td><code>COALESCE_GAP_MS</code></td>
+      <td>30,000 ms (30 sec)</td>
+      <td>Micro-disconnects under 30s are merged into continuous presence.</td>
+    </tr>
+    <tr>
+      <td><code>SEG_MIN_MS</code></td>
+      <td>5,000 ms (5 sec)</td>
+      <td>Minimum segment duration. Shorter segments are dropped (filters Zoom's double-fire noise).</td>
+    </tr>
+    <tr>
+      <td><code>SEG_CAP_MS</code></td>
+      <td>600 minutes (10 hr)</td>
+      <td>Maximum single segment. Prevents runaway intervals from missing leave events.</td>
+    </tr>
+    <tr>
+      <td><code>NO_LEAVE_CAP_MS</code></td>
+      <td>240 minutes (4 hr)</td>
+      <td>Cap for segments without an explicit leave event (lower confidence).</td>
+    </tr>
+    <tr>
+      <td><code>IST_OFFSET_MINUTES</code></td>
+      <td>330 (5h 30m)</td>
+      <td>Offset from UTC to IST for date attribution.</td>
+    </tr>
+    <tr>
+      <td><code>EARLY_CUTOFF</code></td>
+      <td>08:00 IST</td>
+      <td>Events before 08:00 IST with no explicit join are considered yesterday's meeting tail (webhook-only edge case).</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout callout-warning">
+  <strong>Login-Date Attribution Rule</strong>
+  A session belongs ENTIRELY to the IST day the person logged in. If you join at 23:00 IST on July 22 and leave at 02:00 IST on July 23, all 3 hours count toward July 22. This matches Zoom's official daily report behavior.
+</div>
+
+<hr>
+
+<h2 id="identity">Identity Resolution</h2>
+
+<p>Participants are identified by <code>participant_key</code>, which is either their email (preferred) or normalized display name (fallback).</p>
+
+<div class="diagram-container">
+  <div class="diagram-title">Identity Resolution Flow</div>
+  <pre class="mermaid">
+flowchart LR
+    subgraph Sources
+        WH["Webhook events<br/>(name, email)"]
+        BOT["Bot snapshots<br/>(name, email)"]
+    end
+
+    subgraph Resolution
+        PAIRS["Collect all<br/>name → email pairs"]
+        COUNT["Count distinct emails<br/>per name"]
+        DECIDE{{"Exactly 1 email?"}}
+    end
+
+    subgraph Output
+        EMAIL["participant_key = email"]
+        NAME["participant_key = normalized_name"]
+    end
+
+    WH --> PAIRS
+    BOT --> PAIRS
+    PAIRS --> COUNT
+    COUNT --> DECIDE
+    DECIDE -->|Yes| EMAIL
+    DECIDE -->|No| NAME
+  </pre>
+</div>
+
+<h3>Name Normalization</h3>
+
+<pre><code>LOWER(
+  REGEXP_REPLACE(
+    REGEXP_REPLACE(
+      REGEXP_REPLACE(name, r'\s*\([^)]*\)\s*', ''),  -- remove (parenthetical)
+      r'\s+', ' '                                     -- collapse whitespace
+    ),
+    r'^\s+|\s+$', ''                                  -- trim
+  )
+)</code></pre>
+
+<p>Example: <code>"Sayli Sonone (Verve)"</code> → <code>"sayli sonone"</code></p>
+
+<hr>
+
+<h2 id="edge-cases">Edge Cases & Fixes</h2>
+
+<h3>1. 5-Second Rule Bug (Fixed 2026-07-23)</h3>
+
+<div class="callout callout-danger">
+  <strong>Problem</strong>
+  A participant's real exit was ignored because it occurred within 5 seconds of a breakout room join, causing 10+ hours of phantom Main Room time.
+</div>
+
+<p><strong>Root cause:</strong> The original 5-second rule assumed any <code>participant_left</code> near a <code>breakout_room_joined</code> was a room transition. But if someone joins a breakout and then leaves the meeting entirely within 5 seconds, their exit was being filtered out.</p>
+
+<p><strong>Fix:</strong> Check if there's any <code>participant_joined</code> AFTER the <code>participant_left</code>. No rejoin = real exit, not a room transition.</p>
+
+<pre><code>function isRoomTransition(t) {
+  // FIX: Only treat as transition if there's a rejoin AFTER this left
+  var hasRejoinAfter = false;
+  for (var j = 0; j < events.length; j++) {
+    if (JOINS.indexOf(events[j].et) >= 0 && events[j].ts.getTime() > t) {
+      hasRejoinAfter = true;
+      break;
+    }
+  }
+  if (!hasRejoinAfter) return false;  // no rejoin = real exit
+
+  // ... rest of 5-second proximity check
+}</code></pre>
+
+<h3>2. Midnight-Crossing Meetings</h3>
+
+<p><strong>Problem:</strong> Meetings that span midnight could attribute hours to the wrong day or create duplicate entries.</p>
+
+<p><strong>Fix:</strong> The builder reads TWO partitions (D and D+1) but only creates intervals for sessions that STARTED on day D. Sessions starting on D+1 are handled by tomorrow's build.</p>
+
+<h3>3. Zoom Double-Fire Events</h3>
+
+<p><strong>Problem:</strong> Zoom sometimes sends identical events twice within milliseconds.</p>
+
+<p><strong>Fix:</strong> Events with identical (event_type, room, timestamp) within 5 seconds are deduplicated.</p>
+
+<h3>4. Room UUID Changes Mid-Day</h3>
+
+<p><strong>Problem:</strong> If breakout rooms are recreated during a meeting, UUIDs change but names stay the same.</p>
+
+<p><strong>Fix:</strong> "Newest knowledge wins" resolution compares timestamps from both event stream and mapping table.</p>
+
+<hr>
+
+<h2>Appendix: SQL Queries</h2>
+
+<h3>Calculate Total Hours for a Date</h3>
+
+<pre><code>SELECT
+  participant_name,
+  participant_email,
+  ROUND(SUM(duration_seconds) / 3600, 2) AS total_hours,
+  COUNT(*) AS segments
+FROM `breakout_room_calibrator.presence_intervals`
+WHERE event_date = '2026-07-22'
+GROUP BY participant_name, participant_email
+ORDER BY total_hours DESC</code></pre>
+
+<h3>Find Segments for a Specific Person</h3>
+
+<pre><code>SELECT
+  room_name,
+  room_category,
+  FORMAT_TIMESTAMP('%H:%M:%S', start_ts) AS start_time,
+  FORMAT_TIMESTAMP('%H:%M:%S', end_ts) AS end_time,
+  ROUND(duration_seconds / 60, 1) AS minutes,
+  source,
+  confidence
+FROM `breakout_room_calibrator.presence_intervals`
+WHERE event_date = '2026-07-22'
+  AND LOWER(participant_name) LIKE '%sayli%'
+ORDER BY start_ts</code></pre>
+
+<h3>Rebuild a Date (via API)</h3>
+
+<pre><code>curl -X POST "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/intervals/rebuild" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{"date": "2026-07-22"}'</code></pre>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
+    flowchart: { curve: 'basis' }
+  });
+</script>
