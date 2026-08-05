@@ -222,7 +222,8 @@ export async function fetchParticipants() {
 
 export async function fetchTeamAttendance(teamId, date, includeUnmatched = false) {
   // v2: reads from presence_intervals (materialized single source of truth).
-  // Backend auto-builds intervals on-demand if they don't exist for the date.
+  // Read-only: viewing never triggers an interval build — Cloud Scheduler
+  // owns freshness (2-min today rebuild + 15-min self-heal sweep).
   // includeUnmatched: also return meeting participants who match no roster
   // member (name drift) so Team View can warn instead of silently dropping
   // them. Opt-in because the check is global — the Dashboard calls this once
@@ -232,8 +233,8 @@ export async function fetchTeamAttendance(teamId, date, includeUnmatched = false
 }
 
 export async function fetchTeamAttendanceRange(teamId, startDate, endDate) {
-  // v2: reads from presence_intervals. Auto-builds up to 15 unbuilt dates
-  // in the range; for larger backfills hit POST /intervals/backfill once.
+  // v2: reads from presence_intervals. Read-only — never builds; for dates
+  // the scheduler's 35-day sweep doesn't cover, hit POST /intervals/backfill.
   return apiFetch(`/teams/${teamId}/attendance/range_v2?start=${startDate}&end=${endDate}`);
 }
 

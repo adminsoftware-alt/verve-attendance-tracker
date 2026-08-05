@@ -12771,14 +12771,12 @@ from zt_intervals import *  # noqa: F401,F403 — split from app.py, see zt_inte
 # lost — but capped tighter than a normal fill, because "no leave event" could
 # also mean they left and we never heard. 4h default = at most a half-day of
 # benefit-of-the-doubt, never a 10h phantom.
-# Page-load auto-build kill switch. 'true' (default) = pages may trigger
-# builds (legacy behavior). Set to 'false' on Cloud Run ONCE the Cloud
-# Scheduler jobs own freshness (2-min today rebuild + /intervals/auto-build
-# sweep) — pages then become pure readers and never pay build latency.
-# Recent days (today/yesterday) are kept fresh by the hourly + nightly rebuild
-# Cloud Scheduler jobs. The Team View pivot only re-materializes one of those
-# days on view if it's gone STALER than this (a scheduler missed/died) — so a
-# healthy system pays no rebuild latency, but a dead scheduler self-heals.
+# Page-load auto-build kill switch (PAGELOAD_AUTO_BUILD, zt_intervals.py).
+# DEFAULT 'false' since 2026-08-05: every view is a pure reader and never
+# triggers a build, so a paused Cloud Scheduler stays paused instead of being
+# revived by whoever opens the dashboard. Builds run only when something calls
+# /intervals/rebuild, /intervals/auto-build, or /intervals/backfill. Set the
+# env var to 'true' to restore the legacy lazy-build-on-view behavior.
 # --- Inherited-meeting (overnight-spillover) guard ------------------------
 # Zoom meetings can run 24h+. When one is left running across IST midnight its
 # tail lands on the NEXT day's partition starting at ~00:00, with the whole
@@ -13151,33 +13149,12 @@ def team_attendance_v2(team_id, date):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        # Auto-build behaviour:
-        #   - TODAY's date: ALWAYS rebuild so Team View reflects fresh snapshots
-        #     (idempotent load-job WRITE_TRUNCATE — cheap to redo)
-        #   - past dates: only build if not yet materialized
+        # PURE READER (2026-08-05): opening Team View no longer triggers an
+        # interval build. Freshness is owned entirely by Cloud Scheduler
+        # (intervals-rebuild-today-2min + intervals-auto-build-sweep); a page
+        # view just reads what those jobs materialized. Use POST
+        # /intervals/rebuild or /intervals/backfill to build a date on demand.
         _ensure_presence_intervals_table()
-        is_today = (report_date == get_ist_date())
-        if is_today:
-            try:
-                _rebuild_today_guarded(report_date)
-            except Exception as e:
-                print(f"[TeamV2] Today auto-build failed for {report_date}: {e}")
-        else:
-            check_q = f"""
-            SELECT COUNT(*) AS n FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-            WHERE event_date = @date
-            """
-            check_rows = list(client.query(check_q, job_config=bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
-            )).result())
-            if check_rows and (check_rows[0].n or 0) == 0:
-                print(f"[TeamV2] No intervals for {report_date} — auto-building")
-                try:
-                    build_presence_intervals(report_date)
-                except Exception as e:
-                    print(f"[TeamV2] Auto-build failed for {report_date}: {e}")
-                    # Continue with empty intervals — endpoint still returns the
-                    # team roster with zeros instead of erroring.
 
         # Team-member -> presence_intervals bridge uses NORMALIZED names so
         # Zoom rejoin variants ("Kajal Yadav-1") link to the "Kajal Yadav"
@@ -13427,7 +13404,7 @@ def team_attendance_range_v2(team_id):
 
     Query: ?start=YYYY-MM-DD&end=YYYY-MM-DD[&format=csv]
     Same JSON shape as v1 /teams/<id>/attendance/range so the frontend swaps
-    cleanly. Auto-builds up to 15 unbuilt dates in the range.
+    cleanly. PURE READER — never builds intervals (see below).
     """
     try:
         start_date = validate_date_format(request.args.get('start'))
@@ -13435,9 +13412,10 @@ def team_attendance_range_v2(team_id):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        built, still_missing = _auto_build_dates_in_range(start_date, end_date)
-        if built:
-            print(f"[RangeV2] auto-built {built} dates for {team_id} {start_date}..{end_date}")
+        # PURE READER (2026-08-05): opening Team View no longer triggers an
+        # interval build. Cloud Scheduler owns freshness; for dates outside its
+        # 35-day sweep, run POST /intervals/backfill once.
+        built, still_missing = 0, 0
 
         norm_pi = _sql_normalize_name('dk.participant_name')
         norm_tm = _sql_normalize_name('tm.member_name')
@@ -13651,9 +13629,10 @@ def team_monthly_report_v2(team_id):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        built, still_missing = _auto_build_dates_in_range(start_date, end_date)
-        if built:
-            print(f"[MonthlyV2] auto-built {built} dates for {team_id} {year}-{month:02d}")
+        # PURE READER (2026-08-05): opening Team View no longer triggers an
+        # interval build. Cloud Scheduler owns freshness; for dates outside its
+        # 35-day sweep, run POST /intervals/backfill once.
+        built, still_missing = 0, 0
 
         norm_pi = _sql_normalize_name('dk.participant_name')
         norm_tm = _sql_normalize_name('tm.member_name')
@@ -13854,31 +13833,33 @@ def attendance_summary_v2(date):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        # Auto-build behaviour:
-        #   - TODAY's date: ALWAYS rebuild so Day View reflects fresh snapshots
-        #     (idempotent load-job WRITE_TRUNCATE — cheap to redo)
-        #   - past dates: only build if not yet materialized
+        # Auto-build behaviour — OFF by default (PAGELOAD_AUTO_BUILD, 2026-08-05):
+        # viewing a day must not trigger a build. Builds happen only via the
+        # explicit endpoints (/intervals/rebuild, /intervals/auto-build,
+        # /intervals/backfill). With the flag on, the old behavior returns:
+        #   - TODAY's date: rebuild so Day View reflects fresh snapshots
+        #   - past dates: build only if not yet materialized
         _ensure_presence_intervals_table()
-        is_today = (report_date == get_ist_date())
-        if is_today:
-            try:
-                _rebuild_today_guarded(report_date)
-            except Exception as e:
-                print(f"[SummaryV2] Today auto-build failed for {report_date}: {e}")
-        else:
-            check_q = f"""
-            SELECT COUNT(*) AS n FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-            WHERE event_date = @date
-            """
-            check_rows = list(client.query(check_q, job_config=bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
-            )).result())
-            if check_rows and (check_rows[0].n or 0) == 0:
-                print(f"[SummaryV2] No intervals for {report_date} — auto-building")
+        if PAGELOAD_AUTO_BUILD:
+            if report_date == get_ist_date():
                 try:
-                    build_presence_intervals(report_date)
+                    _rebuild_today_guarded(report_date)
                 except Exception as e:
-                    print(f"[SummaryV2] Auto-build failed for {report_date}: {e}")
+                    print(f"[SummaryV2] Today auto-build failed for {report_date}: {e}")
+            else:
+                check_q = f"""
+                SELECT COUNT(*) AS n FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+                WHERE event_date = @date
+                """
+                check_rows = list(client.query(check_q, job_config=bigquery.QueryJobConfig(
+                    query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
+                )).result())
+                if check_rows and (check_rows[0].n or 0) == 0:
+                    print(f"[SummaryV2] No intervals for {report_date} — auto-building")
+                    try:
+                        build_presence_intervals(report_date)
+                    except Exception as e:
+                        print(f"[SummaryV2] Auto-build failed for {report_date}: {e}")
 
         # Pull all intervals for the date, ordered by participant + start_ts
         q = f"""

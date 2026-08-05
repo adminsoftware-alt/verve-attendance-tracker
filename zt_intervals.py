@@ -69,7 +69,12 @@ WEBHOOK_FILL_NO_LEAVE_CAP_MINUTES = int(os.environ.get('WEBHOOK_FILL_NO_LEAVE_CA
 WEBHOOK_SEGMENT_MIN_SECONDS = 5
 
 
-PAGELOAD_AUTO_BUILD = os.environ.get('PAGELOAD_AUTO_BUILD', 'true').lower() != 'false'
+# Page-load auto-build. DEFAULT OFF since 2026-08-05: opening a view must
+# never kick off an interval build — builds are owned by the explicit
+# endpoints (/intervals/rebuild, /intervals/auto-build, /intervals/backfill),
+# whether a human or Cloud Scheduler calls them. Set PAGELOAD_AUTO_BUILD=true
+# to restore the old lazy-build-on-view behavior.
+PAGELOAD_AUTO_BUILD = os.environ.get('PAGELOAD_AUTO_BUILD', 'false').lower() == 'true'
 
 
 SETTLING_STALE_MINUTES = int(os.environ.get('SETTLING_STALE_MINUTES', '90'))
