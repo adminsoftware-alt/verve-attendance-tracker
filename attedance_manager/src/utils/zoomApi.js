@@ -8,6 +8,7 @@ const ZOOM_API_BASE = 'https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app'
 // ─── FETCH HELPERS ─────────────────────────────────────
 
 import { authHeaders } from './storage';
+import { dayMinutes } from './parser';
 
 async function apiFetch(path) {
   const res = await fetch(`${ZOOM_API_BASE}${path}`, { headers: authHeaders() });
@@ -20,8 +21,11 @@ async function apiFetch(path) {
 // ─── LIVE DATA (who's where right now) ─────────────────
 
 function istDate() {
+  // Business date, not calendar date: the attendance day runs 05:00->05:00
+  // IST, so before 05:00 IST "today" is still yesterday's business day.
+  // IST offset (+330 min) minus the 5h day-start (-300 min) = +30 min.
   const now = new Date();
-  return new Date(now.getTime() + 330 * 60000).toISOString().slice(0, 10);
+  return new Date(now.getTime() + 30 * 60000).toISOString().slice(0, 10);
 }
 
 export async function fetchLiveRooms(date) {
@@ -86,7 +90,8 @@ export function transformSummaryToEmployees(summaryData) {
       totalMinutes: totalMin,
       duration: (h > 0 && m > 0) ? `${h}hr ${m}min` : h > 0 ? `${h}hr` : `${m}min`,
       sessions: 1,
-      rooms: rooms.sort((a, b) => (a.start || '').localeCompare(b.start || '')),
+      // Business-day order: post-midnight rooms (before 05:00) sort last
+      rooms: rooms.sort((a, b) => dayMinutes(a.start) - dayMinutes(b.start)),
     };
   }).sort((a, b) => a.name.localeCompare(b.name));
 }

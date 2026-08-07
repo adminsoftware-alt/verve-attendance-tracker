@@ -1,4 +1,4 @@
-import { timeToMin } from '../utils/parser';
+import { dayMinutes } from '../utils/parser';
 
 const COLORS = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#f97316','#6366f1','#14b8a6','#e11d48','#84cc16'];
 const colorMap = {};
@@ -18,8 +18,10 @@ export default function RoomTable({ rooms }) {
 
   // Timeline — skip entirely when no room has a parseable time
   // (Math.min/max on empty arrays would give Infinity → invalid CSS)
-  const starts = rooms.map(r => timeToMin(r.start)).filter(t => t > 0);
-  const ends = rooms.map(r => timeToMin(r.end)).filter(t => t > 0);
+  // dayMinutes: post-midnight times (before 05:00) plot at the RIGHT end
+  // of the business day, e.g. 00:33 renders past 23:00, not before 06:00.
+  const starts = rooms.map(r => dayMinutes(r.start)).filter(t => t > 0);
+  const ends = rooms.map(r => dayMinutes(r.end)).filter(t => t > 0);
   const hasTimes = starts.length > 0 || ends.length > 0;
   const minT = hasTimes ? Math.min(...starts, ...ends) : 0;
   const maxT = hasTimes ? Math.max(...starts, ...ends) : 0;
@@ -40,7 +42,7 @@ export default function RoomTable({ rooms }) {
         <div style={s.hourRow}>
           {hours.map(({ h, p }) => (
             <span key={h} style={{ ...s.hourLabel, left: p + '%' }}>
-              {String(h).padStart(2, '0') + ':00'}
+              {String(h % 24).padStart(2, '0') + ':00'}
             </span>
           ))}
         </div>
@@ -49,8 +51,8 @@ export default function RoomTable({ rooms }) {
             <div key={h} style={{ ...s.gridLine, left: p + '%' }} />
           ))}
           {rooms.map((r, i) => {
-            const rs = timeToMin(r.start);
-            const re = timeToMin(r.end);
+            const rs = dayMinutes(r.start);
+            const re = dayMinutes(r.end);
             const left = ((rs - minT) / range) * 100;
             const width = Math.max(((re - rs) / range) * 100, 0.5);
             return (

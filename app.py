@@ -6789,23 +6789,21 @@ def test_camera_qos():
 # ATTENDANCE DASHBOARD - Live View + Heatmap + Direct BigQuery Access
 # ==============================================================================
 
-# Dates >= this use presence_intervals (webhook-primary) for live/heatmap views;
-# earlier dates still read room_snapshots_v2, which stopped being written when
-# the bot went idle on 2026-07-20 (Room Mapper replaced the 30s polling panel).
-WEBHOOK_PRIMARY_CUTOVER = '2026-07-21'
-
-
 @app.route('/attendance/live', methods=['GET'])
 def attendance_live():
     """
-    Real-time: Who's in which room RIGHT NOW.
-    Webhook-primary dates: latest presence_intervals state (rebuilt every 2 min).
-    Historical dates: latest snapshot data grouped by room.
+    Real-time: Who's in which room RIGHT NOW, from presence_intervals
+    (rebuilt every 5 min by the BQ scheduled query calling
+    sp_build_presence_intervals).
 
     GET /attendance/live
     GET /attendance/live?date=2026-04-03
+
+    Default date is the BUSINESS date (05:00->05:00 IST): at 01:00 IST an
+    ongoing shift is filed under yesterday's business date, so querying the
+    midnight-based "today" would show an empty office.
     """
-    target_date = request.args.get('date', get_ist_date())
+    target_date = request.args.get('date', get_business_date())
     try:
         target_date = validate_date_format(target_date)
     except ValueError as e:
@@ -6813,11 +6811,10 @@ def attendance_live():
 
     try:
         client = get_bq_client()
-        if target_date >= WEBHOOK_PRIMARY_CUTOVER:
-            # "Now" = the latest interval end_ts (the last 2-min rebuild).
-            # Anyone whose interval ends within 90s of that is still present;
-            # people who left earlier have older end_ts and drop out.
-            query = f"""
+        # "Now" = the latest interval end_ts (the last 5-min build).
+        # Anyone whose interval ends within 90s of that is still present;
+        # people who left earlier have older end_ts and drop out.
+        query = f"""
             WITH ivs AS (
               SELECT
                 participant_name,
@@ -6859,69 +6856,6 @@ def attendance_live():
             GROUP BY ar.room_name
             ORDER BY ar.room_name
             """
-        else:
-            query = f"""
-        WITH latest_snapshot AS (
-          SELECT MAX(snapshot_time) as max_time
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
-          WHERE event_date = '{target_date}'
-        ),
-        -- All room names seen during the entire day
-        all_rooms AS (
-          SELECT DISTINCT room_name
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
-          WHERE event_date = '{target_date}'
-            AND room_name IS NOT NULL AND room_name != ''
-        ),
-        -- Per-room latest snapshot WITHIN A 60s WINDOW of the global max.
-        -- Different polling sources (e.g. Zoom App SDK sitting in Main Room
-        -- vs the broader monitor that sees all breakouts) can each push at
-        -- slightly different cadences. If we just take rows where
-        -- snapshot_time = global_max, the room set whose source polled
-        -- last "wins" and every other room appears empty. Window-based
-        -- per-room latest lets ALL recently-active rooms contribute.
-        recent_per_room AS (
-          SELECT s.room_name, MAX(s.snapshot_time) as room_latest
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2` s
-          CROSS JOIN latest_snapshot ls
-          WHERE s.event_date = '{target_date}'
-            AND s.snapshot_time > TIMESTAMP_SUB(ls.max_time, INTERVAL 60 SECOND)
-            AND s.room_name IS NOT NULL AND s.room_name != ''
-          GROUP BY s.room_name
-        ),
-        -- Who is in each room at THAT room's latest snapshot in the window.
-        -- If a participant appears in two rooms' latest snapshots (they
-        -- moved within the 60s window), keep only their most recent room
-        -- so they don't ghost in both places.
-        current_state AS (
-          SELECT
-            s.room_name,
-            s.participant_name,
-            s.participant_email,
-            s.participant_uuid,
-            s.snapshot_time
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2` s
-          INNER JOIN recent_per_room rpr
-            ON s.room_name = rpr.room_name AND s.snapshot_time = rpr.room_latest
-          WHERE s.event_date = '{target_date}'
-            AND s.participant_name NOT LIKE '%Scout%'
-          QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY COALESCE(NULLIF(s.participant_uuid, ''), LOWER(TRIM(s.participant_name)))
-            ORDER BY s.snapshot_time DESC
-          ) = 1
-        )
-        SELECT
-          ar.room_name,
-          ARRAY_AGG(
-            STRUCT(cs.participant_name, cs.participant_email, cs.participant_uuid)
-          ) as participants,
-          COUNTIF(cs.participant_name IS NOT NULL) as participant_count,
-          MAX(cs.snapshot_time) as snapshot_time
-        FROM all_rooms ar
-        LEFT JOIN current_state cs ON ar.room_name = cs.room_name
-        GROUP BY ar.room_name
-        ORDER BY ar.room_name
-        """
         results = list(client.query(query).result())
 
         rooms = []
@@ -6952,7 +6886,9 @@ def attendance_live():
         total_people = sum(r['participant_count'] for r in rooms)
         occupied_count = sum(1 for r in rooms if r['participant_count'] > 0)
 
-        # Staleness check: warn if data is older than 5 minutes
+        # Staleness check: the table is rebuilt every 5 min by the BQ
+        # scheduled query, so allow 2x that (plus build runtime) before
+        # flagging STALE — a 5-min threshold would flap on every cycle.
         data_status = 'NO_DATA'
         stale_seconds = None
         if snapshot_time:
@@ -6963,7 +6899,7 @@ def attendance_live():
                     st_parsed = datetime.strptime(snapshot_time[:19], '%Y-%m-%d %H:%M:%S')
                 age = (datetime.utcnow() - st_parsed.replace(tzinfo=None)).total_seconds()
                 stale_seconds = int(age)
-                data_status = 'HEALTHY' if age < 300 else 'STALE'
+                data_status = 'HEALTHY' if age < 660 else 'STALE'
             except Exception:
                 data_status = 'UNKNOWN'
 
@@ -6997,7 +6933,7 @@ def attendance_heatmap(date=None):
     GET /attendance/heatmap?date=2026-04-03&interval=30
     """
     if date is None:
-        date = request.args.get('date', get_ist_date())
+        date = request.args.get('date', get_business_date())
     try:
         date = validate_date_format(date)
     except ValueError as e:
@@ -7013,11 +6949,9 @@ def attendance_heatmap(date=None):
 
     try:
         client = get_bq_client()
-        if date >= WEBHOOK_PRIMARY_CUTOVER:
-            # Webhook-primary: occupancy from presence_intervals — each interval
-            # contributes to every time slot it overlaps. More accurate than the
-            # legacy 30s samples, and it's the same data every report reads.
-            head = f"""
+        # Occupancy from presence_intervals — each interval contributes to
+        # every time slot it overlaps; same data every report reads.
+        head = f"""
         WITH ivs AS (
           SELECT
             room_name,
@@ -7042,35 +6976,6 @@ def attendance_heatmap(date=None):
             end_ist,
             INTERVAL {interval} MINUTE
           )) AS slot
-        ),
-            """
-        else:
-            head = f"""
-        WITH snapshots AS (
-          SELECT
-            room_name,
-            -- participant_key = UUID when available, else normalized name.
-            -- Ensures renamed participants aren't double-counted per slot.
-            COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
-            snapshot_time,
-            TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots_v2`
-          WHERE event_date = '{date}'
-            AND participant_name NOT LIKE '%Scout%'
-            AND room_name IS NOT NULL AND room_name != ''
-        ),
-        -- Bucket each snapshot into time slots
-        time_bucketed AS (
-          SELECT
-            room_name,
-            participant_key,
-            TIMESTAMP_TRUNC(snapshot_ist, MINUTE) as snapshot_min,
-            FORMAT_TIMESTAMP('%H:%M',
-              TIMESTAMP_SECONDS(
-                DIV(UNIX_SECONDS(TIMESTAMP_TRUNC(snapshot_ist, MINUTE)), {interval} * 60) * {interval} * 60
-              )
-            ) as time_slot
-          FROM snapshots
         ),
             """
         query = head + f"""
@@ -10680,17 +10585,18 @@ def list_unrecognized_participants(date):
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        # 1. Get all zoom participants for the date
+        # 1. Get all zoom participants for the date (from presence_intervals —
+        # the webhook-built source of truth; snapshots stopped in July 2026)
         zoom_query = f"""
         SELECT DISTINCT participant_name, participant_email
-        FROM `{dataset_ref}.room_snapshots_v2`
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
         WHERE event_date = @date
           AND participant_name IS NOT NULL AND participant_name != ''
           AND LOWER(participant_name) NOT LIKE '%scout%'
         ORDER BY participant_name
         """
         job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("date", "STRING", report_date)]
+            query_parameters=[bigquery.ScalarQueryParameter("date", "DATE", report_date)]
         )
         zoom_rows = list(client.query(zoom_query, job_config=job_config).result())
 
@@ -10706,7 +10612,9 @@ def list_unrecognized_participants(date):
         reg_names = set()  # all known lowercase names
         reg_first_names = {}  # first_name -> [full_names]
         for r in reg_rows:
-            name_low = r.participant_name.lower().strip()
+            name_low = (r.participant_name or '').lower().strip()
+            if not name_low:
+                continue
             reg_names.add(name_low)
             normed = normalize_participant_name(r.participant_name).lower().strip()
             reg_names.add(normed)
@@ -10839,127 +10747,32 @@ def list_unrecognized_monthly():
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
 
-        # Per-day, per-name stats across the full month.
+        # Per-day, per-name stats from presence_intervals (one source of
+        # hours, same as classified-monthly). active_mins keeps the legacy
+        # semantic for non-employees: BREAKOUT-room time only — Main Room
+        # lobby time never counted toward presence.
         query = f"""
-        WITH deduped AS (
-            SELECT
-                s.event_date,
-                s.participant_name,
-                s.participant_email,
-                s.room_name,
-                s.snapshot_time
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.participant_name IS NOT NULL AND s.participant_name != ''
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-              AND LOWER(s.room_name) != 'main room'
-              AND LOWER(s.room_name) NOT LIKE '0.main%'
-              AND LOWER(s.room_name) NOT LIKE '%break time%'
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY s.event_date, LOWER(TRIM(s.participant_name)), s.snapshot_time
-                ORDER BY s.room_name
-            ) = 1
-        ),
-        ordered_snaps AS (
-            SELECT
-                event_date,
-                LOWER(TRIM(participant_name)) as name_key,
-                participant_name,
-                participant_email,
-                snapshot_time,
-                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                LAG(snapshot_time) OVER (
-                    PARTITION BY event_date, LOWER(TRIM(participant_name))
-                    ORDER BY snapshot_time
-                ) as prev_time
-            FROM deduped
-        ),
-        daily_stats AS (
-            SELECT
-                event_date,
-                name_key,
-                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
-                MAX(participant_email) as participant_email,
-                MIN(snapshot_ist) as first_seen,
-                MAX(snapshot_ist) as last_seen,
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_time IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) <= 300 THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_time, SECOND) / 60.0
-                        ELSE 0  -- Long gap = session boundary, not active time
-                    END
-                )) as active_mins
-            FROM ordered_snaps
-            GROUP BY event_date, name_key
-        ),
-        -- Break time from BREAK TIME room visits
-        break_room_time AS (
-            SELECT
-                s.event_date,
-                LOWER(TRIM(s.participant_name)) as name_key,
-                -- Dedup multi-source duplicates: if the MonitorPanel is open
-                -- on >1 device (HR client + VM), each polls every 30s and
-                -- writes its own row. Bucketing to 30-second windows keeps
-                -- one count per polling cycle regardless of source.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 0.5 as break_room_mins
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.participant_name IS NOT NULL AND s.participant_name != ''
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-              AND LOWER(s.room_name) LIKE '%break time%'
-            GROUP BY s.event_date, name_key
-        ),
-        -- Break time = Break Time room presence only. Gap-based detection
-        -- removed (long absences from session boundaries / outages were
-        -- being mis-attributed as huge breaks).
-        room_occupancy AS (
-            SELECT snapshot_time, room_name,
-                   COUNT(DISTINCT LOWER(TRIM(participant_name))) as cnt
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date >= @start_date AND event_date <= @end_date
-              AND room_name IS NOT NULL AND room_name != ''
-              AND LOWER(participant_name) NOT LIKE '%scout%'
-            GROUP BY snapshot_time, room_name
-        ),
-        daily_isolation AS (
-            SELECT
-                s.event_date,
-                LOWER(TRIM(s.participant_name)) as name_key,
-                -- Bucket to 30-second windows to dedup multi-source polls.
-                COUNT(DISTINCT DIV(UNIX_SECONDS(s.snapshot_time), 30)) * 30 as isolation_seconds
-            FROM `{dataset_ref}.room_snapshots_v2` s
-            INNER JOIN room_occupancy ro ON s.snapshot_time = ro.snapshot_time AND s.room_name = ro.room_name
-            WHERE s.event_date >= @start_date AND s.event_date <= @end_date
-              AND s.room_name IS NOT NULL AND s.room_name != ''
-              AND LOWER(s.participant_name) NOT LIKE '%scout%'
-              AND LOWER(s.room_name) NOT LIKE '%break time%'
-              -- Alone in Main Room isn't isolation in the work sense.
-              AND LOWER(s.room_name) != 'main room'
-              AND LOWER(s.room_name) NOT LIKE '0.main%'
-              AND ro.cnt = 1
-            GROUP BY s.event_date, name_key
-        )
         SELECT
-            ds.event_date,
-            ds.name_key,
-            ds.participant_name,
-            ds.participant_email,
-            FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
-            FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
-            ds.active_mins,
-            COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
-            COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins
-        FROM daily_stats ds
-        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.name_key = brt.name_key
-        LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.name_key = di.name_key
-        ORDER BY ds.name_key, ds.event_date
+            pi.event_date,
+            pi.participant_key AS name_key,
+            ANY_VALUE(pi.participant_name) AS participant_name,
+            COALESCE(MAX(pi.participant_email), '') AS participant_email,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(pi.start_ts), INTERVAL 330 MINUTE)) AS first_seen_ist,
+            FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(pi.end_ts), INTERVAL 330 MINUTE)) AS last_seen_ist,
+            CAST(CEILING(SUM(IF(pi.room_category = 'breakout', pi.duration_seconds, 0)) / 60.0) AS INT64) AS active_mins,
+            CAST(CEILING(SUM(IF(pi.room_category = 'break', pi.duration_seconds, 0)) / 60.0) AS INT64) AS break_mins,
+            CAST(CEILING(SUM(pi.alone_seconds) / 60.0) AS INT64) AS isolation_mins
+        FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}` pi
+        WHERE pi.event_date BETWEEN @start_date AND @end_date
+          AND pi.participant_name IS NOT NULL AND pi.participant_name != ''
+          AND LOWER(pi.participant_name) NOT LIKE '%scout%'
+        GROUP BY pi.event_date, pi.participant_key
+        ORDER BY name_key, pi.event_date
         """
 
         job_config = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
-            bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+            bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+            bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
         ])
         rows = list(client.query(query, job_config=job_config).result())
 
@@ -10988,44 +10801,35 @@ def list_unrecognized_monthly():
             if getattr(r, 'participant_email', None):
                 reg_emails.add(r.participant_email.lower().strip())
 
-        # ── UUID / email bridge ─────────────────────────────────────
-        # Fetch every (uuid, name, email) triple seen in snapshots this month
-        # so we can recognise a participant even if they were renamed to a
-        # brand-new string (same UUID) or if their email alone matches a
-        # registered employee.
+        # ── Email bridge ────────────────────────────────────────────
+        # Every (name_key, email) pair seen in presence_intervals this month,
+        # so a participant is recognised if their email alone matches a
+        # registered employee (handles renames to brand-new strings).
+        # presence_intervals carries no Zoom UUID — identity there is already
+        # the normalized name + email, so the old UUID bridge is gone.
         bridge_rows = list(client.query(
             f"""
             SELECT DISTINCT
-              COALESCE(NULLIF(participant_uuid, ''), '') AS uuid,
-              LOWER(TRIM(participant_name)) AS name_key,
+              participant_key AS name_key,
               LOWER(TRIM(COALESCE(participant_email, ''))) AS email_key
-            FROM `{dataset_ref}.room_snapshots_v2`
-            WHERE event_date >= @start_date AND event_date <= @end_date
+            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+            WHERE event_date BETWEEN @start_date AND @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
             """,
             job_config=bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
-                bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+                bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
             ]),
         ).result())
 
-        uuid_to_names = {}
-        uuid_to_emails = {}
-        email_to_uuids = {}
-        name_to_uuids = {}
+        email_to_names = {}
         name_to_emails = {}
         for b in bridge_rows:
-            u = b.uuid or ''
             nk = b.name_key or ''
             ek = b.email_key or ''
-            if u:
-                if nk: uuid_to_names.setdefault(u, set()).add(nk)
-                if ek: uuid_to_emails.setdefault(u, set()).add(ek)
-            if nk:
-                if u: name_to_uuids.setdefault(nk, set()).add(u)
-                if ek: name_to_emails.setdefault(nk, set()).add(ek)
-            if ek and u:
-                email_to_uuids.setdefault(ek, set()).add(u)
+            if nk and ek:
+                name_to_emails.setdefault(nk, set()).add(ek)
+                email_to_names.setdefault(ek, set()).add(nk)
 
         team_keywords = set()
         seen_teams = set()
@@ -11076,46 +10880,34 @@ def list_unrecognized_monthly():
             return False
 
         # Seed "known" sets from registry + name matches.
-        known_uuids = set()
         known_emails = set(reg_emails)
         known_name_keys = set()
 
-        for name_key in set(list(name_to_uuids.keys()) + list(name_to_emails.keys())):
+        for name_key in name_to_emails.keys():
             if _name_in_registry(name_key):
                 known_name_keys.add(name_key)
-                for u in name_to_uuids.get(name_key, set()):
-                    if u: known_uuids.add(u)
                 for e in name_to_emails.get(name_key, set()):
                     if e: known_emails.add(e)
 
-        # Transitive closure: if a UUID is known, any other email/name it ever
-        # used is also known; if an email is known, any UUID it appeared under
-        # is also known. Keep iterating until nothing new is added.
+        # Transitive closure over emails: if an email is known, every name
+        # that ever used it is known too (and vice versa).
         changed = True
         while changed:
             changed = False
-            for u in list(known_uuids):
-                for e in uuid_to_emails.get(u, set()):
-                    if e and e not in known_emails:
-                        known_emails.add(e); changed = True
-                for nk in uuid_to_names.get(u, set()):
+            for e in list(known_emails):
+                for nk in email_to_names.get(e, set()):
                     if nk and nk not in known_name_keys:
                         known_name_keys.add(nk); changed = True
-            for e in list(known_emails):
-                for u in email_to_uuids.get(e, set()):
-                    if u and u not in known_uuids:
-                        known_uuids.add(u); changed = True
+                        for e2 in name_to_emails.get(nk, set()):
+                            if e2 and e2 not in known_emails:
+                                known_emails.add(e2)
 
         def is_recognized_row(name_key, raw_name):
-            """Augmented recognition: name → UUID → email transitive match."""
+            """Augmented recognition: name match, then email bridge."""
             if not name_key:
                 return True
             if name_key in known_name_keys:
                 return True
-            # UUID-based bridging: is any UUID used under this name known?
-            for u in name_to_uuids.get(name_key, set()):
-                if u and u in known_uuids:
-                    return True
             # Email-based bridging: is any email tied to this name known?
             for e in name_to_emails.get(name_key, set()):
                 if e and e in known_emails:
@@ -13841,7 +13633,7 @@ def attendance_summary_v2(date):
         #   - past dates: build only if not yet materialized
         _ensure_presence_intervals_table()
         if PAGELOAD_AUTO_BUILD:
-            if report_date == get_ist_date():
+            if report_date == get_business_date():
                 try:
                     _rebuild_today_guarded(report_date)
                 except Exception as e:

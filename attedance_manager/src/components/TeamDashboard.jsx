@@ -2,8 +2,11 @@ import { useState, useEffect, useCallback } from 'react';
 import { fetchTeams, fetchTeamAttendance } from '../utils/zoomApi';
 
 function istDate() {
+  // Business date, not calendar date: the attendance day runs 05:00->05:00
+  // IST, so before 05:00 IST "today" is still yesterday's business day.
+  // IST offset (+330 min) minus the 5h day-start (-300 min) = +30 min.
   const now = new Date();
-  return new Date(now.getTime() + 330 * 60000).toISOString().slice(0, 10);
+  return new Date(now.getTime() + 30 * 60000).toISOString().slice(0, 10);
 }
 
 function fmtMins(m) {

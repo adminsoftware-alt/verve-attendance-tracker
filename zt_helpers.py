@@ -5,8 +5,10 @@ from datetime import datetime, timedelta
 
 __all__ = [
     'IST_OFFSET',
+    'BUSINESS_DAY_START_HOUR',
     'get_ist_now',
     'get_ist_date',
+    'get_business_date',
     'utc_to_ist',
     'normalize_participant_name',
     'collapse_by_email',
@@ -26,6 +28,20 @@ def get_ist_now():
 def get_ist_date():
     """Get current date in IST (YYYY-MM-DD)"""
     return get_ist_now().strftime('%Y-%m-%d')
+
+
+# The attendance day runs 05:00 IST -> 05:00 IST (shifts cross midnight).
+# presence_intervals files each interval under the business date its session
+# started, and the BQ scheduled queries build "today" as
+# DATE(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 HOUR), 'Asia/Kolkata').
+# This helper MUST stay equivalent to that expression.
+BUSINESS_DAY_START_HOUR = 5
+
+
+def get_business_date():
+    """Current business date (YYYY-MM-DD): before 05:00 IST it is still
+    'yesterday' — matches how presence_intervals files post-midnight work."""
+    return (get_ist_now() - timedelta(hours=BUSINESS_DAY_START_HOUR)).strftime('%Y-%m-%d')
 
 
 def utc_to_ist(utc_dt):

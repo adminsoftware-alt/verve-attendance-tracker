@@ -2,8 +2,11 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { fetchTeams, fetchTeamAttendanceRange } from '../utils/zoomApi';
 
 function istDate() {
+  // Business date, not calendar date: the attendance day runs 05:00->05:00
+  // IST, so before 05:00 IST "today" is still yesterday's business day.
+  // IST offset (+330 min) minus the 5h day-start (-300 min) = +30 min.
   const now = new Date();
-  return new Date(now.getTime() + 330 * 60000).toISOString().slice(0, 10);
+  return new Date(now.getTime() + 30 * 60000).toISOString().slice(0, 10);
 }
 
 function fmtMins(m) {
@@ -59,9 +62,9 @@ export default function ReportBuilder({ user }) {
   const [teams, setTeams] = useState([]);
   const [selectedTeam, setSelectedTeam] = useState('');
   const [startDate, setStartDate] = useState(() => {
-    // IST-safe month start: toISOString() on a local Date shifts to the
-    // previous month between 00:00-05:30 IST.
-    const ist = new Date(Date.now() + 330 * 60000);
+    // Month start of the current BUSINESS day (05:00 IST boundary), so the
+    // default range agrees with istDate() below.
+    const ist = new Date(Date.now() + 30 * 60000);
     return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, '0')}-01`;
   });
   const [endDate, setEndDate] = useState(istDate);

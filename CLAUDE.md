@@ -5,11 +5,11 @@ This file provides complete guidance to Claude Code when working with this repos
 ## Project Overview
 
 **Zoom Breakout Room Tracker** - A production system deployed on Google Cloud Run that:
-- Tracks participant activity in Zoom breakout rooms via **SDK Monitoring** (polls every 30s)
-- Captures camera ON/OFF status via Dashboard QoS API
-- **No calibration needed** - SDK provides room names directly
-- Generates daily attendance CSV reports with IST timestamps
-- Scout Bot VM auto-joins meetings; HR clicks app once to start monitoring
+- Tracks participant activity in Zoom breakout rooms via **Zoom webhooks** (`participant_events_p`)
+- Materialises hours into `presence_intervals` via a **BigQuery stored procedure** refreshed every 5 min (see "presence_intervals refresh" below)
+- Attendance day = **business day, 05:00→05:00 IST** (shifts cross midnight)
+- Generates attendance reports/exports from that one table; frontend is the `attedance_manager/` React app
+- Legacy: SDK 30s snapshot monitoring (retired ~2026-07-20), camera QoS (dead — Zoom creds broken)
 
 **Cloud Run URLs:**
 - Backend API: `https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app`
@@ -95,8 +95,8 @@ gcloud.cmd run services logs tail breakout-room-calibrator --region us-central1 
 
 | Table | Schema | Purpose |
 |-------|--------|---------|
-| `room_snapshots_v2` | snapshot_id, snapshot_time, event_date, meeting_id, room_name, participant_name, participant_email, participant_uuid, inserted_at | **PRIMARY** - SDK polling data (every 30s); date-partitioned |
-| `presence_intervals` | participant_key, participant_name, participant_email, room_name, room_category, start_ts, end_ts, duration_seconds, confidence, event_date | **SOURCE OF TRUTH for hours** — built by `zt_intervals.build_presence_intervals`; every report reads this; date-partitioned |
+| `presence_intervals` | participant_key, participant_name, participant_email, room_name, room_category, start_ts, end_ts, duration_seconds, confidence, event_date, session_start_ts | **SOURCE OF TRUTH for hours** — built from `participant_events_p` by the BigQuery stored procedure `sp_build_presence_intervals(target_date)` (v10), refreshed by BQ scheduled queries (see below); every report reads this; date-partitioned. The attendance day is a BUSINESS day, **05:00→05:00 IST** — intervals are filed under the date their *session* started, so post-midnight work stays on the previous business date |
+| `room_snapshots_v2` | snapshot_id, snapshot_time, event_date, meeting_id, room_name, participant_name, participant_email, participant_uuid, inserted_at | **DEPRECATED** — SDK 30s polling data; stopped being written ~2026-07-20 when the bot went idle. Kept for pre-July-21 history; rename to `zz_deprecated_room_snapshots_v2` once remaining code reads are removed |
 | `participant_events_p` | event_id, event_type, event_timestamp, event_date, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, room_uuid, room_name, inserted_at | Webhook join/leave events (partitioned by event_date, clustered; replaced unpartitioned `participant_events` on 2026-07-17 — always reference via `BQ_EVENTS_TABLE`) |
 | `room_mappings` | mapping_id, meeting_id, meeting_uuid, room_uuid, room_name, room_index, mapping_date, mapped_at, source | UUID -> room name (legacy calibration) |
 | `camera_events` | event_id, event_type, event_timestamp, event_date, event_time, meeting_id, meeting_uuid, participant_id, participant_name, participant_email, camera_on, room_name, duration_seconds, inserted_at | Camera ON/OFF events |
@@ -211,15 +211,26 @@ The core problem: Zoom SDK uses GUIDs (`{E7F123FC-EE33-47D8-BC5E-C84FCD31E06F}`)
 - Verified entries auto-removed after 5 minutes
 - Prevents memory leaks from stale calibration data
 
-## Cloud Scheduler Jobs
+## presence_intervals refresh (BigQuery scheduled queries — NOT Cloud Scheduler)
 
-| Job | Region | Schedule (IST) | Endpoint | Purpose |
-|-----|--------|----------------|----------|---------|
-| `intervals-rebuild-today-2min` | asia-east1 | every 2 min, 8:00–23:59 | `/intervals/rebuild` | Keep today fresh |
-| `intervals-auto-build-sweep` | asia-east1 | every 15 min | `/intervals/auto-build` | Self-heal last 35 days |
-| `reconcile-zoom-nightly` | asia-east1 | 10:00 — **PAUSED** (Zoom S2S creds broken) | `/reconcile/zoom` | Cross-check vs Zoom records |
-| `hourly-sheets-update` | us-central1 | hourly 9–23 | `/sheets/update` | Google Sheets export |
-| `hourly-presence-intervals-today`, `daily-presence-intervals`, `email-monitor-alert` | us-central1 | **PAUSED** | — | Superseded / disabled |
+The Python builders and the 2-minute Cloud Scheduler refresh were **retired in Aug 2026**.
+The calculation now lives in a BigQuery stored procedure so it's inspectable and
+re-runnable by hand:
+
+- `sp_build_presence_intervals(target_date DATE)` — v10, built from `participant_events_p`
+- **BQ scheduled query** `presence-intervals-today` — every 5 min, 24/7, tz Asia/Kolkata
+- **BQ scheduled query** `presence-intervals-yesterday` — daily 06:00 IST
+- Both compute the target as `DATE(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 HOUR), 'Asia/Kolkata')`
+  — the **business date** (day runs 05:00→05:00 IST). This expression MUST stay in
+  sync with the procedure's `horizon` check and with `get_business_date()` in
+  `zt_helpers.py` (used for backend/frontend "today" defaults).
+- SQL sources: `01_verify_and_rollout.sql`, `02_build_presence_intervals_v10.sql`,
+  `03_backfill_v8.sql`, `04_scheduled_queries_v10.sql`
+
+**Old Cloud Scheduler jobs** (`intervals-rebuild-today-2min`, `intervals-auto-build-sweep`,
+`hourly-*`, `daily-presence-intervals`, `email-monitor-alert`, `reconcile-zoom-nightly`)
+are paused and should be **DELETED** — do not resume them; they would run the retired
+Python builder against the same table the stored procedure now owns.
 
 ## Environment Variables
 
@@ -372,6 +383,7 @@ src/
 
 ## Version History
 
+- **2026-08-07**: **Interval building moved to BigQuery.** `sp_build_presence_intervals` (v10) replaces the Python builders; two BQ scheduled queries (5-min today / 06:00 yesterday) replace Cloud Scheduler. Attendance day redefined as 05:00→05:00 IST (business day); `get_business_date()` added to `zt_helpers.py` and used as the default "today" in backend + frontend. `/attendance/live` + `/attendance/heatmap` read presence_intervals only (snapshot fallback and `WEBHOOK_PRIMARY_CUTOVER` removed; STALE threshold 300s→660s to fit the 5-min cadence). `/employees/unrecognized-monthly` + `/employees/unrecognized/<date>` migrated from `room_snapshots_v2` to `presence_intervals` (also fixes their permanent 500: STRING query params compared against the DATE `event_date` column). LiveDashboard polling 30s→120s. v8 fixed order-independent reconnect pairing + cross-day room-name resolution; v9 fixed phantom open-segment tails (cap 240→10 min, per-person); v10 fixed post-midnight day assignment via `session_start_ts`.
 - **2026-08-05**: **Views never build intervals.** Opening Team View / Day View / monthly exports used to run `build_presence_intervals` on page load (5+ BQ queries + a load job) — which silently did the paused Cloud Scheduler's work. `PAGELOAD_AUTO_BUILD` now defaults to **false**, the Team View v2 endpoints (`attendance_v2`, `attendance/range_v2`, `report/monthly_v2`) had their build calls removed outright, and `/attendance/summary_v2` (Day View) now respects the flag instead of calling the builder directly. Builds happen ONLY via `/intervals/rebuild`, `/intervals/auto-build`, or `/intervals/backfill`. **Consequence: with the scheduler jobs paused, `presence_intervals` goes stale until one of those endpoints is called — nothing self-heals anymore.**
 - **2026-07-20**: IST midnight-crossing fix — webhook-only participants (no bot snapshots) with events before 08:00 IST are now skipped. The 24h meeting crosses midnight; events at 01:00-04:00 IST are continuations from the previous day, not new sessions. Prevents phantom hours on the next day (e.g., Mahadev's 3hr on July 18 from July 17's meeting that crossed midnight).
 - **2026-07-17**: Events table switched to partitioned `participant_events_p` via code-pointer swap (zero downtime; old table dropped; always use `BQ_EVENTS_TABLE`). Temp `/admin/ops/partition-events` endpoint deleted. Duplicate us-central1 builder jobs paused. `reconcile-zoom-nightly` moved to 10:00 IST then paused (S2S creds broken). `load_mappings_from_bigquery` INT64/STRING mismatch fixed. Docs refreshed; credentials removed from repo docs; dead Supabase files removed.

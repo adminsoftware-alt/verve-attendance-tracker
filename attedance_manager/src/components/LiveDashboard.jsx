@@ -9,12 +9,18 @@ const HEAT_COLORS = [
   { bg: '#fed7aa', fg: '#c2410c' },
   { bg: '#fecaca', fg: '#dc2626' },
 ];
-const REFRESH_SEC = 30;
+// presence_intervals is rebuilt by the BQ scheduled query every 5 min, so
+// polling faster than ~2 min only re-reads unchanged data (each poll is a
+// BigQuery query — cost with no information gain).
+const REFRESH_SEC = 120;
 const AVATARS = ['#3b82f6','#10b981','#f59e0b','#8b5cf6','#ec4899','#06b6d4','#f97316','#ef4444','#6366f1','#14b8a6','#e11d48','#84cc16'];
 
 function istDate() {
+  // Business date, not calendar date: the attendance day runs 05:00->05:00
+  // IST, so before 05:00 IST "today" is still yesterday's business day.
+  // IST offset (+330 min) minus the 5h day-start (-300 min) = +30 min.
   const now = new Date();
-  return new Date(now.getTime() + 330 * 60000).toISOString().slice(0, 10);
+  return new Date(now.getTime() + 30 * 60000).toISOString().slice(0, 10);
 }
 function initials(name) {
   return name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();

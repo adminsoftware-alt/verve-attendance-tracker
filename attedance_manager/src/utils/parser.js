@@ -136,7 +136,7 @@ function parseNewFormat(rows) {
       totalMinutes: totalMin,
       duration: formatDuration(totalMin),
       sessions: emp.rawNames.size,
-      rooms: emp.rooms.sort((a, b) => (a.start || '').localeCompare(b.start || ''))
+      rooms: emp.rooms.sort((a, b) => dayMinutes(a.start) - dayMinutes(b.start))
     };
   }).sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -173,8 +173,8 @@ function parseOldFormat(rows) {
     // Prefer capitalized version (e.g. "Dev" over "dev")
     if (!/(-(DND|\d+|recording))$/i.test(rawName) && baseName && baseName[0] !== baseName[0].toLowerCase()) emp.name = baseName;
 
-    if (joined && (!emp.joined || joined < emp.joined)) emp.joined = joined;
-    if (left && (!emp.left || left > emp.left)) emp.left = left;
+    if (joined && (!emp.joined || dayMinutes(joined) < dayMinutes(emp.joined))) emp.joined = joined;
+    if (left && (!emp.left || dayMinutes(left) > dayMinutes(emp.left))) emp.left = left;
     emp.totalMinutes += parseDurationStr(durStr);
     emp.sessionCount++;
 
@@ -211,7 +211,7 @@ function parseOldFormat(rows) {
     totalMinutes: emp.totalMinutes,
     duration: formatDuration(emp.totalMinutes),
     sessions: emp.sessionCount,
-    rooms: emp.rooms.sort((a, b) => (a.start || '').localeCompare(b.start || ''))
+    rooms: emp.rooms.sort((a, b) => dayMinutes(a.start) - dayMinutes(b.start))
   })).sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -231,9 +231,10 @@ export function mergeDayEmployees(employees) {
     // Prefer capitalized name
     if (emp.name && emp.name[0] !== emp.name[0].toLowerCase()) m.name = emp.name;
     if (emp.email && !m.email) m.email = emp.email;
-    // Earliest joined, latest left
-    if (emp.joined && (!m.joined || emp.joined < m.joined)) m.joined = emp.joined;
-    if (emp.left && (!m.left || emp.left > m.left)) m.left = emp.left;
+    // Earliest joined, latest left — by business-day order (00:33 is LATER
+    // than 23:04 within a 05:00->05:00 day), never by string compare.
+    if (emp.joined && (!m.joined || dayMinutes(emp.joined) < dayMinutes(m.joined))) m.joined = emp.joined;
+    if (emp.left && (!m.left || dayMinutes(emp.left) > dayMinutes(m.left))) m.left = emp.left;
     // Combine rooms and minutes
     m.rooms = [...m.rooms, ...(emp.rooms || [])];
     m.totalMinutes = (m.totalMinutes || 0) + (emp.totalMinutes || 0);
@@ -241,18 +242,18 @@ export function mergeDayEmployees(employees) {
   }
 
   return Object.values(map).map(emp => {
-    // Sort rooms chronologically
-    emp.rooms.sort((a, b) => (a.start || '').localeCompare(b.start || ''));
-    // Fill joined from earliest room start if missing
+    // Sort rooms chronologically within the business day
+    emp.rooms.sort((a, b) => dayMinutes(a.start) - dayMinutes(b.start));
+    // Fill joined/left from rooms ONLY when missing. The backend computes
+    // first/last seen from real timestamps (correct across midnight) —
+    // never overwrite a value that is already present.
     const roomStarts = emp.rooms.map(r => r.start).filter(Boolean);
     const roomEnds = emp.rooms.map(r => r.end).filter(Boolean);
-    if (roomStarts.length) {
-      const earliest = roomStarts.sort()[0];
-      if (!emp.joined || earliest < emp.joined) emp.joined = earliest;
+    if (!emp.joined && roomStarts.length) {
+      emp.joined = roomStarts.sort((a, b) => dayMinutes(a) - dayMinutes(b))[0];
     }
-    if (roomEnds.length) {
-      const latest = roomEnds.sort().pop();
-      if (!emp.left || latest > emp.left) emp.left = latest;
+    if (!emp.left && roomEnds.length) {
+      emp.left = roomEnds.sort((a, b) => dayMinutes(a) - dayMinutes(b)).pop();
     }
     // Recalculate duration
     emp.duration = formatDuration(emp.totalMinutes);
@@ -260,10 +261,12 @@ export function mergeDayEmployees(employees) {
   }).sort((a, b) => a.name.localeCompare(b.name));
 }
 
-// Get today's date in IST (UTC+5:30) to match backend date boundaries
+// Today's BUSINESS date. The attendance day runs 05:00->05:00 IST, so
+// before 05:00 IST "today" is still yesterday's business day.
+// IST offset (+330 min) minus the 5h day-start (-300 min) = +30 min.
 export function todayIST() {
   const now = new Date();
-  const ist = new Date(now.getTime() + (330 * 60000));
+  const ist = new Date(now.getTime() + (30 * 60000));
   return ist.toISOString().slice(0, 10);
 }
 
@@ -271,6 +274,17 @@ export function timeToMin(t) {
   if (!t) return 0;
   const [h, m] = t.split(':').map(Number);
   return h * 60 + (m || 0);
+}
+
+// Minutes for ORDERING within a business day (05:00 -> 05:00 IST).
+// Times before 05:00 belong to the tail end of the previous evening's
+// shift, so "00:33" must sort AFTER "23:04" — add 24h to them.
+// Use this (never raw string compare or timeToMin) whenever comparing
+// or sorting "HH:MM" strings within one attendance day.
+export function dayMinutes(t) {
+  if (!t) return 0;
+  const m = timeToMin(t);
+  return m < 300 ? m + 1440 : m;
 }
 
 export function minToTime(m) {

@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
-import { timeToMin, minToTime, formatDuration, todayIST } from '../utils/parser';
+import { dayMinutes, minToTime, formatDuration, todayIST } from '../utils/parser';
 import { exportDayViewCsv } from '../utils/exportCsv';
 import { useDayData } from '../hooks/useData';
 import RoomTable from './RoomTable';
@@ -50,8 +50,8 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
       e.email.toLowerCase().includes(search.toLowerCase())
     );
     if (sortBy === 'name') list.sort((a, b) => a.name.localeCompare(b.name));
-    else if (sortBy === 'early') list.sort((a, b) => (a.joined ? timeToMin(a.joined) : 9999) - (b.joined ? timeToMin(b.joined) : 9999));
-    else if (sortBy === 'late') list.sort((a, b) => (timeToMin(b.joined) || 0) - (timeToMin(a.joined) || 0));
+    else if (sortBy === 'early') list.sort((a, b) => (a.joined ? dayMinutes(a.joined) : 9999) - (b.joined ? dayMinutes(b.joined) : 9999));
+    else if (sortBy === 'late') list.sort((a, b) => (dayMinutes(b.joined) || 0) - (dayMinutes(a.joined) || 0));
     else if (sortBy === 'duration') list.sort((a, b) => (b.totalMinutes || 0) - (a.totalMinutes || 0));
     return list;
   }, [employees, search, sortBy]);
@@ -59,8 +59,10 @@ export default function DayView({ allData, uploadedDates, onNavigateUpload }) {
   const stats = useMemo(() => {
     if (!employees.length) return null;
     const durs = employees.map(e => e.totalMinutes).filter(d => d > 0);
-    const joins = employees.filter(e => e.joined).map(e => timeToMin(e.joined));
-    const leaves = employees.map(e => timeToMin(e.left)).filter(t => t > 0);
+    // dayMinutes so a 00:33 logout averages as 24:33, not as early morning
+    // (minToTime wraps hours % 24 for display)
+    const joins = employees.filter(e => e.joined).map(e => dayMinutes(e.joined));
+    const leaves = employees.map(e => dayMinutes(e.left)).filter(t => t > 0);
     return {
       count: employees.length,
       avgDur: durs.length ? formatDuration(durs.reduce((a, b) => a + b, 0) / durs.length) : '--',

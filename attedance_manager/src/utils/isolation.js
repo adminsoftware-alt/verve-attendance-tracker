@@ -1,4 +1,7 @@
-import { timeToMin } from './parser';
+// dayMinutes (not timeToMin): overlap math must place post-midnight rooms
+// (before 05:00) at the end of the business day, or a 00:10 room would
+// falsely "overlap" someone's 00:00-05:00-looking morning.
+import { dayMinutes } from './parser';
 
 /**
  * Analyze isolation for a given date's employees.
@@ -20,8 +23,8 @@ export function analyzeIsolation(employees) {
       roomTimelines[rName].push({
         employee: emp.name,
         email: emp.email,
-        start: timeToMin(room.start),
-        end: timeToMin(room.end),
+        start: dayMinutes(room.start),
+        end: dayMinutes(room.end),
         startStr: room.start,
         endStr: room.end,
       });
@@ -37,8 +40,8 @@ export function analyzeIsolation(employees) {
     emp.rooms.forEach(room => {
       if (!room.isNamed) return;
       const rName = room.name;
-      const myStart = timeToMin(room.start);
-      let myEnd = timeToMin(room.end);
+      const myStart = dayMinutes(room.start);
+      let myEnd = dayMinutes(room.end);
       if (myEnd < myStart) myEnd += 1440; // interval crosses midnight
       const myDur = Math.max(myEnd - myStart, 0);
       totalNamedMinutes += myDur;
