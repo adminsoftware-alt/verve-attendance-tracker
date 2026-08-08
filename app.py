@@ -13019,7 +13019,14 @@ def team_attendance_v2(team_id, date):
                 SUM(IF(pi.room_category='break',    {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS break_seconds,
                 SUM(pi.alone_seconds) AS isolation_seconds,
                 SUM({_sql_billed_seconds('pi.duration_seconds')}) AS total_seconds,
-                SUM(IF(pi.confidence < 0.6, {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS lowconf_seconds,
+                -- LOWCONF cutoff 0.6 -> 0.4 (2026-08-08). The BQ builder
+                -- (sp_build_presence_intervals v11) emits only 0.35 (open
+                -- segment: no closing webhook, ending guessed) or 0.5 (closed
+                -- by a real webhook). At 0.6 EVERY row counted as low
+                -- confidence, so every person on every day showed the
+                -- "⚠ estimated" marker and it carried no information.
+                -- 0.4 flags only genuinely guessed endings.
+                SUM(IF(pi.confidence < 0.4, {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS lowconf_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
             FROM member_bridge mb
@@ -13269,7 +13276,14 @@ def team_attendance_range_v2(team_id):
                 SUM(IF(pi.room_category='break',    {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS break_seconds,
                 SUM(pi.alone_seconds) AS isolation_seconds,
                 SUM({_sql_billed_seconds('pi.duration_seconds')}) AS total_seconds,
-                SUM(IF(pi.confidence < 0.6, {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS lowconf_seconds,
+                -- LOWCONF cutoff 0.6 -> 0.4 (2026-08-08). The BQ builder
+                -- (sp_build_presence_intervals v11) emits only 0.35 (open
+                -- segment: no closing webhook, ending guessed) or 0.5 (closed
+                -- by a real webhook). At 0.6 EVERY row counted as low
+                -- confidence, so every person on every day showed the
+                -- "⚠ estimated" marker and it carried no information.
+                -- 0.4 flags only genuinely guessed endings.
+                SUM(IF(pi.confidence < 0.4, {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS lowconf_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
             FROM member_bridge mb
@@ -13484,7 +13498,14 @@ def team_monthly_report_v2(team_id):
                 SUM(IF(pi.room_category='break',    {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS break_seconds,
                 SUM(pi.alone_seconds)             AS isolation_seconds,
                 SUM({_sql_billed_seconds('pi.duration_seconds')}) AS total_seconds,
-                SUM(IF(pi.confidence < 0.6, {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS lowconf_seconds,
+                -- LOWCONF cutoff 0.6 -> 0.4 (2026-08-08). The BQ builder
+                -- (sp_build_presence_intervals v11) emits only 0.35 (open
+                -- segment: no closing webhook, ending guessed) or 0.5 (closed
+                -- by a real webhook). At 0.6 EVERY row counted as low
+                -- confidence, so every person on every day showed the
+                -- "⚠ estimated" marker and it carried no information.
+                -- 0.4 flags only genuinely guessed endings.
+                SUM(IF(pi.confidence < 0.4, {_sql_billed_seconds('pi.duration_seconds')}, 0)) AS lowconf_seconds,
                 MIN(pi.start_ts) AS first_seen_utc,
                 MAX(pi.end_ts)   AS last_seen_utc
             FROM member_bridge mb
