@@ -229,9 +229,12 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
     const mins = Number(r.active_minutes) || 0;
     const isoMins = Number(r.isolation_minutes) || 0;
     const brkMins = Number(r.break_minutes) || 0;
+    const totMins = Number(r.total_minutes) || 0;
     lookup[`${r.name}|${r.date}`] = {
       minutes: mins,
       hours: mins / 60,  // active_minutes already excludes break time
+      totalMinutes: totMins,
+      totalHours: totMins / 60,  // everything on Zoom, break included
       isolationMinutes: isoMins,
       isolationHours: isoMins / 60,
       breakMinutes: brkMins,
@@ -256,9 +259,12 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   // SHEET 1 — "Data" (raw rows, one per person per date)
   // ════════════════════════════════════════════════════════
   const dataWs = {};
+  // Total Zoom Hours is APPENDED last: existing spreadsheets ingest this
+  // sheet by column position, so new columns must never shift the old ones.
   const dataHeaders = [
     'Name', 'Login Date', 'Login Time', 'Logout date', 'Logout Time',
-    'Total number of minutes', 'Hours', 'Entity', 'Manager Name'
+    'Total number of minutes', 'Hours', 'Entity', 'Manager Name',
+    'Total Zoom Hours'
   ];
   dataHeaders.forEach((h, i) => writeCell(dataWs, 0, i, h, HEADER_STYLE));
 
@@ -281,15 +287,17 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
     writeCell(dataWs, row, 6, hours, NUM_CELL_STYLE);
     writeCell(dataWs, row, 7, teamName, { ...NUM_CELL_STYLE, alignment: { horizontal: 'left' } });
     writeCell(dataWs, row, 8, managerName, { ...NUM_CELL_STYLE, alignment: { horizontal: 'left' } });
+    const totalHours = Number(((Number(r.total_minutes) || 0) / 60).toFixed(4));
+    writeCell(dataWs, row, 9, totalHours, NUM_CELL_STYLE);
   });
 
   dataWs['!cols'] = [
     { wch: 24 }, { wch: 13 }, { wch: 11 }, { wch: 13 }, { wch: 11 },
-    { wch: 22 }, { wch: 10 }, { wch: 18 }, { wch: 20 },
+    { wch: 22 }, { wch: 10 }, { wch: 18 }, { wch: 20 }, { wch: 17 },
   ];
 
   // ════════════════════════════════════════════════════════
-  // SHEET 2 — "Pivot" (rows=names, cols=dates, cells=hours)
+  // SHEET — "Working Hours" (rows=names, cols=dates, cells=hours net of break)
   // ════════════════════════════════════════════════════════
   const pivotWs = {};
 
@@ -309,7 +317,7 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   });
 
   // Row 1 — title pair "SUM of Hours | Login Date"
-  writeCell(pivotWs, 1, 0, 'SUM of Hours', {
+  writeCell(pivotWs, 1, 0, 'SUM of Working Hours', {
     font: { bold: true, color: { rgb: 'FF64748B' }, sz: 10 },
     alignment: { horizontal: 'left' },
   });
@@ -423,6 +431,105 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   // Freeze the header rows and first column
   // Bug fix: Use correct xlsx-js-style API for freeze panes
   pivotWs['!views'] = [{ state: 'frozen', xSplit: 2, ySplit: 3 }];
+
+  // ════════════════════════════════════════════════════════
+  // SHEET — "Total Zoom Hours" (raw time on Zoom, break included)
+  //
+  // Working Hours minus this sheet is exactly the Break Time sheet.
+  // NO threshold shading here, deliberately: early-logout, overtime and the
+  // monthly target are all defined against working hours, so applying them
+  // to a number that includes break would flag everyone who took lunch.
+  // ════════════════════════════════════════════════════════
+  const totalWs = {};
+
+  // Row 0 — day-of-week / Holiday labels
+  dates.forEach((ds, i) => {
+    const dow = dateFromStr(ds).getDay();
+    if (holidayMap[ds]) {
+      writeCell(totalWs, 0, 2 + i, 'Holiday', HOLIDAY_LABEL_STYLE);
+    } else if (dow === 0) {
+      writeCell(totalWs, 0, 2 + i, 'Sunday', DOW_LABEL_STYLE);
+    } else if (dow === 6) {
+      writeCell(totalWs, 0, 2 + i, 'Saturday', DOW_LABEL_STYLE);
+    } else {
+      writeCell(totalWs, 0, 2 + i, '', DOW_LABEL_STYLE);
+    }
+  });
+
+  // Row 1 — title pair
+  writeCell(totalWs, 1, 0, 'Total Zoom Hours', {
+    font: { bold: true, color: { rgb: 'FF64748B' }, sz: 10 },
+    alignment: { horizontal: 'left' },
+  });
+  writeCell(totalWs, 1, 1, '(break included)', {
+    font: { italic: true, color: { rgb: 'FF94A3B8' }, sz: 9 },
+    alignment: { horizontal: 'left' },
+  });
+
+  // Row 2 — header: Name | (blank) | date1 | ... | Grand Total
+  writeCell(totalWs, 2, 0, 'Name', HEADER_STYLE);
+  writeCell(totalWs, 2, 1, '', HEADER_STYLE);
+  dates.forEach((ds, i) => {
+    writeCell(totalWs, 2, 2 + i, dateFromStr(ds), { ...HEADER_STYLE, numFmt: 'dd-mmm' });
+  });
+  const totalGrandCol = 2 + dates.length;
+  writeCell(totalWs, 2, totalGrandCol, 'Grand Total', HEADER_STYLE);
+
+  // Per-person rows
+  const totalColTotals = new Array(dates.length).fill(0);
+  names.forEach((name, nIdx) => {
+    const r = 3 + nIdx;
+    writeCell(totalWs, r, 0, name, NAME_CELL_STYLE);
+    writeCell(totalWs, r, 1, '', BLANK_CELL_STYLE);
+
+    let personTotal = 0;
+    dates.forEach((ds, dIdx) => {
+      const col = 2 + dIdx;
+      if (holidayMap[ds]) {
+        writeCell(totalWs, r, col, 'H', HOLIDAY_CELL_STYLE);
+        return;
+      }
+      const h = lookup[`${name}|${ds}`]?.totalHours || 0;
+      if (h > 0) {
+        writeCell(totalWs, r, col, Number(h.toFixed(2)), NUM_CELL_STYLE);
+        personTotal += h;
+        totalColTotals[dIdx] += h;
+      } else {
+        writeCell(totalWs, r, col, '', BLANK_CELL_STYLE);
+      }
+    });
+
+    writeCell(totalWs, r, totalGrandCol, Number(personTotal.toFixed(2)), GRAND_TOTAL_STYLE);
+  });
+
+  // Grand Total row
+  const totalGrandRow = 3 + names.length;
+  writeCell(totalWs, totalGrandRow, 0, 'Grand Total', GRAND_TOTAL_STYLE);
+  writeCell(totalWs, totalGrandRow, 1, '', GRAND_TOTAL_STYLE);
+  let totalGrandSum = 0;
+  totalColTotals.forEach((t, i) => {
+    if (holidayMap[dates[i]]) {
+      writeCell(totalWs, totalGrandRow, 2 + i, 'H', { ...GRAND_TOTAL_STYLE, font: { bold: true, color: { rgb: 'FF4338CA' } } });
+      return;
+    }
+    totalGrandSum += t;
+    writeCell(totalWs, totalGrandRow, 2 + i, Number(t.toFixed(2)), GRAND_TOTAL_STYLE);
+  });
+  writeCell(totalWs, totalGrandRow, totalGrandCol, Number(totalGrandSum.toFixed(2)), GRAND_TOTAL_STYLE);
+
+  // Notes — no colour legend, because this sheet has no shading
+  const totalNoteStart = totalGrandRow + 2;
+  writeCell(totalWs, totalNoteStart,     0, 'Note:', NOTE_LABEL_STYLE);
+  writeCell(totalWs, totalNoteStart,     1, 'Total time on Zoom — main room + breakout + break, unadjusted', NOTE_VALUE_STYLE);
+  writeCell(totalWs, totalNoteStart + 1, 1, 'Working Hours sheet = this sheet minus the Break Time sheet', NOTE_VALUE_STYLE);
+  writeCell(totalWs, totalNoteStart + 2, 1, 'H', HOLIDAY_LABEL_STYLE);
+  writeCell(totalWs, totalNoteStart + 2, 2, 'Holiday (not counted as working day or leave)', NOTE_VALUE_STYLE);
+
+  const totalCols = [{ wch: 24 }, { wch: 4 }];
+  dates.forEach(() => totalCols.push({ wch: 9 }));
+  totalCols.push({ wch: 12 });
+  totalWs['!cols'] = totalCols;
+  totalWs['!views'] = [{ state: 'frozen', xSplit: 2, ySplit: 3 }];
 
   // ════════════════════════════════════════════════════════
   // SHEET 3 — "Isolation" (pivot of isolation hours per person per day)
@@ -725,7 +832,10 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   // ════════════════════════════════════════════════════════
   const wb = XLSX.utils.book_new();
   const mon3 = monthName.slice(0, 3);
-  XLSX.utils.book_append_sheet(wb, pivotWs,  `${mon3} ${year} Pivot`);
+  // Sheet order mirrors the on-screen tabs: Total Zoom Hours first, then
+  // Working Hours (renamed from "Pivot" 2026-08-10 to match the UI).
+  XLSX.utils.book_append_sheet(wb, totalWs,  `${mon3} ${year} Total Zoom Hours`);
+  XLSX.utils.book_append_sheet(wb, pivotWs,  `${mon3} ${year} Working Hours`);
   XLSX.utils.book_append_sheet(wb, isoWs,    `${mon3} ${year} Isolation`);
   XLSX.utils.book_append_sheet(wb, breakWs,  `${mon3} ${year} Break Time`);
   XLSX.utils.book_append_sheet(wb, leaveWs,  `${mon3} ${year} Leaves`);

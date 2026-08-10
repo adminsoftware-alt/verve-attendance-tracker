@@ -8,6 +8,11 @@ import { downloadTeamPivotExcel } from '../utils/teamPivotExcel';
 import MonthlyPivotTables from './MonthlyPivotTables';
 import AttendanceEditModal from './AttendanceEditModal';
 
+// Pseudo-team covering everyone who joined the Zoom meeting, roster or not.
+// Must match ALL_MEMBERS_TEAM_ID in app.py — the backend routes on this id.
+const ALL_MEMBERS_ID = '__all__';
+const ALL_MEMBERS_NAME = 'All Members';
+
 function istDate() {
   // Business date, not calendar date: the attendance day runs 05:00->05:00
   // IST, so before 05:00 IST "today" is still yesterday's business day.
@@ -182,7 +187,9 @@ export default function TeamView({ user }) {
         setMonthlyData(data);
         setDataLoading(false);
       }
-      const team = teams.find(t => t.team_id === selectedTeam) || {};
+      const team = selectedTeam === ALL_MEMBERS_ID
+        ? { team_id: ALL_MEMBERS_ID, team_name: ALL_MEMBERS_NAME }
+        : (teams.find(t => t.team_id === selectedTeam) || {});
       downloadTeamPivotExcel(data, team, year, month);
     } catch (e) {
       setError(e.message);
@@ -207,6 +214,9 @@ export default function TeamView({ user }) {
         <div style={s.controls}>
           <select value={selectedTeam} onChange={e => setSelectedTeam(e.target.value)} style={s.select}>
             <option value="">Select team</option>
+            {/* Managers are scoped to their own teams, so they don't get the
+                everyone-in-the-meeting view. */}
+            {!isManager && <option value={ALL_MEMBERS_ID}>{ALL_MEMBERS_NAME}</option>}
             {teams.map(t => <option key={t.team_id} value={t.team_id}>{t.team_name}</option>)}
           </select>
           <div style={s.modeToggle}>

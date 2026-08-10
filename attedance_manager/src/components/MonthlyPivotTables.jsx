@@ -76,8 +76,10 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
       const mins = Number(r.active_minutes) || 0;
       const isoMins = Number(r.isolation_minutes) || 0;
       const brkMins = Number(r.break_minutes) || 0;
+      const totMins = Number(r.total_minutes) || 0;
       lookupMap[`${r.name}|${r.date}`] = {
         hours: mins / 60,              // active_minutes already excludes break time
+        totalHours: totMins / 60,      // everything on Zoom, break included
         isolationHours: isoMins / 60,
         breakHours: brkMins / 60,
         status: r.status || null,
@@ -108,10 +110,16 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
       {/* Sub-tabs */}
       <div style={s.tabBar}>
         <button
+          onClick={() => setView('total')}
+          style={{ ...s.tab, ...(view === 'total' ? s.tabOn : {}) }}
+        >
+          Total Zoom Hours
+        </button>
+        <button
           onClick={() => setView('hours')}
           style={{ ...s.tab, ...(view === 'hours' ? s.tabOn : {}) }}
         >
-          Hours Pivot
+          Working Hours
         </button>
         <button
           onClick={() => setView('breaks')}
@@ -134,6 +142,9 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
       </div>
 
       {/* Active view */}
+      {view === 'total' && (
+        <TotalZoomPivot dates={dates} names={names} lookup={lookup} holidayMap={holidayMap} />
+      )}
       {view === 'hours' && (
         <HoursPivot dates={dates} names={names} lookup={lookup} targetHours={targetHours} workingDays={workingDays} holidayMap={holidayMap} canEdit={canEdit} onEditCell={onEditCell} dailyData={monthlyData?.daily_data} />
       )}
@@ -150,7 +161,97 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
   );
 }
 
-// ─── Hours pivot ─────────────────────────────────────
+// ─── Total Zoom hours pivot ──────────────────────────
+// Raw time on Zoom: main room + breakout + Break Time, nothing added and
+// nothing taken off. Working Hours is this minus break, so the two tabs
+// differ by exactly the Break Time column. Deliberately has no target,
+// no early-logout and no overtime shading — those thresholds are defined
+// against working hours and would read as false alarms here.
+function TotalZoomPivot({ dates, names, lookup, holidayMap = {} }) {
+  const colTotals = new Array(dates.length).fill(0);
+  const personTotals = {};
+  names.forEach(name => {
+    let total = 0;
+    dates.forEach((ds, i) => {
+      const h = lookup[`${name}|${ds}`]?.totalHours || 0;
+      total += h;
+      colTotals[i] += h;
+    });
+    personTotals[name] = total;
+  });
+  const grandTotal = Object.values(personTotals).reduce((a, b) => a + b, 0);
+
+  return (
+    <div>
+      <div style={s.legendBar}>
+        <LegendItem color="#e0e7ff" border="#a5b4fc" label="Holiday" />
+        <span style={s.legendMeta}>
+          Total time on Zoom — main room + breakout + break, unadjusted.
+          Working Hours is this minus Break Time.
+        </span>
+      </div>
+
+      <div style={s.tableWrap}>
+        <table style={s.pivotTable}>
+          <thead>
+            <tr>
+              <th style={s.stickyNameTh}>Name</th>
+              {dates.map(ds => {
+                const isHoliday = !!holidayMap[ds];
+                return (
+                  <th key={ds} style={{ ...s.dateTh, ...(isWeekend(ds) ? s.weekendTh : {}), ...(isHoliday ? s.holidayTh : {}) }} title={isHoliday ? `Holiday: ${holidayMap[ds]}` : ''}>
+                    <div style={{ fontSize: 12, fontWeight: 700 }}>{shortDay(ds)}</div>
+                    <div style={{ fontSize: 9, color: isHoliday ? '#4338ca' : '#94a3b8', fontWeight: 500 }}>
+                      {isHoliday ? 'Holiday' : dayOfWeek(ds)}
+                    </div>
+                  </th>
+                );
+              })}
+              <th style={s.totalTh}>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {names.map((name, nIdx) => (
+              <tr key={name} style={nIdx % 2 === 0 ? s.trEven : {}}>
+                <td style={s.stickyNameTd}>{name}</td>
+                {dates.map(ds => {
+                  const cell = lookup[`${name}|${ds}`];
+                  if (holidayMap[ds]) {
+                    return (
+                      <td key={ds} style={{ ...s.cellTd, background: '#e0e7ff', color: '#4338ca', fontWeight: 700 }} title={holidayMap[ds]}>
+                        H
+                      </td>
+                    );
+                  }
+                  return (
+                    <td key={ds} style={s.cellTd}>
+                      {cell?.estimated && (
+                        <span title="Estimated — most of this day had no closing webhook" style={{ color: '#d97706', marginRight: 2 }}>⚠</span>
+                      )}
+                      {fmtHoursDecimal(cell?.totalHours || 0)}
+                    </td>
+                  );
+                })}
+                <td style={{ ...s.totalTd, background: '#e2e8f0', color: '#0f172a' }}>
+                  {fmtHoursDecimal(personTotals[name])}
+                </td>
+              </tr>
+            ))}
+            <tr style={s.grandRow}>
+              <td style={{ ...s.stickyNameTd, background: '#e2e8f0', fontWeight: 800 }}>Grand Total</td>
+              {colTotals.map((t, i) => (
+                <td key={i} style={{ ...s.cellTd, background: '#e2e8f0', fontWeight: 700 }}>{fmtHoursDecimal(t)}</td>
+              ))}
+              <td style={{ ...s.totalTd, background: '#cbd5e1', fontWeight: 800 }}>{fmtHoursDecimal(grandTotal)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Working hours pivot (total minus break) ─────────
 function HoursPivot({ dates, names, lookup, targetHours, workingDays, holidayMap = {}, canEdit, onEditCell, dailyData = [] }) {
   const colTotals = new Array(dates.length).fill(0);
   const personTotals = {};

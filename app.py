@@ -12930,6 +12930,146 @@ def intervals_status():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+# ── "All Members" pseudo-team ───────────────────────────────────────────────
+# Team View's team dropdown offers, alongside the real teams, an entry that
+# reports on EVERY person who appeared in the Zoom meeting instead of on a
+# roster. It rides the same /teams/<team_id>/... routes under a sentinel id,
+# so the frontend, the CSV links and the Excel export need no special-casing
+# beyond the label.
+ALL_MEMBERS_TEAM_ID = '__all__'
+ALL_MEMBERS_TEAM_NAME = 'All Members'
+
+
+def _scout_bot_name_key():
+    """Scout Bot's name in the same normalized form `_sql_normalize_name`
+    produces, so SQL can exclude it by exact match. Substring matching was
+    dropped in 2026-07 — a real person whose display name merely contained
+    "Scout Bot" used to vanish from tracking."""
+    return normalize_participant_name(SCOUT_BOT_NAME or '').lower().strip()
+
+
+def _sql_identity_ctes(dataset_ref, date_where, is_all, with_date):
+    """CTE block ending in `member_bridge` — the map from presence_intervals
+    participants onto the people a Team View report lists. Shared by the three
+    v2 endpoints, which previously each carried their own copy.
+
+    date_where  presence_intervals filter, e.g. "event_date = @date"
+    with_date   carry event_date through the bridge — range and monthly report
+                per day; the daily endpoint aggregates the whole day at once
+    is_all      the "All Members" pseudo-team. There is no roster, so every
+                participant becomes their own member, keyed on participant_key
+                (the builder has already merged one person's rejoin variants
+                onto a single key). The Scout Bot is dropped.
+
+    In team mode the block also defines `team_members`, which the daily
+    endpoint outer-joins against so absent members still get a row.
+    """
+    dsel = 'event_date,' if with_date else ''          # inside distinct_keys
+    dbridge = ' dk.event_date,' if with_date else ''   # inside member_bridge
+
+    if is_all:
+        return f"""
+        distinct_keys AS (
+            SELECT DISTINCT {dsel} participant_key, participant_name, participant_email
+            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+            WHERE {date_where}
+              AND participant_name IS NOT NULL AND participant_name != ''
+              AND {_sql_normalize_name('participant_name')} != @bot_key
+        ),
+        key_identity AS (
+            -- One display name/email per person for the WHOLE report, chosen
+            -- across every day in it. Picking per day would split someone who
+            -- rejoined as "Priya-1" on Tuesday into two rows in the summary.
+            SELECT participant_key,
+                   MIN(participant_name)  AS member_name,
+                   MAX(participant_email) AS member_email
+            FROM distinct_keys
+            GROUP BY participant_key
+        ),
+        member_bridge AS (
+            SELECT DISTINCT
+                ki.member_name, ki.member_email,{dbridge}
+                dk.participant_key
+            FROM distinct_keys dk
+            JOIN key_identity ki ON ki.participant_key = dk.participant_key
+        )"""
+
+    norm_pi = _sql_normalize_name('dk.participant_name')
+    norm_tm = _sql_normalize_name('tm.member_name')
+    return f"""
+        team_members AS (
+            SELECT participant_name AS member_name, participant_email AS member_email
+            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
+            WHERE team_id = @team_id
+        ),
+        distinct_keys AS (
+            SELECT DISTINCT {dsel} participant_key, participant_name, participant_email
+            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+            WHERE {date_where}
+              AND participant_name IS NOT NULL AND participant_name != ''
+        ),
+        aliases AS (
+            -- Admin-confirmed links: Zoom display-name variant -> roster
+            -- member. participant_key is already the normalized name, so
+            -- alias_key compares against it directly.
+            SELECT DISTINCT
+                {_sql_normalize_name('alias_name')} AS alias_key,
+                {_sql_normalize_name('member_name')} AS member_key
+            FROM `{dataset_ref}.participant_aliases`
+        ),
+        member_keys AS (
+            -- Each roster member's set of acceptable name keys: their own
+            -- normalized name plus any aliased Zoom-name variants. Expanded
+            -- BEFORE the bridge join because BigQuery rejects EXISTS
+            -- subqueries inside join predicates.
+            SELECT member_name, member_email, {norm_tm} AS match_key
+            FROM team_members tm
+            UNION DISTINCT
+            SELECT tm.member_name, tm.member_email, al.alias_key AS match_key
+            FROM team_members tm
+            JOIN aliases al ON al.member_key = {norm_tm}
+        ),
+        member_bridge AS (
+            SELECT DISTINCT
+                mk.member_name, mk.member_email,{dbridge}
+                dk.participant_key
+            FROM member_keys mk
+            JOIN distinct_keys dk
+              ON (
+                {norm_pi} = mk.match_key
+                OR (
+                  NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
+                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(mk.member_email)), '')
+                )
+              )
+        )"""
+
+
+def _team_identity_params(team_id, is_all):
+    """The query parameter that the identity CTEs reference — @team_id for a
+    real team, @bot_key for All Members. Declaring both would leave one unused
+    in every query."""
+    if is_all:
+        return [bigquery.ScalarQueryParameter("bot_key", "STRING", _scout_bot_name_key())]
+    return [bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+
+
+def _lookup_team_name(client, dataset_ref, team_id, is_all, with_manager=False):
+    """Team name (and optionally manager) for the report header. The All
+    Members pseudo-team has no row in the teams table."""
+    if is_all:
+        return (ALL_MEMBERS_TEAM_NAME, '') if with_manager else ALL_MEMBERS_TEAM_NAME
+    cols = 'team_name, manager_name' if with_manager else 'team_name'
+    rows = list(client.query(
+        f"SELECT {cols} FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id",
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+        )).result())
+    if not rows:
+        return ('Unknown', '') if with_manager else 'Unknown'
+    return (rows[0].team_name, rows[0].manager_name) if with_manager else rows[0].team_name
+
+
 @app.route('/teams/<team_id>/attendance_v2/<date>', methods=['GET'])
 def team_attendance_v2(team_id, date):
     """v2 team attendance — reads from presence_intervals.
@@ -12952,61 +13092,29 @@ def team_attendance_v2(team_id, date):
         # Zoom rejoin variants ("Kajal Yadav-1") link to the "Kajal Yadav"
         # roster row. Also matches by email when present. One member may
         # match multiple participant_keys (one per rejoin variant) — all
-        # intervals get summed under the member's row.
-        norm_pi   = _sql_normalize_name('dk.participant_name')
-        norm_tm   = _sql_normalize_name('tm.member_name')
+        # intervals get summed under the member's row. For the All Members
+        # pseudo-team there is no roster and every participant is their own
+        # member; see _sql_identity_ctes.
+        is_all = (team_id == ALL_MEMBERS_TEAM_ID)
+        identity_ctes = _sql_identity_ctes(dataset_ref, 'event_date = @date',
+                                          is_all=is_all, with_date=False)
+
+        # All Members lists exactly the people who showed up, so there is no
+        # roster to outer-join for absentees.
+        if is_all:
+            roster_join = "FROM per_member pm"
+            roster_cols = "pm.member_name,\n            pm.member_email,"
+            roster_order = "ORDER BY pm.member_name"
+        else:
+            roster_join = ("FROM team_members tm\n"
+                           "        LEFT JOIN per_member pm\n"
+                           "          ON pm.member_name = tm.member_name\n"
+                           "         AND COALESCE(pm.member_email, '') = COALESCE(tm.member_email, '')")
+            roster_cols = "tm.member_name,\n            tm.member_email,"
+            roster_order = "ORDER BY tm.member_name"
+
         q = f"""
-        WITH team_members AS (
-            SELECT
-                participant_name AS member_name,
-                participant_email AS member_email
-            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
-            WHERE team_id = @team_id
-        ),
-        distinct_keys AS (
-            SELECT DISTINCT
-                participant_key,
-                participant_name,
-                participant_email
-            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-            WHERE event_date = @date
-              AND participant_name IS NOT NULL AND participant_name != ''
-        ),
-        aliases AS (
-            -- Admin-confirmed links: Zoom display-name variant -> roster
-            -- member. participant_key is already the normalized name.
-            SELECT DISTINCT
-                {_sql_normalize_name('alias_name')} AS alias_key,
-                {_sql_normalize_name('member_name')} AS member_key
-            FROM `{dataset_ref}.participant_aliases`
-        ),
-        member_keys AS (
-            -- Each roster member's set of acceptable name keys: their own
-            -- normalized name plus any aliased Zoom-name variants. Expanded
-            -- BEFORE the bridge join because BigQuery rejects EXISTS
-            -- subqueries inside join predicates.
-            SELECT member_name, member_email, {norm_tm} AS match_key
-            FROM team_members tm
-            UNION DISTINCT
-            SELECT tm.member_name, tm.member_email, al.alias_key AS match_key
-            FROM team_members tm
-            JOIN aliases al ON al.member_key = {norm_tm}
-        ),
-        member_bridge AS (
-            SELECT DISTINCT
-                mk.member_name,
-                mk.member_email,
-                dk.participant_key
-            FROM member_keys mk
-            JOIN distinct_keys dk
-              ON (
-                {norm_pi} = mk.match_key
-                OR (
-                  NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
-                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(mk.member_email)), '')
-                )
-              )
-        ),
+        WITH {identity_ctes},
         per_member AS (
             SELECT
                 mb.member_name,
@@ -13036,8 +13144,7 @@ def team_attendance_v2(team_id, date):
             GROUP BY mb.member_name, mb.member_email
         )
         SELECT
-            tm.member_name,
-            tm.member_email,
+            {roster_cols}
             pm.display_name AS participant_name,
             pm.display_email AS participant_email,
             COALESCE(SAFE_DIVIDE(pm.lowconf_seconds, pm.total_seconds), 0) > 0.5 AS estimated,
@@ -13048,28 +13155,17 @@ def team_attendance_v2(team_id, date):
             {_sql_whole_minutes('pm.total_seconds')} AS total_duration_mins,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.first_seen_utc, INTERVAL 330 MINUTE)) AS first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(pm.last_seen_utc,  INTERVAL 330 MINUTE)) AS last_seen_ist
-        FROM team_members tm
-        LEFT JOIN per_member pm
-          ON pm.member_name = tm.member_name
-         AND COALESCE(pm.member_email, '') = COALESCE(tm.member_email, '')
-        ORDER BY tm.member_name
+        {roster_join}
+        {roster_order}
         """
         rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+            query_parameters=_team_identity_params(team_id, is_all) + [
                 bigquery.ScalarQueryParameter("date", "DATE", report_date),
             ]
         )).result())
 
-        # Get team info (name/manager) — same shape as v1
-        team_q = f"""
-        SELECT team_name, manager_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id
-        """
-        team_rows = list(client.query(team_q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
-        )).result())
-        team_name = team_rows[0].team_name if team_rows else 'Unknown'
-        manager_name = team_rows[0].manager_name if team_rows else ''
+        team_name, manager_name = _lookup_team_name(
+            client, dataset_ref, team_id, is_all, with_manager=True)
 
         def _status(active):
             # Status is judged on break-EXCLUSIVE minutes, matching v1:
@@ -13131,8 +13227,10 @@ def team_attendance_v2(team_id, date):
         # Opt-in (?include_unmatched=1): the Dashboard fires this endpoint
         # once per team, and the check is global — running it N times per
         # page load would waste BigQuery scans for identical results.
+        # Meaningless for All Members, which lists every participant by
+        # definition — nobody can be missing from it.
         unmatched = []
-        want_unmatched = request.args.get('include_unmatched') == '1'
+        want_unmatched = request.args.get('include_unmatched') == '1' and not is_all
         if want_unmatched:
           try:
             norm_dk = _sql_normalize_name('dk.participant_name')
@@ -13216,55 +13314,11 @@ def team_attendance_range_v2(team_id):
         # 35-day sweep, run POST /intervals/backfill once.
         built, still_missing = 0, 0
 
-        norm_pi = _sql_normalize_name('dk.participant_name')
-        norm_tm = _sql_normalize_name('tm.member_name')
+        is_all = (team_id == ALL_MEMBERS_TEAM_ID)
+        identity_ctes = _sql_identity_ctes(dataset_ref, 'event_date BETWEEN @start AND @end',
+                                           is_all=is_all, with_date=True)
         q = f"""
-        WITH team_members AS (
-            SELECT participant_name AS member_name, participant_email AS member_email
-            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
-            WHERE team_id = @team_id
-        ),
-        distinct_keys AS (
-            SELECT DISTINCT event_date, participant_key, participant_name, participant_email
-            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-            WHERE event_date BETWEEN @start AND @end
-              AND participant_name IS NOT NULL AND participant_name != ''
-        ),
-        aliases AS (
-            -- Admin-confirmed links: Zoom display-name variant -> roster
-            -- member. participant_key is already the normalized name, so
-            -- alias_key compares against it directly.
-            SELECT DISTINCT
-                {_sql_normalize_name('alias_name')} AS alias_key,
-                {_sql_normalize_name('member_name')} AS member_key
-            FROM `{dataset_ref}.participant_aliases`
-        ),
-        member_keys AS (
-            -- Each roster member's set of acceptable name keys: their own
-            -- normalized name plus any aliased Zoom-name variants. Expanded
-            -- BEFORE the bridge join because BigQuery rejects EXISTS
-            -- subqueries inside join predicates.
-            SELECT member_name, member_email, {norm_tm} AS match_key
-            FROM team_members tm
-            UNION DISTINCT
-            SELECT tm.member_name, tm.member_email, al.alias_key AS match_key
-            FROM team_members tm
-            JOIN aliases al ON al.member_key = {norm_tm}
-        ),
-        member_bridge AS (
-            SELECT DISTINCT
-                mk.member_name, mk.member_email,
-                dk.event_date, dk.participant_key
-            FROM member_keys mk
-            JOIN distinct_keys dk
-              ON (
-                {norm_pi} = mk.match_key
-                OR (
-                  NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
-                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(mk.member_email)), '')
-                )
-              )
-        ),
+        WITH {identity_ctes},
         per_day AS (
             SELECT
                 mb.member_name, mb.member_email, mb.event_date,
@@ -13310,25 +13364,23 @@ def team_attendance_range_v2(team_id):
         ORDER BY pd.member_name, pd.event_date
         """
         rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+            query_parameters=_team_identity_params(team_id, is_all) + [
                 bigquery.ScalarQueryParameter("start", "DATE", start_date),
                 bigquery.ScalarQueryParameter("end", "DATE", end_date),
             ]
         )).result())
 
-        # Team info
-        team_q = f"SELECT team_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id"
-        team_rows = list(client.query(team_q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
-        )).result())
-        team_name = team_rows[0].team_name if team_rows else 'Unknown'
+        team_name = _lookup_team_name(client, dataset_ref, team_id, is_all)
 
-        # All team members for absence handling
-        members_q = f"SELECT participant_name, participant_email FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id"
-        all_members = list(client.query(members_q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
-        )).result())
+        # All team members for absence handling. All Members has no roster —
+        # its headcount is however many people actually showed up, counted
+        # from member_summary once that is built below.
+        all_members = []
+        if not is_all:
+            members_q = f"SELECT participant_name, participant_email FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` WHERE team_id = @team_id"
+            all_members = list(client.query(members_q, job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
+            )).result())
 
         def _status(total):
             return 'present' if total >= 300 else ('half_day' if total >= 240 else 'absent')
@@ -13397,7 +13449,7 @@ def team_attendance_range_v2(team_id):
             'team_name': team_name,
             'start_date': start_date,
             'end_date': end_date,
-            'total_members': len(all_members),
+            'total_members': len(member_summary) if is_all else len(all_members),
             'daily_data': daily_data,
             'member_summary': list(member_summary.values()),
             'source': 'presence_intervals_v2',
@@ -13440,55 +13492,11 @@ def team_monthly_report_v2(team_id):
         # 35-day sweep, run POST /intervals/backfill once.
         built, still_missing = 0, 0
 
-        norm_pi = _sql_normalize_name('dk.participant_name')
-        norm_tm = _sql_normalize_name('tm.member_name')
+        is_all = (team_id == ALL_MEMBERS_TEAM_ID)
+        identity_ctes = _sql_identity_ctes(dataset_ref, 'event_date BETWEEN @start AND @end',
+                                           is_all=is_all, with_date=True)
         q = f"""
-        WITH team_members AS (
-            SELECT participant_name AS member_name, participant_email AS member_email
-            FROM `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}`
-            WHERE team_id = @team_id
-        ),
-        distinct_keys AS (
-            SELECT DISTINCT event_date, participant_key, participant_name, participant_email
-            FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-            WHERE event_date BETWEEN @start AND @end
-              AND participant_name IS NOT NULL AND participant_name != ''
-        ),
-        aliases AS (
-            -- Admin-confirmed links: Zoom display-name variant -> roster
-            -- member. participant_key is already the normalized name, so
-            -- alias_key compares against it directly.
-            SELECT DISTINCT
-                {_sql_normalize_name('alias_name')} AS alias_key,
-                {_sql_normalize_name('member_name')} AS member_key
-            FROM `{dataset_ref}.participant_aliases`
-        ),
-        member_keys AS (
-            -- Each roster member's set of acceptable name keys: their own
-            -- normalized name plus any aliased Zoom-name variants. Expanded
-            -- BEFORE the bridge join because BigQuery rejects EXISTS
-            -- subqueries inside join predicates.
-            SELECT member_name, member_email, {norm_tm} AS match_key
-            FROM team_members tm
-            UNION DISTINCT
-            SELECT tm.member_name, tm.member_email, al.alias_key AS match_key
-            FROM team_members tm
-            JOIN aliases al ON al.member_key = {norm_tm}
-        ),
-        member_bridge AS (
-            SELECT DISTINCT
-                mk.member_name, mk.member_email,
-                dk.event_date, dk.participant_key
-            FROM member_keys mk
-            JOIN distinct_keys dk
-              ON (
-                {norm_pi} = mk.match_key
-                OR (
-                  NULLIF(LOWER(TRIM(dk.participant_email)), '') IS NOT NULL
-                  AND NULLIF(LOWER(TRIM(dk.participant_email)), '') = NULLIF(LOWER(TRIM(mk.member_email)), '')
-                )
-              )
-        ),
+        WITH {identity_ctes},
         per_day AS (
             SELECT
                 mb.member_name, mb.member_email, mb.event_date,
@@ -13532,18 +13540,13 @@ def team_monthly_report_v2(team_id):
         ORDER BY pd.member_name, pd.event_date
         """
         rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("team_id", "STRING", team_id),
+            query_parameters=_team_identity_params(team_id, is_all) + [
                 bigquery.ScalarQueryParameter("start", "DATE", start_date),
                 bigquery.ScalarQueryParameter("end",   "DATE", end_date),
             ]
         )).result())
 
-        team_q = f"SELECT team_name FROM `{dataset_ref}.{BQ_TEAMS_TABLE}` WHERE team_id = @team_id"
-        team_rows = list(client.query(team_q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("team_id", "STRING", team_id)]
-        )).result())
-        team_name = team_rows[0].team_name if team_rows else 'Unknown'
+        team_name = _lookup_team_name(client, dataset_ref, team_id, is_all)
 
         def _status(total):
             return 'present' if total >= 300 else ('half_day' if total >= 240 else 'absent')
