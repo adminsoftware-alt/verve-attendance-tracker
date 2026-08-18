@@ -13636,6 +13636,250 @@ def team_monthly_report_v2(team_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+# ==============================================================================
+# ROOM OVERRIDES — human corrections that outrank every automatic room name
+# ==============================================================================
+# Zoom never sends a room name in its breakout webhooks; the server resolves
+# one from memory when the webhook lands and freezes that guess into
+# participant_events_p. When the guess is wrong the damage is real: on
+# 2026-08-11 a work room was stamped with the break room's name and 187
+# minutes of working time were filed as break.
+#
+# These endpoints write to `room_overrides`, which sp_build_presence_intervals
+# reads as priority 0/1 — ahead of room_mappings and ahead of the event
+# stream. The override is an INPUT to the builder, never an edit to
+# presence_intervals: that table is deleted and rebuilt every 5 minutes, so
+# anything written into it directly would vanish on the next tick. Writing to
+# room_overrides instead means the correction is applied by every future
+# rebuild, including backfills of past days.
+
+ROOM_OVERRIDES_TABLE = 'room_overrides'
+VALID_ROOM_CATEGORIES = ('break', 'breakout', 'main')
+
+
+def _ensure_room_overrides_table():
+    """Create room_overrides if absent. Mirrors 08_room_overrides_v13.sql so a
+    fresh environment works without running the SQL file by hand."""
+    client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+    client.query(f"""
+    CREATE TABLE IF NOT EXISTS `{dataset_ref}.{ROOM_OVERRIDES_TABLE}` (
+        override_id   STRING NOT NULL,
+        room_uuid     STRING NOT NULL,
+        mapping_date  DATE,
+        room_name     STRING,
+        room_category STRING,
+        note          STRING,
+        set_by        STRING,
+        set_at        TIMESTAMP,
+        active        BOOL
+    )
+    """).result()
+
+
+def _rebuild_dates_via_procedure(dates):
+    """CALL the BigQuery builder for each date so the override takes effect
+    immediately instead of waiting for the 5-minute scheduled query.
+    Returns (rebuilt, errors)."""
+    client = get_bq_client()
+    dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+    rebuilt, errors = [], []
+    for d in dates:
+        if not d:
+            continue
+        try:
+            client.query(
+                f"CALL `{dataset_ref}.sp_build_presence_intervals`(@d)",
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", d)]
+                )).result()
+            rebuilt.append(str(d))
+        except Exception as e:
+            # A concurrent build of the same day aborts one of the two; the
+            # next scheduled tick picks it up, so this is not fatal.
+            print(f"[RoomOverride] rebuild failed for {d}: {e}")
+            errors.append({'date': str(d), 'error': str(e)[:200]})
+    return rebuilt, errors
+
+
+@app.route('/rooms/overrides', methods=['GET'])
+@require_auth()
+def list_room_overrides():
+    """Every override, newest first. ?active=1 for live ones only."""
+    try:
+        _ensure_room_overrides_table()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+        only_active = request.args.get('active') == '1'
+        where = "WHERE COALESCE(active, TRUE)" if only_active else ""
+        rows = list(client.query(f"""
+            SELECT override_id, room_uuid, CAST(mapping_date AS STRING) AS mapping_date,
+                   room_name, room_category, note, set_by,
+                   CAST(set_at AS STRING) AS set_at, COALESCE(active, TRUE) AS active
+            FROM `{dataset_ref}.{ROOM_OVERRIDES_TABLE}`
+            {where}
+            ORDER BY set_at DESC
+            LIMIT 500
+        """).result())
+        return jsonify({'success': True, 'overrides': [dict(r) for r in rows]})
+    except Exception as e:
+        print(f"[RoomOverride] list error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/rooms/override', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
+def create_room_override():
+    """Record what a room actually is, then rebuild the affected day.
+
+    Body: {room_uuid, room_name?, room_category?, mapping_date?, note?}
+      mapping_date omitted/null -> applies whenever this room UUID appears.
+      At least one of room_name / room_category must be given.
+
+    Restricted to admin/superadmin on purpose: marking the break room as a
+    work room raises EVERYBODY's working hours, including the caller's, and
+    would be invisible in a report. Every change is stamped with who made it.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        room_uuid = (data.get('room_uuid') or '').strip()
+        room_name = (data.get('room_name') or '').strip()
+        room_category = (data.get('room_category') or '').strip().lower()
+        note = (data.get('note') or '').strip()
+        raw_date = (data.get('mapping_date') or '').strip()
+
+        if not room_uuid:
+            return jsonify({'success': False, 'error': 'room_uuid is required'}), 400
+        if not room_name and not room_category:
+            return jsonify({'success': False,
+                            'error': 'give room_name, room_category, or both'}), 400
+        if room_category and room_category not in VALID_ROOM_CATEGORIES:
+            return jsonify({'success': False,
+                            'error': f'room_category must be one of {VALID_ROOM_CATEGORIES}'}), 400
+
+        mapping_date = validate_date_format(raw_date) if raw_date else None
+
+        _ensure_room_overrides_table()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        actor = ''
+        payload = getattr(request, 'auth_user', None) or {}
+        actor = payload.get('u') or payload.get('e') or 'unknown'
+
+        override_id = str(uuid_lib.uuid4())
+        # Parameterised INSERT ... SELECT rather than insert_rows_json: rows
+        # streamed via the insert API sit in a write buffer and are not
+        # guaranteed visible to the very next query, and this endpoint rebuilds
+        # immediately afterwards. A DML insert is readable straight away.
+        client.query(f"""
+            INSERT INTO `{dataset_ref}.{ROOM_OVERRIDES_TABLE}`
+              (override_id, room_uuid, mapping_date, room_name, room_category,
+               note, set_by, set_at, active)
+            SELECT @override_id, @room_uuid, @mapping_date,
+                   NULLIF(@room_name, ''), NULLIF(@room_category, ''),
+                   NULLIF(@note, ''), @set_by, CURRENT_TIMESTAMP(), TRUE
+        """, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("override_id", "STRING", override_id),
+            bigquery.ScalarQueryParameter("room_uuid", "STRING", room_uuid),
+            bigquery.ScalarQueryParameter("mapping_date", "DATE", mapping_date),
+            bigquery.ScalarQueryParameter("room_name", "STRING", room_name),
+            bigquery.ScalarQueryParameter("room_category", "STRING", room_category),
+            bigquery.ScalarQueryParameter("note", "STRING", note),
+            bigquery.ScalarQueryParameter("set_by", "STRING", actor),
+        ])).result()
+
+        # Which day(s) to recompute. A dated override touches that day. An
+        # undated one touches every day this room UUID actually appears on,
+        # capped so one click cannot trigger a month of rebuilds.
+        if mapping_date:
+            dates = [mapping_date]
+        else:
+            drows = list(client.query(f"""
+                SELECT DISTINCT event_date
+                FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+                WHERE room_uuid = @room_uuid
+                  AND event_date >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 45 DAY)
+                ORDER BY event_date DESC
+                LIMIT 15
+            """, job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("room_uuid", "STRING", room_uuid)
+            ])).result())
+            dates = [r.event_date for r in drows]
+
+        rebuilt, errors = _rebuild_dates_via_procedure(dates)
+
+        return jsonify({
+            'success': True,
+            'override_id': override_id,
+            'room_uuid': room_uuid,
+            'room_name': room_name or None,
+            'room_category': room_category or None,
+            'mapping_date': str(mapping_date) if mapping_date else None,
+            'set_by': actor,
+            'rebuilt_dates': rebuilt,
+            'rebuild_errors': errors,
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[RoomOverride] create error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/rooms/override/<override_id>', methods=['DELETE'])
+@require_auth(roles=['admin', 'superadmin'])
+def retire_room_override(override_id):
+    """Retire an override (active = FALSE) and rebuild the days it touched.
+    Never deletes the row — the record of who changed what has to survive."""
+    try:
+        _ensure_room_overrides_table()
+        client = get_bq_client()
+        dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
+
+        rows = list(client.query(f"""
+            SELECT room_uuid, mapping_date
+            FROM `{dataset_ref}.{ROOM_OVERRIDES_TABLE}`
+            WHERE override_id = @id
+        """, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("id", "STRING", override_id)
+        ])).result())
+        if not rows:
+            return jsonify({'success': False, 'error': 'override not found'}), 404
+
+        client.query(f"""
+            UPDATE `{dataset_ref}.{ROOM_OVERRIDES_TABLE}`
+            SET active = FALSE
+            WHERE override_id = @id
+        """, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("id", "STRING", override_id)
+        ])).result()
+
+        target = rows[0].mapping_date
+        dates = [target] if target else []
+        if not dates:
+            drows = list(client.query(f"""
+                SELECT DISTINCT event_date
+                FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
+                WHERE room_uuid = @room_uuid
+                  AND event_date >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 45 DAY)
+                ORDER BY event_date DESC
+                LIMIT 15
+            """, job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("room_uuid", "STRING", rows[0].room_uuid)
+            ])).result())
+            dates = [r.event_date for r in drows]
+
+        rebuilt, errors = _rebuild_dates_via_procedure(dates)
+        return jsonify({'success': True, 'override_id': override_id,
+                        'rebuilt_dates': rebuilt, 'rebuild_errors': errors})
+    except Exception as e:
+        print(f"[RoomOverride] retire error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/attendance/summary_v2/<date>', methods=['GET'])
 def attendance_summary_v2(date):
     """v2 Day View Full. Reads from presence_intervals.
@@ -13678,11 +13922,14 @@ def attendance_summary_v2(date):
                         print(f"[SummaryV2] Auto-build failed for {report_date}: {e}")
 
         # Pull all intervals for the date, ordered by participant + start_ts
+        # room_uuid (added v13) is what lets My Day offer "this room was
+        # actually X" — you cannot correct a room you cannot identify.
         q = f"""
         SELECT
           participant_key,
           participant_name,
           participant_email,
+          room_uuid,
           room_name,
           room_category,
           start_ts,
@@ -13747,6 +13994,7 @@ def attendance_summary_v2(date):
                 # the frontend's transformSummaryToEmployees in zoomApi.js
                 # (which sums room_duration_mins to compute total minutes).
                 room_visits.append({
+                    'room_uuid':         getattr(iv, 'room_uuid', None) or '',
                     'room_name':         iv.room_name,
                     'room_category':     iv.room_category,
                     'room_joined_ist':   _fmt_ist(iv.start_ts),

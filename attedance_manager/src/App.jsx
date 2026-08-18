@@ -4,6 +4,7 @@ import { useAllData } from './hooks/useData';
 import Login from './components/Login';
 import Sidebar from './components/Sidebar';
 import DayView from './components/DayView';
+import MyDay from './components/MyDay';
 import Employees from './components/Employees';
 import RoomAnalytics from './components/RoomAnalytics';
 import LiveDashboard from './components/LiveDashboard';
@@ -72,6 +73,9 @@ export default function App() {
         {!isManager && loading && <FullPageLoader message="Loading attendance data..." />}
         {!isManager && !loading && page === 'day' && (
           <DayView allData={allData} uploadedDates={uploadedDates} onNavigateUpload={() => setPage('upload')} />
+        )}
+        {!isManager && page === 'myday' && (
+          <MyDay user={user} />
         )}
         {!isManager && page === 'employees' && (
           <Employees user={user} />

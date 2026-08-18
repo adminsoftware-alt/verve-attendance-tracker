@@ -195,7 +195,12 @@ function ordinal(n) {
  * @param {number} year
  * @param {number} month (1-12)
  */
-export function downloadTeamPivotExcel(monthlyData, team, year, month) {
+// opts.startDate / opts.endDate drive Team View's "Custom Period" mode: the
+// same workbook, bounded by an explicit range instead of a calendar month.
+export function downloadTeamPivotExcel(monthlyData, team, year, month, opts = {}) {
+  const rangeStart = opts.startDate || null;
+  const rangeEnd = opts.endDate || null;
+  const isRange = Boolean(rangeStart && rangeEnd);
   const teamName = monthlyData?.team_name || team?.team_name || 'Team';
   const managerName = team?.manager_name || monthlyData?.manager_name || '';
   const dailyData = Array.isArray(monthlyData?.daily_data) ? monthlyData.daily_data : [];
@@ -208,12 +213,25 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   });
 
   // ── Build the list of dates (weekdays in month + any date that has data) ──
-  const dateSet = new Set();
+  const periodDates = [];
   const daysInMonth = new Date(year, month, 0).getDate();
-  for (let d = 1; d <= daysInMonth; d++) {
-    const ds = `${year}-${pad2(month)}-${pad2(d)}`;
-    if (!isWeekend(ds)) dateSet.add(ds);
+  if (isRange) {
+    // Local parts, not toISOString(): local midnight in IST is 18:30 UTC the
+    // previous day, which would slide the whole range back by one.
+    const cur = new Date(`${rangeStart}T00:00:00`);
+    const stop = new Date(`${rangeEnd}T00:00:00`);
+    while (cur <= stop) {
+      periodDates.push(`${cur.getFullYear()}-${pad2(cur.getMonth() + 1)}-${pad2(cur.getDate())}`);
+      cur.setDate(cur.getDate() + 1);
+    }
+  } else {
+    for (let d = 1; d <= daysInMonth; d++) {
+      periodDates.push(`${year}-${pad2(month)}-${pad2(d)}`);
+    }
   }
+
+  const dateSet = new Set();
+  periodDates.forEach(ds => { if (!isWeekend(ds)) dateSet.add(ds); });
   dailyData.forEach(r => { if (r?.date) dateSet.add(r.date); });
   const dates = Array.from(dateSet).sort();
 
@@ -247,10 +265,7 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
 
   // Count working days (Mon-Fri, minus holidays) in the full month
   let workingDays = 0;
-  for (let d = 1; d <= daysInMonth; d++) {
-    const ds = `${year}-${pad2(month)}-${pad2(d)}`;
-    if (!isWeekend(ds) && !holidayMap[ds]) workingDays++;
-  }
+  periodDates.forEach(ds => { if (!isWeekend(ds) && !holidayMap[ds]) workingDays++; });
   const holidayCount = Object.keys(holidayMap).length;
   const targetHoursExclBreaks = workingDays * DAILY_TARGET_HOURS;
   const targetHoursInclBreaks = workingDays * 9;
@@ -393,7 +408,9 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   // Notes section (2 blank rows below)
   const noteStart = grandRow + 2;
   const monthName = MONTH_NAMES[month - 1];
-  const reportPeriod = `1st to ${ordinal(daysInMonth)} ${monthName} ${year}`;
+  const reportPeriod = isRange
+    ? `${rangeStart} to ${rangeEnd}`
+    : `1st to ${ordinal(daysInMonth)} ${monthName} ${year}`;
 
   writeCell(pivotWs, noteStart,     0, 'Note:', NOTE_LABEL_STYLE);
   writeCell(pivotWs, noteStart,     1, 'Report is from', NOTE_LABEL_STYLE);
@@ -832,16 +849,20 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   // ════════════════════════════════════════════════════════
   const wb = XLSX.utils.book_new();
   const mon3 = monthName.slice(0, 3);
+  // Sheet names cap at 31 chars, so a range uses a compact prefix.
+  const tag = isRange ? `${rangeStart.slice(5)}_${rangeEnd.slice(5)}` : `${mon3} ${year}`;
   // Sheet order mirrors the on-screen tabs: Total Zoom Hours first, then
   // Working Hours (renamed from "Pivot" 2026-08-10 to match the UI).
-  XLSX.utils.book_append_sheet(wb, totalWs,  `${mon3} ${year} Total Zoom Hours`);
-  XLSX.utils.book_append_sheet(wb, pivotWs,  `${mon3} ${year} Working Hours`);
-  XLSX.utils.book_append_sheet(wb, isoWs,    `${mon3} ${year} Isolation`);
-  XLSX.utils.book_append_sheet(wb, breakWs,  `${mon3} ${year} Break Time`);
-  XLSX.utils.book_append_sheet(wb, leaveWs,  `${mon3} ${year} Leaves`);
-  XLSX.utils.book_append_sheet(wb, dataWs,   `${mon3} ${year} Data`);
+  XLSX.utils.book_append_sheet(wb, totalWs,  `${tag} Total Zoom Hrs`);
+  XLSX.utils.book_append_sheet(wb, pivotWs,  `${tag} Working Hours`);
+  XLSX.utils.book_append_sheet(wb, isoWs,    `${tag} Isolation`);
+  XLSX.utils.book_append_sheet(wb, breakWs,  `${tag} Break Time`);
+  XLSX.utils.book_append_sheet(wb, leaveWs,  `${tag} Leaves`);
+  XLSX.utils.book_append_sheet(wb, dataWs,   `${tag} Data`);
 
   const safeTeam = teamName.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-  const filename = `Attendance_Report_${safeTeam}_${monthName}_${year}.xlsx`;
+  const filename = isRange
+    ? `Attendance_Report_${safeTeam}_${rangeStart}_to_${rangeEnd}.xlsx`
+    : `Attendance_Report_${safeTeam}_${monthName}_${year}.xlsx`;
   XLSX.writeFile(wb, filename);
 }

@@ -1,6 +1,7 @@
 const ADMIN_NAV = [
   { key: 'live', label: 'Live', icon: '\u{1F4E1}' },
   { key: 'day', label: 'Day View', icon: '\u{1F4C5}' },
+  { key: 'myday', label: 'My Day', icon: '\u{1F64B}' },
   { key: 'employees', label: 'Employees', icon: '\u{1F465}' },
   { key: 'empsummary', label: 'Employee Summary', icon: '\u{1F4C8}' },
   { key: 'roomanalytics', label: 'Room Analytics', icon: '\u{1F3E2}' },

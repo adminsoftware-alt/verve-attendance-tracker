@@ -1,8 +1,7 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
-  fetchTeams, fetchTeamAttendance, fetchTeamAttendanceRange,
-  fetchTeamMonthlyReport, getTeamRangeCsvUrl,
-  fetchAllTeamMembers, createParticipantAlias, addTeamMember
+  fetchTeams, fetchTeamAttendanceRange,
+  fetchTeamMonthlyReport, getTeamRangeCsvUrl
 } from '../utils/zoomApi';
 import { downloadTeamPivotExcel } from '../utils/teamPivotExcel';
 import MonthlyPivotTables from './MonthlyPivotTables';
@@ -21,42 +20,14 @@ function istDate() {
   return new Date(now.getTime() + 30 * 60000).toISOString().slice(0, 10);
 }
 
-function fmtMins(m) {
-  if (!m) return '-';
-  const h = Math.floor(m / 60);
-  const min = m % 60;
-  if (h > 0 && min > 0) return `${h}hr ${min}min`;
-  if (h > 0) return `${h}hr`;
-  return `${min}min`;
-}
-
-// Status badge color
-function statusStyle(status) {
-  switch (status) {
-    case 'present': return { background: '#dcfce7', color: '#15803d' };
-    case 'half_day': return { background: '#fef3c7', color: '#92400e' };
-    case 'absent': default: return { background: '#fef2f2', color: '#dc2626' };
-  }
-}
-
-function statusLabel(status) {
-  switch (status) {
-    case 'present': return 'Present';
-    case 'half_day': return 'Half Day';
-    case 'absent': default: return 'Absent';
-  }
-}
-
 export default function TeamView({ user }) {
   const [teams, setTeams] = useState([]);
   const [selectedTeam, setSelectedTeam] = useState('');
-  const [mode, setMode] = useState('monthly');      // daily | range | monthly
-  const [date, setDate] = useState(istDate);
+  const [mode, setMode] = useState('monthly');      // monthly | custom
   const [startDate, setStartDate] = useState(istDate);
   const [endDate, setEndDate] = useState(istDate);
   const [year, setYear] = useState(new Date().getFullYear());
   const [month, setMonth] = useState(new Date().getMonth() + 1);
-  const [attendance, setAttendance] = useState(null);
   const [rangeData, setRangeData] = useState(null);
   const [monthlyData, setMonthlyData] = useState(null);
   const [dataLoading, setDataLoading] = useState(false);
@@ -64,12 +35,6 @@ export default function TeamView({ user }) {
   const [error, setError] = useState(null);
   const [editModalMember, setEditModalMember] = useState(null);
   const [editModalDate, setEditModalDate] = useState(null);
-
-  // Unmatched-participant resolution (link alias / add to team)
-  const [allMembers, setAllMembers] = useState([]);        // roster across all teams
-  const [linkSelection, setLinkSelection] = useState({});  // zoomName -> member_name
-  const [resolvedNames, setResolvedNames] = useState({});  // zoomName -> 'linked'|'added'|error msg
-  const [resolveBusy, setResolveBusy] = useState('');      // zoomName in flight
 
   // Manager filtering
   const isManager = user?.role === 'manager';
@@ -93,85 +58,24 @@ export default function TeamView({ user }) {
     setDataLoading(true);
     setError(null);
     try {
-      if (mode === 'daily') {
-        const data = await fetchTeamAttendance(selectedTeam, date, true);
-        setAttendance(data);
-        setRangeData(null);
-        setMonthlyData(null);
-      } else if (mode === 'range') {
+      if (mode === 'custom') {
+        // Custom Period reuses the range endpoint, whose daily_data carries
+        // the same per-day fields the monthly report does — so the pivots
+        // below produce identical metrics over an arbitrary range.
         const data = await fetchTeamAttendanceRange(selectedTeam, startDate, endDate);
         setRangeData(data);
-        setAttendance(null);
         setMonthlyData(null);
       } else {
         const data = await fetchTeamMonthlyReport(selectedTeam, year, month);
         setMonthlyData(data);
-        setAttendance(null);
         setRangeData(null);
       }
     } catch (e) { setError(e.message); }
     setDataLoading(false);
-  }, [selectedTeam, mode, date, startDate, endDate, year, month]);
+  }, [selectedTeam, mode, startDate, endDate, year, month]);
 
   useEffect(() => { loadAttendance(); }, [loadAttendance]);
 
-  // Lazy-load the full roster (for the "link to member" dropdown) only when
-  // the banner actually has unmatched names to resolve.
-  const unmatchedList = attendance?.unmatched_participants || [];
-  useEffect(() => {
-    if (unmatchedList.length > 0 && allMembers.length === 0) {
-      fetchAllTeamMembers()
-        .then(d => setAllMembers(d.members || []))
-        .catch(e => console.error('Failed to load roster for alias linking:', e));
-    }
-  }, [unmatchedList.length, allMembers.length]);
-
-  // Link a Zoom display name to an existing roster member (creates an alias;
-  // takes effect on the next data load since today is always rebuilt).
-  const handleLinkAlias = async (zoomName, zoomEmail) => {
-    const memberName = linkSelection[zoomName];
-    if (!memberName) return;
-    setResolveBusy(zoomName);
-    try {
-      await createParticipantAlias(zoomName, memberName, zoomEmail || '');
-      setResolvedNames(prev => ({ ...prev, [zoomName]: `linked to ${memberName}` }));
-    } catch (e) {
-      setResolvedNames(prev => ({ ...prev, [zoomName]: `error: ${e.message}` }));
-    }
-    setResolveBusy('');
-  };
-
-  // Add the Zoom name as a brand-new member of the currently selected team.
-  const handleAddUnmatched = async (zoomName, zoomEmail) => {
-    if (!selectedTeam) return;
-    setResolveBusy(zoomName);
-    try {
-      await addTeamMember(selectedTeam, zoomName, zoomEmail || '');
-      setResolvedNames(prev => ({ ...prev, [zoomName]: 'added to this team' }));
-    } catch (e) {
-      setResolvedNames(prev => ({ ...prev, [zoomName]: `error: ${e.message}` }));
-    }
-    setResolveBusy('');
-  };
-
-  // Daily stats
-  const dailyStats = useMemo(() => {
-    const members = attendance?.participants;
-    if (!members?.length) return null;
-    const present = members.filter(m => m.status === 'present').length;
-    const halfDay = members.filter(m => m.status === 'half_day').length;
-    const absent = members.filter(m => m.status === 'absent').length;
-    const total = members.length;
-    const working = members.filter(m => m.status !== 'absent');
-    const avgActive = working.length > 0 ? Math.round(working.reduce((s, m) => s + (m.total_duration_mins || 0), 0) / working.length) : 0;
-    const totalBreak = working.reduce((s, m) => s + (m.break_minutes || 0), 0);
-    return { present, halfDay, absent, total, avgActive, totalBreak };
-  }, [attendance]);
-
-  const downloadDailyCsv = () => {
-    if (!selectedTeam) return;
-    window.open(getTeamRangeCsvUrl(selectedTeam, date, date), '_blank');
-  };
   const downloadRangeCsv = () => {
     if (!selectedTeam) return;
     window.open(getTeamRangeCsvUrl(selectedTeam, startDate, endDate), '_blank');
@@ -179,6 +83,23 @@ export default function TeamView({ user }) {
   const downloadPivotExcel = async () => {
     if (!selectedTeam) return;
     try {
+      const team = selectedTeam === ALL_MEMBERS_ID
+        ? { team_id: ALL_MEMBERS_ID, team_name: ALL_MEMBERS_NAME }
+        : (teams.find(t => t.team_id === selectedTeam) || {});
+
+      if (mode === 'custom') {
+        // Same workbook, bounded by the chosen period instead of a month.
+        let data = rangeData;
+        if (!data || data.start_date !== startDate || data.end_date !== endDate) {
+          setDataLoading(true);
+          data = await fetchTeamAttendanceRange(selectedTeam, startDate, endDate);
+          setRangeData(data);
+          setDataLoading(false);
+        }
+        downloadTeamPivotExcel(data, team, year, month, { startDate, endDate });
+        return;
+      }
+
       // Ensure we have fresh data for the selected month
       let data = monthlyData;
       if (!data || data.team_id !== selectedTeam || data.year !== year || data.month !== month) {
@@ -187,9 +108,6 @@ export default function TeamView({ user }) {
         setMonthlyData(data);
         setDataLoading(false);
       }
-      const team = selectedTeam === ALL_MEMBERS_ID
-        ? { team_id: ALL_MEMBERS_ID, team_name: ALL_MEMBERS_NAME }
-        : (teams.find(t => t.team_id === selectedTeam) || {});
       downloadTeamPivotExcel(data, team, year, month);
     } catch (e) {
       setError(e.message);
@@ -198,10 +116,6 @@ export default function TeamView({ user }) {
   };
 
   if (loading && teams.length === 0) return <div style={s.loader}>Loading...</div>;
-
-  const dailyMembers = attendance?.participants || [];
-  const rangeSummary = rangeData?.member_summary || [];
-  const rangeDaily = rangeData?.daily_data || [];
 
   return (
     <div>
@@ -220,9 +134,8 @@ export default function TeamView({ user }) {
             {teams.map(t => <option key={t.team_id} value={t.team_id}>{t.team_name}</option>)}
           </select>
           <div style={s.modeToggle}>
-            <button onClick={() => setMode('daily')} style={{ ...s.modeBtn, ...(mode === 'daily' ? s.modeBtnOn : {}) }}>Daily</button>
-            <button onClick={() => setMode('range')} style={{ ...s.modeBtn, ...(mode === 'range' ? s.modeBtnOn : {}) }}>Range</button>
             <button onClick={() => setMode('monthly')} style={{ ...s.modeBtn, ...(mode === 'monthly' ? s.modeBtnOn : {}) }}>Monthly</button>
+            <button onClick={() => setMode('custom')} style={{ ...s.modeBtn, ...(mode === 'custom' ? s.modeBtnOn : {}) }}>Custom Period</button>
           </div>
         </div>
       </div>
@@ -231,19 +144,14 @@ export default function TeamView({ user }) {
 
       {/* Date controls */}
       <div style={s.dateBar}>
-        {mode === 'daily' && (
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <input type="date" value={date} onChange={e => setDate(e.target.value)} style={s.dateInput} />
-            <button onClick={downloadDailyCsv} style={s.csvBtn}>CSV</button>
-          </div>
-        )}
-        {mode === 'range' && (
+        {mode === 'custom' && (
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
             <label style={{ fontSize: 12, color: '#64748b' }}>From</label>
             <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} style={s.dateInput} />
             <label style={{ fontSize: 12, color: '#64748b' }}>To</label>
             <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} style={s.dateInput} />
             <button onClick={downloadRangeCsv} style={s.csvBtn}>CSV</button>
+            <button onClick={downloadPivotExcel} style={s.pivotXlsxBtn} title="Excel report for this period">Download Excel Report</button>
           </div>
         )}
         {mode === 'monthly' && (
@@ -266,223 +174,29 @@ export default function TeamView({ user }) {
 
       {!selectedTeam && <div style={s.empty}>Select a team to view attendance</div>}
 
-      {/* ═══ DAILY VIEW ═══ */}
-      {mode === 'daily' && selectedTeam && !dataLoading && attendance && (
+      {/* ═══ MONTHLY / CUSTOM PERIOD — identical metrics ═══ */}
+      {mode === 'custom' && selectedTeam && !dataLoading && rangeData && (
         <div>
-          {attendance.team_name && (
-            <div style={{ marginBottom: 12, fontSize: 13, color: '#64748b' }}>
-              <strong style={{ color: '#1e293b' }}>{attendance.team_name}</strong>
-              {attendance.manager_name ? ` — Manager: ${attendance.manager_name}` : ''}
-              {` — ${attendance.date}`}
-            </div>
-          )}
-
-          {dailyStats && (
-            <div style={s.statsRow}>
-              <StatCard label="Present" value={dailyStats.present} sub={`of ${dailyStats.total}`} color="#10b981" />
-              {dailyStats.halfDay > 0 && <StatCard label="Half Day" value={dailyStats.halfDay} color="#f59e0b" />}
-              <StatCard label="Absent" value={dailyStats.absent} sub={`of ${dailyStats.total}`} color="#ef4444" />
-              <StatCard label="Avg Active" value={fmtMins(dailyStats.avgActive)} color="#3b82f6" />
-              <StatCard label="Total Break" value={fmtMins(dailyStats.totalBreak)} color="#f97316" />
-            </div>
-          )}
-
-          {/* Name-drift resolver: people in the meeting whose Zoom name
-              matches no roster member anywhere. Each can be LINKED to an
-              existing member (permanent alias) or ADDED to this team. */}
-          {unmatchedList.length > 0 && (
-            <div style={{
-              margin: '0 0 12px', padding: '10px 14px', borderRadius: 8,
-              background: '#fef3c7', border: '1px solid #f59e0b', fontSize: 12.5, color: '#92400e',
-            }}>
-              <strong>⚠ {unmatchedList.length} participant(s) in the meeting don't match any team roster</strong>
-              {' — their hours are not counted in any team. Link each to an existing member, or add them to this team:'}
-              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {unmatchedList.map(u => (
-                  <div key={u.name} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                    <span style={{ fontWeight: 600, minWidth: 180 }}>{u.name}</span>
-                    {resolvedNames[u.name] ? (
-                      <span style={{ color: resolvedNames[u.name].startsWith('error') ? '#dc2626' : '#15803d' }}>
-                        ✓ {resolvedNames[u.name]}
-                      </span>
-                    ) : (
-                      <>
-                        <select
-                          value={linkSelection[u.name] || ''}
-                          onChange={e => setLinkSelection(prev => ({ ...prev, [u.name]: e.target.value }))}
-                          style={{ fontSize: 12, padding: '3px 6px', borderRadius: 5, border: '1px solid #d1d5db', maxWidth: 240 }}
-                        >
-                          <option value="">Link to existing member…</option>
-                          {allMembers.map((m, i) => (
-                            <option key={`${m.member_name}|${m.team_id}|${i}`} value={m.member_name}>
-                              {m.member_name} [{m.team_name}]
-                            </option>
-                          ))}
-                        </select>
-                        <button
-                          disabled={!linkSelection[u.name] || resolveBusy === u.name}
-                          onClick={() => handleLinkAlias(u.name, u.email)}
-                          style={{ fontSize: 12, padding: '3px 10px', borderRadius: 5, border: 'none', background: '#2563eb', color: '#fff', cursor: 'pointer', opacity: (!linkSelection[u.name] || resolveBusy === u.name) ? 0.5 : 1 }}
-                        >
-                          {resolveBusy === u.name ? '…' : 'Link'}
-                        </button>
-                        <button
-                          disabled={resolveBusy === u.name}
-                          onClick={() => handleAddUnmatched(u.name, u.email)}
-                          style={{ fontSize: 12, padding: '3px 10px', borderRadius: 5, border: '1px solid #059669', background: '#fff', color: '#059669', cursor: 'pointer' }}
-                        >
-                          Add to this team
-                        </button>
-                      </>
-                    )}
-                  </div>
-                ))}
-              </div>
-              <div style={{ marginTop: 8, fontSize: 11.5 }}>
-                Linking/adding takes effect on the next refresh for today; run a backfill to fix past days.
-              </div>
-            </div>
-          )}
-
-          {dailyMembers.length > 0 ? (
-            <div style={s.tableWrap}>
-              <table style={s.table}>
-                <thead>
-                  <tr>
-                    <th style={s.th}>Name</th>
-                    <th style={s.th}>Status</th>
-                    <th style={s.th}>First Seen</th>
-                    <th style={s.th}>Last Seen</th>
-                    <th style={s.th}>Total Time</th>
-                    <th style={s.th}>Breakout</th>
-                    <th style={s.th}>Main Room</th>
-                    <th style={s.th}>Break</th>
-                    <th style={s.th}>Isolation</th>
-                    {user?.role === 'superadmin' && <th style={s.th}></th>}
-                  </tr>
-                </thead>
-                <tbody>
-                  {dailyMembers.map((m, i) => (
-                    <tr key={i} style={{ ...(i % 2 === 0 ? s.trEven : {}), ...(m.status === 'absent' ? { opacity: 0.45 } : {}) }}>
-                      <td style={s.td}>
-                        <div style={{ fontWeight: 600 }}>{m.name}</div>
-                        {m.email && <div style={{ fontSize: 11, color: '#64748b' }}>{m.email}</div>}
-                      </td>
-                      <td style={s.td}>
-                        <span style={{ ...s.badge, ...statusStyle(m.status) }}>{statusLabel(m.status)}</span>
-                      </td>
-                      <td style={s.td}>{m.first_seen_ist || '-'}</td>
-                      <td style={s.td}>{m.last_seen_ist || '-'}</td>
-                      <td style={{ ...s.td, fontWeight: 600, color: m.total_duration_mins >= 300 ? '#10b981' : m.total_duration_mins >= 240 ? '#f59e0b' : m.total_duration_mins > 0 ? '#ef4444' : '#94a3b8' }}>
-                        {m.estimated && <span title="Estimated from webhook data (bot coverage missing)" style={{ color: '#d97706', marginRight: 3 }}>⚠</span>}
-                        {fmtMins(m.total_duration_mins)}
-                      </td>
-                      <td style={{ ...s.td, color: '#3b82f6' }}>{fmtMins(m.breakout_mins)}</td>
-                      <td style={{ ...s.td, color: '#8b5cf6' }}>{fmtMins(m.main_room_mins)}</td>
-                      <td style={{ ...s.td, color: (m.break_minutes || 0) > 45 ? '#dc2626' : '#64748b' }}>
-                        {m.status !== 'absent' ? fmtMins(m.break_minutes) : '-'}
-                      </td>
-                      <td style={{ ...s.td, color: m.isolation_minutes > 30 ? '#ef4444' : '#64748b' }}>
-                        {m.status !== 'absent' ? fmtMins(m.isolation_minutes) : '-'}
-                      </td>
-                      {user?.role === 'superadmin' && (
-                        <td style={s.td}>
-                          <button onClick={() => { setEditModalMember(m); setEditModalDate(date); }} style={s.editBtn}>Edit</button>
-                        </td>
-                      )}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div style={s.empty}>No attendance data for this date.</div>
-          )}
+          <div style={{ marginBottom: 12, fontSize: 13, color: '#64748b' }}>
+            <strong style={{ color: '#1e293b' }}>{rangeData.team_name}</strong>
+            {` — ${rangeData.start_date} to ${rangeData.end_date}`}
+          </div>
+          <MonthlyPivotTables
+            monthlyData={rangeData}
+            year={year}
+            month={month}
+            startDate={rangeData.start_date}
+            endDate={rangeData.end_date}
+            holidays={rangeData?.holidays || []}
+            user={user}
+            onEditCell={(member, cellDate) => {
+              setEditModalMember(member);
+              setEditModalDate(cellDate);
+            }}
+          />
         </div>
       )}
 
-      {/* ═══ RANGE VIEW ═══ */}
-      {mode === 'range' && selectedTeam && !dataLoading && rangeData && (
-        <div>
-          {rangeData.team_name && (
-            <div style={{ marginBottom: 12, fontSize: 13, color: '#64748b' }}>
-              <strong style={{ color: '#1e293b' }}>{rangeData.team_name}</strong>
-              {` — ${rangeData.start_date} to ${rangeData.end_date}`}
-            </div>
-          )}
-
-          {rangeSummary.length > 0 && (
-            <>
-              <h3 style={s.sectionTitle}>Member Summary</h3>
-              <div style={{ ...s.tableWrap, marginBottom: 24 }}>
-                <table style={s.table}>
-                  <thead>
-                    <tr>
-                      <th style={s.th}>Name</th>
-                      <th style={s.th}>Days Present</th>
-                      <th style={s.th}>Total Active</th>
-                      <th style={s.th}>Total Break</th>
-                      <th style={s.th}>Total Isolation</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rangeSummary.map((m, i) => (
-                      <tr key={i} style={i % 2 === 0 ? s.trEven : {}}>
-                        <td style={{ ...s.td, fontWeight: 600 }}>{m.name}</td>
-                        <td style={s.td}><span style={{ ...s.badge, background: '#eff6ff', color: '#2563eb' }}>{m.days_present}</span></td>
-                        <td style={{ ...s.td, color: '#10b981', fontWeight: 600 }}>{fmtMins(m.total_active_mins)}</td>
-                        <td style={{ ...s.td, color: '#f97316' }}>{fmtMins(m.total_break_mins)}</td>
-                        <td style={{ ...s.td, color: '#64748b' }}>{fmtMins(m.total_isolation_mins)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          )}
-
-          {rangeDaily.length > 0 ? (
-            <>
-              <h3 style={s.sectionTitle}>Daily Breakdown</h3>
-              <div style={s.tableWrap}>
-                <table style={s.table}>
-                  <thead>
-                    <tr>
-                      <th style={s.th}>Date</th>
-                      <th style={s.th}>Name</th>
-                      <th style={s.th}>First Seen</th>
-                      <th style={s.th}>Last Seen</th>
-                      <th style={s.th}>Active</th>
-                      <th style={s.th}>Break</th>
-                      <th style={s.th}>Isolation</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rangeDaily.map((d, i) => (
-                      <tr key={i} style={i % 2 === 0 ? s.trEven : {}}>
-                        <td style={{ ...s.td, fontWeight: 500 }}>{d.date}</td>
-                        <td style={s.td}>{d.name}</td>
-                        <td style={s.td}>{d.first_seen_ist || '-'}</td>
-                        <td style={s.td}>{d.last_seen_ist || '-'}</td>
-                        <td style={{ ...s.td, color: '#10b981', fontWeight: 600 }}>
-                          {d.estimated && <span title="Estimated from webhook data (bot coverage missing)" style={{ color: '#d97706', marginRight: 3 }}>⚠</span>}
-                          {fmtMins(d.active_minutes)}
-                        </td>
-                        <td style={{ ...s.td, color: '#f97316' }}>{fmtMins(d.break_minutes)}</td>
-                        <td style={{ ...s.td, color: '#64748b' }}>{fmtMins(d.isolation_minutes)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          ) : (
-            <div style={s.empty}>No attendance data for this date range.</div>
-          )}
-        </div>
-      )}
-
-      {/* ═══ MONTHLY VIEW ═══ */}
       {mode === 'monthly' && selectedTeam && !dataLoading && monthlyData && (
         <div>
           {monthlyData.team_name && (
@@ -520,15 +234,6 @@ export default function TeamView({ user }) {
   );
 }
 
-function StatCard({ label, value, sub, color }) {
-  return (
-    <div style={s.statCard}>
-      <div style={s.statLabel}>{label}</div>
-      <div style={{ fontSize: 26, fontWeight: 800, color, lineHeight: 1.1 }}>{value}</div>
-      {sub && <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>{sub}</div>}
-    </div>
-  );
-}
 
 const s = {
   header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap', gap: 12 },

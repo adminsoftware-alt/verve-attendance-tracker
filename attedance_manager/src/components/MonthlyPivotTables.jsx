@@ -44,7 +44,12 @@ function dayOfWeek(ymd) {
   return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dowOf(ymd)];
 }
 
-export default function MonthlyPivotTables({ monthlyData, year, month, holidays = [], user, onEditCell }) {
+/**
+ * Renders the monthly pivots. Also drives Team View's "Custom Period" mode:
+ * pass startDate/endDate and the same tables are produced over that range
+ * instead of a calendar month, so both modes report identical metrics.
+ */
+export default function MonthlyPivotTables({ monthlyData, year, month, holidays = [], user, onEditCell, startDate, endDate }) {
   const canEdit = user?.role === 'superadmin';
   const [view, setView] = useState('hours');
 
@@ -57,12 +62,30 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
 
   const { dates, names, lookup, workingDays, weekdays } = useMemo(() => {
     const dailyData = monthlyData?.daily_data || [];
-    const dateSet = new Set();
-    const daysInMonth = new Date(year, month, 0).getDate();
-    for (let d = 1; d <= daysInMonth; d++) {
-      const ds = `${year}-${pad2(month)}-${pad2(d)}`;
-      if (!isWeekend(ds)) dateSet.add(ds);
+
+    // The period is either an explicit range (Custom Period) or a calendar
+    // month (Monthly). Everything downstream works off this one list, so the
+    // two modes cannot drift apart.
+    const periodDates = [];
+    if (startDate && endDate) {
+      // Format from LOCAL parts. toISOString() would convert to UTC, and a
+      // local midnight in IST is 18:30 UTC the previous day — which slid the
+      // whole range back a day.
+      const cur = new Date(`${startDate}T00:00:00`);
+      const stop = new Date(`${endDate}T00:00:00`);
+      while (cur <= stop) {
+        periodDates.push(`${cur.getFullYear()}-${pad2(cur.getMonth() + 1)}-${pad2(cur.getDate())}`);
+        cur.setDate(cur.getDate() + 1);
+      }
+    } else {
+      const daysInMonth = new Date(year, month, 0).getDate();
+      for (let d = 1; d <= daysInMonth; d++) {
+        periodDates.push(`${year}-${pad2(month)}-${pad2(d)}`);
+      }
     }
+
+    const dateSet = new Set();
+    periodDates.forEach(ds => { if (!isWeekend(ds)) dateSet.add(ds); });
     dailyData.forEach(r => { if (r?.date) dateSet.add(r.date); });
     const datesArr = Array.from(dateSet).sort();
 
@@ -87,17 +110,14 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
       };
     });
 
-    // Working days = weekdays minus holidays
+    // Working days = weekdays in the period, minus holidays
     let wd = 0;
-    for (let d = 1; d <= daysInMonth; d++) {
-      const ds = `${year}-${pad2(month)}-${pad2(d)}`;
-      if (!isWeekend(ds) && !holidayMap[ds]) wd++;
-    }
+    periodDates.forEach(ds => { if (!isWeekend(ds) && !holidayMap[ds]) wd++; });
     // Weekdays list for Leaves calc excludes both weekends AND holidays
     const weekdaysArr = datesArr.filter(ds => !isWeekend(ds) && !holidayMap[ds]);
 
     return { dates: datesArr, names: namesArr, lookup: lookupMap, workingDays: wd, weekdays: weekdaysArr };
-  }, [monthlyData, year, month, holidayMap]);
+  }, [monthlyData, year, month, holidayMap, startDate, endDate]);
 
   if (!names.length) {
     return <div style={s.empty}>No attendance data for this month.</div>;

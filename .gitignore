@@ -44,3 +44,4 @@ reports/
 
 # Zip files
 *.zip
+.DS_Store

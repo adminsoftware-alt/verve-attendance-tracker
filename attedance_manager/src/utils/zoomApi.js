@@ -506,3 +506,26 @@ export async function adminDeleteEvents(eventIds) {
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
   return res.json();
 }
+
+// ─── ROOM OVERRIDES ────────────────────────────────────
+// A human statement of what a room actually is. The BigQuery builder reads
+// `room_overrides` as its top-priority source, ahead of room_mappings and the
+// webhook event names — so this is a correction to the INPUT of the hours
+// calculation, not an edit to its output. presence_intervals is deleted and
+// rebuilt every 5 minutes; anything written there directly would not survive.
+// The backend rebuilds the affected day(s) before it responds, so the numbers
+// have already moved by the time the call returns.
+
+export async function fetchRoomOverrides(activeOnly = false) {
+  return apiFetch(`/rooms/overrides${activeOnly ? '?active=1' : ''}`);
+}
+
+// { room_uuid, room_name?, room_category?, mapping_date?, note? }
+// mapping_date omitted => the override applies whenever that room UUID appears.
+export async function createRoomOverride(payload) {
+  return apiPost('/rooms/override', payload);
+}
+
+export async function retireRoomOverride(overrideId) {
+  return apiDelete(`/rooms/override/${overrideId}`);
+}
