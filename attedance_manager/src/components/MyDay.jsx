@@ -46,11 +46,6 @@ export default function MyDay({ user }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // Which person are we showing? Defaults to the logged-in user; admins can
-  // look at anyone, because the person who noticed a wrong room is not always
-  // the person who can fix it.
-  const [who, setWho] = useState('');
-
   // Correction state
   const [editing, setEditing] = useState(null);   // the room_visit being corrected
   const [formName, setFormName] = useState('');
@@ -89,11 +84,16 @@ export default function MyDay({ user }) {
     return [...list].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   }, [summary]);
 
-  // Pick the logged-in person automatically. Match on email first (stable),
-  // then on name — the same order the backend uses everywhere else.
+  // My Day shows YOU and nobody else. It is the one screen where the person
+  // reading it is the ground truth — you know which room you were actually in,
+  // and a correction is stored against the room UUID, so fixing it from your
+  // own row fixes it for everyone who was in that room. There is no reason to
+  // browse other people's days from here.
+  //
+  // Match on email first (stable), then on display name — the same order the
+  // backend uses everywhere else. Zoom display names drift; emails do not.
   const me = useMemo(() => {
     if (!people.length) return null;
-    if (who) return people.find(p => (p.name || '') === who) || null;
     const email = (user?.email || '').toLowerCase().trim();
     const name = (user?.name || '').toLowerCase().trim();
     return (
@@ -101,7 +101,7 @@ export default function MyDay({ user }) {
       people.find(p => name && (p.name || '').toLowerCase().trim() === name) ||
       null
     );
-  }, [people, who, user]);
+  }, [people, user]);
 
   const visits = me?.room_visits || [];
 
@@ -178,21 +178,22 @@ export default function MyDay({ user }) {
       {error && <div style={s.error}>{error}</div>}
       {savedMsg && <div style={s.ok}>{savedMsg}</div>}
 
-      {/* Whose day? Defaults to you. */}
+      {/* Whose day? Yours. Not a chooser — a statement of who is signed in. */}
       <div style={s.whoBar}>
         <label style={s.whoLabel}>Showing</label>
-        <select value={who} onChange={e => setWho(e.target.value)} style={s.select}>
-          <option value="">Me{user?.name ? ` (${user.name})` : ''}</option>
-          {people.map(p => (
-            <option key={`${p.name}|${p.email}`} value={p.name}>{p.name}</option>
-          ))}
-        </select>
-        {!loading && !me && people.length > 0 && (
-          <span style={s.hint}>
-            No rooms found for you on this date — pick a name to view someone else.
-          </span>
-        )}
+        <span style={s.whoName}>
+          {user?.name || 'You'}
+          {user?.email && <span style={s.whoEmail}> ({user.email})</span>}
+        </span>
       </div>
+
+      {!loading && !me && people.length > 0 && (
+        <div style={s.notFound}>
+          No rooms recorded for <strong>{user?.email || user?.name}</strong> on this date.
+          If you were on Zoom that day, the email you sign in with may differ from the
+          one Zoom has for you — an admin can align them under Employees.
+        </div>
+      )}
 
       {loading && <div style={s.empty}>Loading…</div>}
 
@@ -383,10 +384,12 @@ const s = {
   todayBtn: { padding: '7px 12px', border: '1px solid #d1d5db', borderRadius: 8, background: '#fff', cursor: 'pointer', fontSize: 12, color: '#334155' },
   dateInput: { padding: '8px 12px', border: '1px solid #d1d5db', borderRadius: 8, fontSize: 13 },
   refreshBtn: { padding: '8px 16px', background: '#f1f5f9', color: '#475569', border: '1px solid #e5e7eb', borderRadius: 8, fontSize: 12, cursor: 'pointer' },
-  select: { padding: '7px 10px', border: '1px solid #d1d5db', borderRadius: 8, fontSize: 13, background: '#fff', cursor: 'pointer' },
 
   whoBar: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 16, flexWrap: 'wrap' },
   whoLabel: { fontSize: 12, color: '#64748b', fontWeight: 600 },
+  whoName: { fontSize: 14, fontWeight: 700, color: '#0f172a' },
+  whoEmail: { fontSize: 13, fontWeight: 500, color: '#64748b' },
+  notFound: { padding: '12px 14px', background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a', borderRadius: 10, fontSize: 13, marginBottom: 16, lineHeight: 1.5 },
   hint: { fontSize: 12, color: '#94a3b8' },
 
   error: { padding: '10px 14px', background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: 10, fontSize: 13, marginBottom: 14 },
