@@ -13814,6 +13814,43 @@ def create_room_override():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/intervals/rebuild-procedure', methods=['POST'])
+@require_auth(roles=['admin', 'superadmin'])
+def intervals_rebuild_procedure():
+    """Rebuild one day by CALLing the BigQuery stored procedure.
+
+    Deliberately NOT /intervals/rebuild: that one runs the retired Python
+    builder, which knows nothing about room_uuid or the v13 room-name fix and
+    would overwrite the day with worse data. The stored procedure owns this
+    table now, so a rebuild has to go through it.
+
+    Days built before v13 carry no room_uuid, which is why My Day cannot offer
+    "correct this room" on them. Rebuilding fills the column in.
+
+    Body: {"date": "YYYY-MM-DD"}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        raw = (data.get('date') or '').strip()
+        if not raw:
+            # No implicit default: an empty body must not silently rebuild
+            # today alongside the 5-minute scheduled query.
+            return jsonify({'success': False, 'error': 'date is required'}), 400
+        target = validate_date_format(raw)
+        rebuilt, errors = _rebuild_dates_via_procedure([target])
+        if errors and not rebuilt:
+            return jsonify({'success': False, 'date': str(target),
+                            'error': errors[0].get('error', 'rebuild failed')}), 500
+        return jsonify({'success': True, 'date': str(target),
+                        'rebuilt_dates': rebuilt, 'rebuild_errors': errors})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[RebuildProcedure] error: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/rooms/override/<override_id>', methods=['DELETE'])
 @require_auth(roles=['admin', 'superadmin'])
 def retire_room_override(override_id):
