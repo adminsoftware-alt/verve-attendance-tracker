@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { fetchSummary, createRoomOverride, fetchRoomOverrides, rebuildDayViaProcedure } from '../utils/zoomApi';
+import { fetchSummary, createRoomOverride, fetchRoomOverrides } from '../utils/zoomApi';
 
 /**
  * MY DAY — your own attendance for any date, and the place to correct a room.
@@ -71,7 +71,6 @@ export default function MyDay({ user }) {
   const [saving, setSaving] = useState(false);
   const [savedMsg, setSavedMsg] = useState('');
   const [overrides, setOverrides] = useState([]);
-  const [rebuilding, setRebuilding] = useState(false);
 
   // Whose day this screen shows, pinned per login. Shared accounts are the
   // reason this exists: signing in as admin@ tells us nothing about which
@@ -157,29 +156,6 @@ export default function MyDay({ user }) {
     });
     return { total, breakMins, working: total - breakMins };
   }, [visits]);
-
-  // Days built before v13 have no room_uuid on their intervals, so there is
-  // nothing to attach a correction to. That is a stale-data problem, not a
-  // permissions one — rebuilding the day through the stored procedure fills
-  // the column in and the buttons appear. Main Room stays never have a room
-  // ID, so they are excluded from the test.
-  const needsRebuild = useMemo(() => {
-    const breakoutVisits = visits.filter(v => v.room_category !== 'main');
-    return breakoutVisits.length > 0 && breakoutVisits.every(v => !v.room_uuid);
-  }, [visits]);
-
-  const rebuildDay = async () => {
-    setRebuilding(true);
-    setError(null);
-    try {
-      await rebuildDayViaProcedure(date);
-      await load();
-      setSavedMsg(`Rebuilt ${date}. You can now correct rooms on this day.`);
-    } catch (e) {
-      setError(`Rebuild failed: ${e.message}`);
-    }
-    setRebuilding(false);
-  };
 
   const openEditor = (v) => {
     setEditing(v);
@@ -288,19 +264,6 @@ export default function MyDay({ user }) {
 
       {loading && <div style={s.empty}>Loading…</div>}
 
-      {!loading && me && canOverride && needsRebuild && (
-        <div style={s.rebuildBar}>
-          <span>
-            This day was built before room IDs were recorded, so its rooms cannot be
-            corrected yet. Rebuilding reads the same webhook events again and fills them in —
-            it does not change anyone's hours by itself.
-          </span>
-          <button onClick={rebuildDay} disabled={rebuilding} style={s.rebuildBtn}>
-            {rebuilding ? 'Rebuilding…' : 'Rebuild this day'}
-          </button>
-        </div>
-      )}
-
       {!loading && me && (
         <>
           <div style={s.statsRow}>
@@ -352,7 +315,7 @@ export default function MyDay({ user }) {
                             style={s.hint}
                             title={v.room_category === 'main'
                               ? 'Main Room stays have no room ID to correct'
-                              : 'No room ID on this row — rebuild the day to correct it'}
+                              : 'No room ID recorded on this row, so it cannot be corrected'}
                           >—</span>
                         )}
                       </td>
@@ -502,8 +465,6 @@ const s = {
   saveBtn: { padding: '7px 12px', border: 'none', borderRadius: 8, background: '#2563eb', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer' },
   linkBtn: { border: 'none', background: 'none', color: '#2563eb', fontSize: 12, fontWeight: 600, cursor: 'pointer', padding: 0, textDecoration: 'underline' },
   linkBtnDark: { border: 'none', background: 'none', color: '#92400e', fontSize: 13, fontWeight: 700, cursor: 'pointer', padding: 0, textDecoration: 'underline' },
-  rebuildBar: { display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', padding: '12px 14px', background: '#eff6ff', color: '#1e40af', border: '1px solid #bfdbfe', borderRadius: 10, fontSize: 13, marginBottom: 16, lineHeight: 1.5 },
-  rebuildBtn: { padding: '8px 14px', border: 'none', borderRadius: 8, background: '#2563eb', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' },
   notFound: { padding: '12px 14px', background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a', borderRadius: 10, fontSize: 13, marginBottom: 16, lineHeight: 1.5 },
   hint: { fontSize: 12, color: '#94a3b8' },
 

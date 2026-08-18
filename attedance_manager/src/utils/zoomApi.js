@@ -526,13 +526,6 @@ export async function createRoomOverride(payload) {
   return apiPost('/rooms/override', payload);
 }
 
-// Rebuild one day through the BigQuery stored procedure. Days built before
-// v13 have no room_uuid, so My Day cannot offer a correction on them until
-// they are rebuilt.
-export async function rebuildDayViaProcedure(date) {
-  return apiPost('/intervals/rebuild-procedure', { date });
-}
-
 export async function retireRoomOverride(overrideId) {
   return apiDelete(`/rooms/override/${overrideId}`);
 }
