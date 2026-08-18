@@ -32,6 +32,23 @@ function fmtMins(m) {
   return `${min}m`;
 }
 
+// A person is identified by email where there is one, because Zoom display
+// names drift and emails do not. Falls back to the name only when the
+// participant has no email on record.
+function personId(p) {
+  const e = (p?.email || '').toLowerCase().trim();
+  return e || `name:${(p?.name || '').toLowerCase().trim()}`;
+}
+
+function findPerson(people, id) {
+  if (!id) return null;
+  if (id.startsWith('name:')) {
+    const n = id.slice(5);
+    return people.find(p => (p.name || '').toLowerCase().trim() === n) || null;
+  }
+  return people.find(p => (p.email || '').toLowerCase().trim() === id) || null;
+}
+
 function catStyle(cat) {
   switch (cat) {
     case 'break':    return { background: '#fff7ed', color: '#9a3412', border: '1px solid #fed7aa' };
@@ -55,6 +72,16 @@ export default function MyDay({ user }) {
   const [savedMsg, setSavedMsg] = useState('');
   const [overrides, setOverrides] = useState([]);
   const [rebuilding, setRebuilding] = useState(false);
+
+  // Whose day this screen shows, pinned per login. Shared accounts are the
+  // reason this exists: signing in as admin@ tells us nothing about which
+  // person is sitting there, so they say once and it sticks.
+  const pinKey = `verve_myday_person:${user?.username || user?.email || 'anon'}`;
+  const [pinned, setPinned] = useState(() => {
+    try { return localStorage.getItem(pinKey) || ''; } catch { return ''; }
+  });
+  const [picking, setPicking] = useState(false);
+  const [draft, setDraft] = useState('');
 
   const canOverride = user?.role === 'admin' || user?.role === 'superadmin';
 
@@ -91,18 +118,33 @@ export default function MyDay({ user }) {
   // own row fixes it for everyone who was in that room. There is no reason to
   // browse other people's days from here.
   //
-  // Match on email first (stable), then on display name — the same order the
-  // backend uses everywhere else. Zoom display names drift; emails do not.
+  // Resolution order: the pinned person, then the login's own email, then its
+  // display name — the same email-before-name order the backend uses.
   const me = useMemo(() => {
     if (!people.length) return null;
     const email = (user?.email || '').toLowerCase().trim();
     const name = (user?.name || '').toLowerCase().trim();
     return (
-      people.find(p => email && (p.email || '').toLowerCase().trim() === email) ||
+      findPerson(people, pinned) ||
+      (email ? findPerson(people, email) : null) ||
       people.find(p => name && (p.name || '').toLowerCase().trim() === name) ||
       null
     );
-  }, [people, user]);
+  }, [people, pinned, user]);
+
+  // What the header says when the chosen person has no rooms on this date —
+  // the pin is still the answer to "whose day is this", even on a blank day.
+  const shownLabel = me
+    ? { name: me.name, email: me.email }
+    : pinned
+      ? { name: pinned.startsWith('name:') ? pinned.slice(5) : pinned, email: '' }
+      : { name: user?.name || 'You', email: user?.email || '' };
+
+  const savePin = (id) => {
+    setPinned(id);
+    try { id ? localStorage.setItem(pinKey, id) : localStorage.removeItem(pinKey); } catch { /* private mode */ }
+    setPicking(false);
+  };
 
   const visits = me?.room_visits || [];
 
@@ -186,7 +228,7 @@ export default function MyDay({ user }) {
       <div style={s.header}>
         <div>
           <h2 style={s.title}>My Day</h2>
-          <div style={s.subtitle}>Your rooms for a single day — and where to fix one that is labelled wrong</div>
+          <div style={s.subtitle}>One person's rooms for a single day — and where to fix one that is labelled wrong</div>
         </div>
         <div style={s.controls}>
           <button onClick={() => shiftDate(-1)} style={s.navBtn} aria-label="Previous day">←</button>
@@ -202,20 +244,45 @@ export default function MyDay({ user }) {
       {error && <div style={s.error}>{error}</div>}
       {savedMsg && <div style={s.ok}>{savedMsg}</div>}
 
-      {/* Whose day? Yours. Not a chooser — a statement of who is signed in. */}
+      {/* Whose day? One person, chosen once — not a list of everybody. */}
       <div style={s.whoBar}>
         <label style={s.whoLabel}>Showing</label>
-        <span style={s.whoName}>
-          {user?.name || 'You'}
-          {user?.email && <span style={s.whoEmail}> ({user.email})</span>}
-        </span>
+        {picking ? (
+          <>
+            <select value={draft} onChange={e => setDraft(e.target.value)} style={s.select}>
+              <option value="">Choose a person…</option>
+              {people.map(p => (
+                <option key={personId(p)} value={personId(p)}>
+                  {p.name}{p.email ? ` (${p.email})` : ''}
+                </option>
+              ))}
+            </select>
+            <button onClick={() => savePin(draft)} disabled={!draft} style={s.saveBtn}>Save</button>
+            <button onClick={() => setPicking(false)} style={s.linkBtn}>Cancel</button>
+          </>
+        ) : (
+          <>
+            <span style={s.whoName}>
+              {shownLabel.name}
+              {shownLabel.email && <span style={s.whoEmail}> ({shownLabel.email})</span>}
+            </span>
+            {people.length > 0 && (
+              <button onClick={() => { setDraft(pinned); setPicking(true); }} style={s.linkBtn}>
+                Change
+              </button>
+            )}
+          </>
+        )}
       </div>
 
-      {!loading && !me && people.length > 0 && (
+      {!loading && !me && !picking && people.length > 0 && (
         <div style={s.notFound}>
-          No rooms recorded for <strong>{user?.email || user?.name}</strong> on this date.
-          If you were on Zoom that day, the email you sign in with may differ from the
-          one Zoom has for you — an admin can align them under Employees.
+          No rooms recorded for <strong>{shownLabel.email || shownLabel.name}</strong> on this date.
+          {' '}If this is a shared login, or the email you sign in with differs from the one
+          Zoom has, pick the right person once and this screen will remember it.
+          {' '}<button onClick={() => { setDraft(pinned); setPicking(true); }} style={s.linkBtnDark}>
+            Choose the person
+          </button>
         </div>
       )}
 
@@ -431,6 +498,10 @@ const s = {
   whoLabel: { fontSize: 12, color: '#64748b', fontWeight: 600 },
   whoName: { fontSize: 14, fontWeight: 700, color: '#0f172a' },
   whoEmail: { fontSize: 13, fontWeight: 500, color: '#64748b' },
+  select: { padding: '7px 10px', border: '1px solid #d1d5db', borderRadius: 8, fontSize: 13, background: '#fff', cursor: 'pointer', maxWidth: 340 },
+  saveBtn: { padding: '7px 12px', border: 'none', borderRadius: 8, background: '#2563eb', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer' },
+  linkBtn: { border: 'none', background: 'none', color: '#2563eb', fontSize: 12, fontWeight: 600, cursor: 'pointer', padding: 0, textDecoration: 'underline' },
+  linkBtnDark: { border: 'none', background: 'none', color: '#92400e', fontSize: 13, fontWeight: 700, cursor: 'pointer', padding: 0, textDecoration: 'underline' },
   rebuildBar: { display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', padding: '12px 14px', background: '#eff6ff', color: '#1e40af', border: '1px solid #bfdbfe', borderRadius: 10, fontSize: 13, marginBottom: 16, lineHeight: 1.5 },
   rebuildBtn: { padding: '8px 14px', border: 'none', borderRadius: 8, background: '#2563eb', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' },
   notFound: { padding: '12px 14px', background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a', borderRadius: 10, fontSize: 13, marginBottom: 16, lineHeight: 1.5 },
