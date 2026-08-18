@@ -13666,7 +13666,7 @@ def _ensure_room_overrides_table():
     CREATE TABLE IF NOT EXISTS `{dataset_ref}.{ROOM_OVERRIDES_TABLE}` (
         override_id   STRING NOT NULL,
         room_uuid     STRING NOT NULL,
-        mapping_date  DATE,
+        mapping_date  DATE NOT NULL,
         room_name     STRING,
         room_category STRING,
         note          STRING,
@@ -13732,8 +13732,9 @@ def list_room_overrides():
 def create_room_override():
     """Record what a room actually is, then rebuild the affected day.
 
-    Body: {room_uuid, room_name?, room_category?, mapping_date?, note?}
-      mapping_date omitted/null -> applies whenever this room UUID appears.
+    Body: {room_uuid, mapping_date, room_name?, room_category?, note?}
+      An override is matched on room_uuid + mapping_date, so both are
+      required — a row without a date would never be read by the builder.
       At least one of room_name / room_category must be given.
 
     Restricted to admin/superadmin on purpose: marking the break room as a
@@ -13750,6 +13751,8 @@ def create_room_override():
 
         if not room_uuid:
             return jsonify({'success': False, 'error': 'room_uuid is required'}), 400
+        if not raw_date:
+            return jsonify({'success': False, 'error': 'mapping_date is required'}), 400
         if not room_name and not room_category:
             return jsonify({'success': False,
                             'error': 'give room_name, room_category, or both'}), 400
@@ -13757,7 +13760,7 @@ def create_room_override():
             return jsonify({'success': False,
                             'error': f'room_category must be one of {VALID_ROOM_CATEGORIES}'}), 400
 
-        mapping_date = validate_date_format(raw_date) if raw_date else None
+        mapping_date = validate_date_format(raw_date)
 
         _ensure_room_overrides_table()
         client = get_bq_client()
@@ -13789,25 +13792,8 @@ def create_room_override():
             bigquery.ScalarQueryParameter("set_by", "STRING", actor),
         ])).result()
 
-        # Which day(s) to recompute. A dated override touches that day. An
-        # undated one touches every day this room UUID actually appears on,
-        # capped so one click cannot trigger a month of rebuilds.
-        if mapping_date:
-            dates = [mapping_date]
-        else:
-            drows = list(client.query(f"""
-                SELECT DISTINCT event_date
-                FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-                WHERE room_uuid = @room_uuid
-                  AND event_date >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 45 DAY)
-                ORDER BY event_date DESC
-                LIMIT 15
-            """, job_config=bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("room_uuid", "STRING", room_uuid)
-            ])).result())
-            dates = [r.event_date for r in drows]
-
-        rebuilt, errors = _rebuild_dates_via_procedure(dates)
+        # One override, one day, one rebuild.
+        rebuilt, errors = _rebuild_dates_via_procedure([mapping_date])
 
         return jsonify({
             'success': True,
@@ -13815,7 +13801,7 @@ def create_room_override():
             'room_uuid': room_uuid,
             'room_name': room_name or None,
             'room_category': room_category or None,
-            'mapping_date': str(mapping_date) if mapping_date else None,
+            'mapping_date': str(mapping_date),
             'set_by': actor,
             'rebuilt_dates': rebuilt,
             'rebuild_errors': errors,
@@ -13856,22 +13842,10 @@ def retire_room_override(override_id):
             bigquery.ScalarQueryParameter("id", "STRING", override_id)
         ])).result()
 
+        # Every override carries a date, so retiring one affects exactly that
+        # day. Legacy rows without a date (none should exist) rebuild nothing.
         target = rows[0].mapping_date
-        dates = [target] if target else []
-        if not dates:
-            drows = list(client.query(f"""
-                SELECT DISTINCT event_date
-                FROM `{dataset_ref}.{PRESENCE_INTERVALS_TABLE}`
-                WHERE room_uuid = @room_uuid
-                  AND event_date >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 45 DAY)
-                ORDER BY event_date DESC
-                LIMIT 15
-            """, job_config=bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("room_uuid", "STRING", rows[0].room_uuid)
-            ])).result())
-            dates = [r.event_date for r in drows]
-
-        rebuilt, errors = _rebuild_dates_via_procedure(dates)
+        rebuilt, errors = _rebuild_dates_via_procedure([target] if target else [])
         return jsonify({'success': True, 'override_id': override_id,
                         'rebuilt_dates': rebuilt, 'rebuild_errors': errors})
     except Exception as e:

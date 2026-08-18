@@ -25,16 +25,14 @@
 -- everybody's working hours.
 --
 -- HOW AN OVERRIDE IS MATCHED
---   mapping_date = <the day>  -> applies to that day only   (priority 0)
---   mapping_date IS NULL      -> applies whenever that UUID appears (priority 1)
+--   room_uuid + mapping_date, both required. Nothing else. An override
+--   states what one room was on one day, and applies to that day only.
 --
--- Both exist because room UUIDs are stable for a while and then rotate. In
--- room_mappings, the break room oUy7wbJxs4e0Xuveb+casg== is the same ID on
--- 6, 7 and 8 August across two different meeting sessions, then changes by
--- the 10th. A dated override fixes one day; an undated one holds for the
--- whole life of that room ID and stops applying by itself when Zoom rotates
--- it. Health check 16 is what verifies the assumption underneath the undated
--- form — that one UUID only ever means one room.
+-- It is deliberately not open-ended. Room UUIDs are stable for a while and
+-- then rotate, so an override with no date would keep applying to days
+-- nobody looked at, and would go on applying after Zoom reused the ID.
+-- Correcting a room on three days means three rows — see example 5 at the
+-- bottom for the one-statement way to write them.
 --
 -- NOT EXECUTED by the author — no BigQuery credentials.
 -- ============================================================================
@@ -45,7 +43,7 @@ CREATE TABLE IF NOT EXISTS
 `verve-attendance-tracker.breakout_room_calibrator.room_overrides` (
   override_id   STRING NOT NULL,
   room_uuid     STRING NOT NULL,   -- the room being corrected
-  mapping_date  DATE,              -- NULL = applies to every day this UUID appears
+  mapping_date  DATE NOT NULL,     -- the day it applies to — one row per day
   room_name     STRING,            -- corrected name (optional)
   room_category STRING,            -- 'break' | 'breakout' | 'main' (optional)
   note          STRING,            -- why — free text from whoever fixed it
@@ -162,10 +160,10 @@ BEGIN
         'breakout_room_joined','breakout_room_left')
   ),
 
-  -- ── 2. room_uuid -> room_name. Six evidence sources, lowest pri wins. ──
-  --     v13 adds the two human-override tiers at the top.
+  -- ── 2. room_uuid -> room_name. Five evidence sources, lowest pri wins. ──
+  --     v13 adds the human-override tier at the top.
   name_evidence AS (
-    -- (0) OVERRIDE pinned to THIS date — the most specific statement there is
+    -- (0) OVERRIDE for this room on THIS date — a human said so; it wins
     SELECT room_uuid, room_name, 0 AS pri, 1000000 AS support, set_at AS seen
     FROM `verve-attendance-tracker.breakout_room_calibrator.room_overrides`
     WHERE COALESCE(active, TRUE)
@@ -174,17 +172,8 @@ BEGIN
       AND room_name IS NOT NULL AND room_name != ''
 
     UNION ALL
-    -- (1) OVERRIDE with no date — holds for the whole life of this room UUID
-    SELECT room_uuid, room_name, 1, 1000000, set_at
-    FROM `verve-attendance-tracker.breakout_room_calibrator.room_overrides`
-    WHERE COALESCE(active, TRUE)
-      AND mapping_date IS NULL
-      AND room_uuid IS NOT NULL AND room_uuid != ''
-      AND room_name IS NOT NULL AND room_name != ''
-
-    UNION ALL
-    -- (2) room_mappings saved for THIS date: the deliberate machine record
-    SELECT room_uuid, room_name, 2, COUNT(*), MAX(mapped_at)
+    -- (1) room_mappings saved for THIS date: the deliberate machine record
+    SELECT room_uuid, room_name, 1, COUNT(*), MAX(mapped_at)
     FROM `verve-attendance-tracker.breakout_room_calibrator.room_mappings`
     WHERE mapping_date = target_date
       AND room_uuid IS NOT NULL AND room_uuid != ''
@@ -193,10 +182,10 @@ BEGIN
     GROUP BY room_uuid, room_name
 
     UNION ALL
-    -- (3) names seen in TODAY's event stream — MAJORITY wins.
+    -- (2) names seen in TODAY's event stream — MAJORITY wins.
     --     Zoom never sends a room name; the server guesses it when the
     --     webhook arrives and freezes the guess. Never let one event decide.
-    SELECT room_uuid, room_name, 3, COUNT(*), MAX(event_timestamp)
+    SELECT room_uuid, room_name, 2, COUNT(*), MAX(event_timestamp)
     FROM raw_events
     WHERE room_uuid IS NOT NULL AND room_uuid != ''
       AND room_name IS NOT NULL AND room_name != ''
@@ -206,8 +195,8 @@ BEGIN
     GROUP BY room_uuid, room_name
 
     UNION ALL
-    -- (4) room_mappings from ANY date. Rescues a day the Room Mapper missed.
-    SELECT room_uuid, room_name, 4, COUNT(*), MAX(mapped_at)
+    -- (3) room_mappings from ANY date. Rescues a day the Room Mapper missed.
+    SELECT room_uuid, room_name, 3, COUNT(*), MAX(mapped_at)
     FROM `verve-attendance-tracker.breakout_room_calibrator.room_mappings`
     WHERE room_uuid IS NOT NULL AND room_uuid != ''
       AND room_name IS NOT NULL AND room_name != ''
@@ -215,8 +204,8 @@ BEGIN
     GROUP BY room_uuid, room_name
 
     UNION ALL
-    -- (5) names seen in the event stream on any recent day
-    SELECT room_uuid, room_name, 5, COUNT(*), MAX(event_timestamp)
+    -- (4) names seen in the event stream on any recent day
+    SELECT room_uuid, room_name, 4, COUNT(*), MAX(event_timestamp)
     FROM `verve-attendance-tracker.breakout_room_calibrator.participant_events_p`
     WHERE event_date BETWEEN DATE_SUB(target_date, INTERVAL 60 DAY)
                          AND DATE_ADD(target_date, INTERVAL 1 DAY)
@@ -236,27 +225,19 @@ BEGIN
     GROUP BY room_uuid
   ),
 
-  -- ── 2b. explicit CATEGORY overrides, same date-then-undated precedence ──
+  -- ── 2b. explicit CATEGORY overrides for this date ──────────────────────
+  -- Same match as the name: room_uuid + mapping_date. If the same room was
+  -- corrected twice on one day, the most recent correction stands.
   category_overrides AS (
     SELECT
       room_uuid,
-      ARRAY_AGG(room_category ORDER BY pri ASC, set_at DESC LIMIT 1)[OFFSET(0)]
+      ARRAY_AGG(LOWER(TRIM(room_category)) ORDER BY set_at DESC LIMIT 1)[OFFSET(0)]
         AS forced_category
-    FROM (
-      SELECT room_uuid, LOWER(TRIM(room_category)) AS room_category, 0 AS pri, set_at
-      FROM `verve-attendance-tracker.breakout_room_calibrator.room_overrides`
-      WHERE COALESCE(active, TRUE)
-        AND mapping_date = target_date
-        AND room_uuid IS NOT NULL AND room_uuid != ''
-        AND room_category IS NOT NULL AND TRIM(room_category) != ''
-      UNION ALL
-      SELECT room_uuid, LOWER(TRIM(room_category)), 1, set_at
-      FROM `verve-attendance-tracker.breakout_room_calibrator.room_overrides`
-      WHERE COALESCE(active, TRUE)
-        AND mapping_date IS NULL
-        AND room_uuid IS NOT NULL AND room_uuid != ''
-        AND room_category IS NOT NULL AND TRIM(room_category) != ''
-    )
+    FROM `verve-attendance-tracker.breakout_room_calibrator.room_overrides`
+    WHERE COALESCE(active, TRUE)
+      AND mapping_date = target_date
+      AND room_uuid IS NOT NULL AND room_uuid != ''
+      AND room_category IS NOT NULL AND TRIM(room_category) != ''
     GROUP BY room_uuid
   ),
 
@@ -486,8 +467,24 @@ END;
 --              '8.0:BREAK TIME - Tea/Lunch/ Dinner', 'break',
 --              'was labelled Creative Corner', 'you@verveadvisory.com',
 --              CURRENT_TIMESTAMP(), TRUE);
---    then rebuild that date. Use mapping_date = NULL to make it permanent
---    for that room UUID.
+--    then rebuild that date.
 --
 -- 4. To retire an override, set active = FALSE and rebuild — never DELETE, so
 --    the record of who changed what survives.
+--
+-- 5. Same room wrong on several days? One row per day, written in one go —
+--    this reads the days that room actually appears on and stops there:
+--      INSERT INTO `verve-attendance-tracker.breakout_room_calibrator.room_overrides`
+--        (override_id, room_uuid, mapping_date, room_name, room_category,
+--         note, set_by, set_at, active)
+--      SELECT GENERATE_UUID(), room_uuid, event_date,
+--             '8.0:BREAK TIME - Tea/Lunch/ Dinner', 'break',
+--             'bulk fix', 'you@verveadvisory.com', CURRENT_TIMESTAMP(), TRUE
+--      FROM (
+--        SELECT DISTINCT room_uuid, event_date
+--        FROM `verve-attendance-tracker.breakout_room_calibrator.presence_intervals`
+--        WHERE room_uuid = 'p0a38bAFprbeXhSRe/Xigw=='
+--          AND event_date BETWEEN DATE '2026-08-06' AND DATE '2026-08-08'
+--      );
+--    then CALL the builder once per day in that range (07_backfill_v12.sql
+--    STEP 2 does exactly that loop).

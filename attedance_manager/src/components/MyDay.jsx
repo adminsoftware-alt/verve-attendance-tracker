@@ -55,7 +55,6 @@ export default function MyDay({ user }) {
   const [editing, setEditing] = useState(null);   // the room_visit being corrected
   const [formName, setFormName] = useState('');
   const [formCategory, setFormCategory] = useState('break');
-  const [formScope, setFormScope] = useState('date');  // 'date' | 'always'
   const [formNote, setFormNote] = useState('');
   const [saving, setSaving] = useState(false);
   const [savedMsg, setSavedMsg] = useState('');
@@ -134,7 +133,7 @@ export default function MyDay({ user }) {
         room_uuid: editing.room_uuid,
         room_name: formName.trim() || undefined,
         room_category: formCategory || undefined,
-        mapping_date: formScope === 'date' ? date : undefined,
+        mapping_date: date,   // an override is always for one day
         note: formNote.trim() || undefined,
       });
       setSavedMsg(
@@ -301,20 +300,10 @@ export default function MyDay({ user }) {
               style={s.input}
             />
 
-            <label style={s.fieldLabel}>Apply to</label>
-            <div style={s.catRow}>
-              <button onClick={() => setFormScope('date')}
-                      style={{ ...s.catBtn, ...(formScope === 'date' ? s.catBtnOn : {}) }}>
-                {date} only
-              </button>
-              <button onClick={() => setFormScope('always')}
-                      style={{ ...s.catBtn, ...(formScope === 'always' ? s.catBtnOn : {}) }}>
-                Every day this room appears
-              </button>
-            </div>
             <div style={s.helpText}>
-              Room IDs stay the same for days at a time and then rotate. “Every day”
-              holds until Zoom issues a new ID for this room, and stops applying by itself.
+              This correction applies to <strong>{date}</strong> only. Room IDs stay the
+              same for days at a time and then rotate, so if the same room is wrong on
+              another day, open that day and correct it there too.
             </div>
 
             <label style={s.fieldLabel}>Note (optional)</label>
@@ -362,7 +351,7 @@ export default function MyDay({ user }) {
                         ? <span style={{ ...s.badge, ...catStyle(o.room_category) }}>{o.room_category}</span>
                         : '—'}
                     </td>
-                    <td style={s.td}>{o.mapping_date || 'every day'}</td>
+                    <td style={s.td}>{o.mapping_date || '—'}</td>
                     <td style={s.td}>{o.set_by || '—'}</td>
                     <td style={{ ...s.td, color: '#64748b' }}>{o.note || '—'}</td>
                   </tr>
