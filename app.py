@@ -673,6 +673,15 @@ class MeetingState:
                         self.uuid_to_name[stripped] = room_name
                     count += 1
 
+                    # Already in BigQuery — mark it so the sync backfill does
+                    # not re-save it under TODAY's date. Without this, every
+                    # restart re-dated every mapping it had ever seen: the
+                    # break room accumulated 4 -> 11 room IDs in six days,
+                    # most of them belonging to days long past.
+                    self.persisted_webhook_uuids.add(room_uuid)
+                    if stripped != room_uuid:
+                        self.persisted_webhook_uuids.add(stripped)
+
                     if not self.meeting_id and row.meeting_id:
                         self.meeting_id = row.meeting_id
 
@@ -5180,7 +5189,15 @@ def mapping_sync():
                     with meeting_state._lock:
                         disputes = dict(meeting_state.mapping_disputes)
                         prior_corrections = dict(meeting_state.last_uuid_corrections)
-                    claims = {}       # unknown uuid -> claimed room names
+                    # CORROBORATION (2026-08-24): claims count SUPPORTERS, not
+                    # just names. One person is not enough to name a room —
+                    # if they stepped out of the break room a moment before
+                    # the panel looked, their new room inherits the break
+                    # name and that whole team's day is filed as break. Three
+                    # rooms, 63 hours, 17-20 Aug 2026. A second independent
+                    # person must agree before anything reaches BigQuery.
+                    MAPPING_MIN_WITNESSES = 2
+                    claims = {}       # unknown uuid -> {room name: supporter count}
                     corrections = {}  # mapped uuid that DISAGREES -> claims
                     for (kind, ident), rname in room_by_person.items():
                         entry = bo_state.get(kind + ':' + ident)
@@ -5199,33 +5216,49 @@ def mapping_sync():
                             continue
                         current = (uuid_names.get(wu) or '').strip()
                         if not current:
-                            claims.setdefault(wu, set()).add(rname)
+                            by_name = claims.setdefault(wu, {})
+                            by_name[rname] = by_name.get(rname, 0) + 1
                         elif current != rname.strip():
                             if wu in disputes:
                                 continue  # frozen for the day (see below)
                             # VERIFY-AND-CORRECT: existing mapping contradicts
                             # what the SDK sees for a stable participant.
-                            corrections.setdefault(wu, set()).add(rname)
+                            by_name = corrections.setdefault(wu, {})
+                            by_name[rname] = by_name.get(rname, 0) + 1
 
-                    for wu, names in claims.items():
-                        if len(names) != 1:
+                    for wu, by_name in claims.items():
+                        if len(by_name) != 1:
                             print(f"[mapping/sync] State-resolution SKIP {wu[:20]}...: "
-                                  f"conflicting rooms {sorted(names)}")
+                                  f"conflicting rooms {sorted(by_name)}")
                             continue
-                        rname = next(iter(names))
+                        rname, witnesses = next(iter(by_name.items()))
+                        if witnesses < MAPPING_MIN_WITNESSES:
+                            # Held, not discarded: the next sync re-counts, and
+                            # a genuinely occupied room reaches two witnesses
+                            # within a minute or two. Meanwhile the room stays
+                            # unnamed, which counts as WORKING time — the safe
+                            # way to be wrong.
+                            print(f"[mapping/sync] HELD {wu[:20]}... -> '{rname}': "
+                                  f"only {witnesses} witness, need {MAPPING_MIN_WITNESSES}")
+                            continue
                         meeting_state.add_webhook_room_mapping(wu, rname)
                         if _persist_mapping(wu, rname):
                             with meeting_state._lock:
                                 meeting_state.persisted_webhook_uuids.add(wu)
                         state_resolved += 1
-                        print(f"[mapping/sync] State-resolved: {wu[:20]}... -> {rname}")
+                        print(f"[mapping/sync] State-resolved: {wu[:20]}... -> {rname} "
+                              f"({witnesses} witnesses)")
 
-                    for wu, names in corrections.items():
-                        if len(names) != 1:
+                    for wu, by_name in corrections.items():
+                        if len(by_name) != 1:
                             print(f"[mapping/sync] Correction SKIP {wu[:20]}...: "
-                                  f"conflicting rooms {sorted(names)}")
+                                  f"conflicting rooms {sorted(by_name)}")
                             continue
-                        rname = next(iter(names))
+                        rname, witnesses = next(iter(by_name.items()))
+                        if witnesses < MAPPING_MIN_WITNESSES:
+                            print(f"[mapping/sync] Correction HELD {wu[:20]}... -> '{rname}': "
+                                  f"only {witnesses} witness")
+                            continue
                         old_name = uuid_names.get(wu)
                         # ANTI PING-PONG: a correction that REVERSES a recent
                         # one means two participants' webhook states disagree

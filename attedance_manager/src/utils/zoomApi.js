@@ -10,8 +10,25 @@ const ZOOM_API_BASE = 'https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app'
 import { authHeaders } from './storage';
 import { dayMinutes } from './parser';
 
+// A 12-hour login token expires silently. Reads mostly still work (many GETs
+// are unauthenticated), so the page keeps looking signed in while every write
+// fails with a bare "API error 401". Rather than show that, end the session
+// and say so in words — the only thing that actually fixes it is signing in
+// again.
+function failIfExpired(res) {
+  if (res.status !== 401) return;
+  try {
+    sessionStorage.removeItem('verve_token');
+    sessionStorage.removeItem('verve_session');
+  } catch { /* private mode */ }
+  // Reloading lands on the login screen, since App reads the session on mount.
+  setTimeout(() => window.location.reload(), 1500);
+  throw new Error('Your session has expired. Signing you out — please log in again.');
+}
+
 async function apiFetch(path) {
   const res = await fetch(`${ZOOM_API_BASE}${path}`, { headers: authHeaders() });
+  failIfExpired(res);
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
   const data = await res.json();
   if (data.success === false) throw new Error(data.error || 'API returned failure');
@@ -148,6 +165,7 @@ async function apiPost(path, body) {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body)
   });
+  failIfExpired(res);
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
   const data = await res.json();
   if (data.success === false) throw new Error(data.error || 'API returned failure');
@@ -160,6 +178,7 @@ async function apiPut(path, body) {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body)
   });
+  failIfExpired(res);
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
   const data = await res.json();
   if (data.success === false) throw new Error(data.error || 'API returned failure');
@@ -168,6 +187,7 @@ async function apiPut(path, body) {
 
 async function apiDelete(path) {
   const res = await fetch(`${ZOOM_API_BASE}${path}`, { method: 'DELETE', headers: authHeaders() });
+  failIfExpired(res);
   if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
   const data = await res.json();
   if (data.success === false) throw new Error(data.error || 'API returned failure');
