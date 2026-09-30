@@ -41,6 +41,8 @@ reports/
 !package-lock.json
 !breakout-calibrator/package.json
 !breakout-calibrator/package-lock.json
+# Zoom webhook test fixtures (fake data, needed by tests/)
+!tests/fixtures/*.json
 
 # Zip files
 *.zip

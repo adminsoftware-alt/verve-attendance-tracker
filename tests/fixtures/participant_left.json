@@ -1,0 +1,22 @@
+{
+  "event": "meeting.participant_left",
+  "event_ts": 1790704200000,
+  "payload": {
+    "account_id": "AcCtTest01",
+    "object": {
+      "id": "123456789",
+      "uuid": "MTGuuid-instance-1==",
+      "host_id": "hostX",
+      "topic": "Daily Operations",
+      "type": 8,
+      "timezone": "Asia/Kolkata",
+      "participant": {
+        "user_id": "16778240",
+        "user_name": "Ravi Kumar",
+        "email": "ravi.kumar@example.com",
+        "leave_time": "2026-09-29T17:50:00Z",
+        "leave_reason": "left the meeting"
+      }
+    }
+  }
+}

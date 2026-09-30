@@ -1,0 +1,17 @@
+{
+  "event": "meeting.participant_left_breakout_room",
+  "event_ts": 1790690400000,
+  "payload": {
+    "account_id": "AcCtTest01",
+    "object": {
+      "id": "123456789",
+      "uuid": "MTGuuid-instance-1==",
+      "breakout_room_uuid": "BRuuid-sales-aaa111==",
+      "participant": {
+        "user_id": "16778240",
+        "user_name": "Ravi Kumar",
+        "email": "ravi.kumar@example.com"
+      }
+    }
+  }
+}

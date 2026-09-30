@@ -155,6 +155,13 @@ def add_zoom_headers(response):
 # Zoom Credentials - MUST be set via environment variables
 # No default values to prevent accidental deployment without proper configuration
 from zt_config import *  # noqa: F401,F403 — split from app.py, see zt_config.py
+import zt_pubsub  # Pub/Sub buffer for webhooks (off unless WEBHOOK_PUBSUB_ENABLED=true)
+from zt_pubsub import EventStoreError, raise_if_strict
+import zt_mapping        # room-mapping decisions + DISPUTED persistence
+import zt_observability  # structured logs, webhook liveness, health metrics
+
+# Project/dataset handed to zt_mapping's BigQuery helpers
+_MAPPING_CFG = {'project': GCP_PROJECT_ID, 'dataset': BQ_DATASET}
 
 # Scout Bot Configuration
 
@@ -372,6 +379,7 @@ class MeetingState:
         self.event_dedup_cache = {}  # Deduplication cache: hash -> timestamp
         self.dedup_ttl_seconds = 60  # Events with same hash within 60s are duplicates
         self._last_cache_cleanup = time.time()  # For periodic cache cleanup
+        self._mark_tls = threading.local()  # Per-thread dedup marks (Pub/Sub rollback)
         self.reset()
 
     def reset(self):
@@ -442,7 +450,25 @@ class MeetingState:
 
             # Mark as seen
             self.event_dedup_cache[event_hash] = now
+            marks = getattr(self._mark_tls, 'marks', None)
+            if marks is not None:
+                marks.append(event_hash)
             return False
+
+    def begin_mark_tracking(self):
+        """Start recording dedup marks made by this thread (Pub/Sub push)."""
+        self._mark_tls.marks = []
+
+    def end_mark_tracking(self, rollback=False):
+        """Stop recording. rollback=True un-marks this thread's events so a
+        Pub/Sub redelivery after a failed BigQuery insert is NOT dropped as a
+        duplicate."""
+        marks = getattr(self._mark_tls, 'marks', None) or []
+        self._mark_tls.marks = None
+        if rollback and marks:
+            with self._lock:
+                for h in marks:
+                    self.event_dedup_cache.pop(h, None)
 
     def set_meeting(self, meeting_id, meeting_uuid=None):
         """Set current meeting, reset if different from previous"""
@@ -1195,16 +1221,26 @@ def insert_participant_event(event_data):
         client = get_bq_client()
         table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}"
 
-        errors = client.insert_rows_json(table_id, [cleaned_data])
+        # row_ids = BigQuery's best-effort streaming dedup, keyed on our
+        # deterministic event_id (point 3): a repeat landing inside BQ's
+        # dedup window is dropped server-side before it is even stored.
+        errors = client.insert_rows_json(table_id, [cleaned_data],
+                                         row_ids=[cleaned_data['event_id']])
         if errors:
             print(f"[BigQuery] Insert error: {errors}")
             print(f"[BigQuery] Failed data: {json.dumps(cleaned_data, indent=2)}")
+            # Inside a Pub/Sub push this raises -> non-2xx -> Pub/Sub retries.
+            # On the inline /webhook path it is a no-op (unchanged behaviour).
+            raise_if_strict(f"insert errors: {errors}")
             return False
 
         return True
+    except EventStoreError:
+        raise
     except Exception as e:
         print(f"[BigQuery] Error: {e}")
         traceback.print_exc()
+        raise_if_strict(e)
         return False
 
 
@@ -1234,7 +1270,8 @@ def insert_camera_event(event_data):
         client = get_bq_client()
         table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_CAMERA_TABLE}"
 
-        errors = client.insert_rows_json(table_id, [cleaned_data])
+        errors = client.insert_rows_json(table_id, [cleaned_data],
+                                         row_ids=[cleaned_data['event_id']])
         if errors:
             print(f"[BigQuery] Camera event error: {errors}")
             print(f"[BigQuery] Failed data: {json.dumps(cleaned_data, indent=2, default=str)}")
@@ -1723,6 +1760,25 @@ def extract_participant_data(data):
     }
 
 
+def deterministic_event_id(event_type, p, room_uuid=None):
+    """Deterministic event_id (review point 3): the SAME Zoom event always
+    hashes to the SAME id, whichever instance receives it and however often
+    it is delivered (restart mid-window, retry after 60s, Pub/Sub
+    redelivery). BigQuery can then drop repeats — insert_rows_json passes
+    this as the streaming insertId, and the v15 builder keeps one row per
+    event_id. The old uuid4 ids made every copy of an event look unique."""
+    raw = '|'.join([
+        event_type,
+        p.get('meeting_uuid') or p.get('meeting_id') or '',
+        p.get('participant_id') or '',
+        p.get('participant_email') or '',
+        p.get('participant_name') or '',
+        p['event_dt'].isoformat(),
+        room_uuid if room_uuid is not None else (p.get('room_uuid') or ''),
+    ])
+    return 'e1-' + hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]
+
+
 def handle_participant_joined(data):
     """Handle participant joined main meeting"""
     # Extract data with comprehensive fallbacks
@@ -1753,7 +1809,7 @@ def handle_participant_joined(data):
     meeting_state.set_meeting(p['meeting_id'], p['meeting_uuid'])
 
     event_data = {
-        'event_id': str(uuid_lib.uuid4()),
+        'event_id': deterministic_event_id('participant_joined', p, room_uuid=''),
         'event_type': 'participant_joined',
         'event_timestamp': p['event_dt'].isoformat(),
         'event_date': p['event_date_ist'],
@@ -1800,7 +1856,7 @@ def handle_participant_left(data):
         return
 
     event_data = {
-        'event_id': str(uuid_lib.uuid4()),
+        'event_id': deterministic_event_id('participant_left', p, room_uuid=''),
         'event_type': 'participant_left',
         'event_timestamp': p['event_dt'].isoformat(),
         'event_date': p['event_date_ist'],
@@ -2038,7 +2094,7 @@ def handle_breakout_room_join(data):
         print(f"  -> WARNING: No room_uuid in event data")
 
     event_data = {
-        'event_id': str(uuid_lib.uuid4()),
+        'event_id': deterministic_event_id('breakout_room_joined', p, room_uuid=room_uuid),
         'event_type': 'breakout_room_joined',
         'event_timestamp': p['event_dt'].isoformat(),
         'event_date': p['event_date_ist'],
@@ -2097,7 +2153,7 @@ def handle_breakout_room_leave(data):
                                p['participant_email'], p['meeting_id'])
 
     event_data = {
-        'event_id': str(uuid_lib.uuid4()),
+        'event_id': deterministic_event_id('breakout_room_left', p, room_uuid=room_uuid),
         'event_type': 'breakout_room_left',
         'event_timestamp': p['event_dt'].isoformat(),
         'event_date': p['event_date_ist'],
@@ -2156,7 +2212,7 @@ def handle_camera_event(data, camera_on):
             duration_seconds = None
 
     camera_event = {
-        'event_id': str(uuid_lib.uuid4()),
+        'event_id': deterministic_event_id('camera_on' if camera_on else 'camera_off', p),
         'event_type': 'camera_on' if camera_on else 'camera_off',
         'event_timestamp': event_dt.isoformat(),
         'event_date': p['event_date_ist'],
@@ -3598,6 +3654,36 @@ def webhook():
             'encryptedToken': encrypted_token
         })
 
+    # PUB/SUB MODE: the signature is already verified, so hand the event to
+    # Pub/Sub and answer Zoom right away. Processing happens in
+    # /pubsub/zoom-events, where a failed BigQuery write is retried instead
+    # of lost. If publishing itself fails, fall through and process inline
+    # (today's behaviour), so a Pub/Sub outage never drops an event.
+    if zt_pubsub.pubsub_active():
+        try:
+            raw_body = request.data.decode('utf-8') if request.data else json.dumps(data)
+            message_id = zt_pubsub.publish_webhook(data, raw_body)
+            print(f"[Webhook] {event} -> Pub/Sub ({message_id})")
+            return jsonify({'status': 'queued'})
+        except Exception as e:
+            print(f"[Webhook] Pub/Sub publish FAILED, processing inline: {e}")
+
+    try:
+        _dispatch_webhook_event(event, data)
+    except Exception as e:
+        print(f"[Webhook] ERROR handling {event}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Still return success to Zoom so it doesn't retry
+        return jsonify({'status': 'error logged', 'event': event}), 200
+
+    return jsonify({'status': 'success'})
+
+
+def _dispatch_webhook_event(event, data):
+    """Route one verified Zoom event to its handler. Shared by the inline
+    /webhook path and the Pub/Sub push path. Exceptions propagate."""
+    zt_observability.record_webhook(event)  # feeds /health/webhook liveness
     print(f"\n{'='*60}")
     print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] WEBHOOK EVENT: {event}")
     print(f"{'='*60}")
@@ -3609,40 +3695,124 @@ def webhook():
     else:
         print(f"[Webhook] Payload: {raw_str}")
 
-    # Route events to handlers with error catching
+    if event == 'meeting.participant_joined':
+        handle_participant_joined(data)
+
+    elif event == 'meeting.participant_left':
+        handle_participant_left(data)
+
+    elif event == 'meeting.participant_joined_breakout_room':
+        handle_breakout_room_join(data)
+
+    elif event == 'meeting.participant_left_breakout_room':
+        handle_breakout_room_leave(data)
+
+    elif event in ['meeting.participant_video_on', 'meeting.participant_video_started']:
+        handle_camera_event(data, camera_on=True)
+
+    elif event in ['meeting.participant_video_off', 'meeting.participant_video_stopped']:
+        handle_camera_event(data, camera_on=False)
+
+    elif event == 'meeting.ended':
+        handle_meeting_ended(data)
+
+    else:
+        print(f"[Webhook] Unhandled event type: {event}")
+
+
+@app.route('/pubsub/zoom-events', methods=['POST'])
+def pubsub_zoom_events():
+    """Pub/Sub push endpoint: processes one queued Zoom webhook.
+
+    Reply codes decide what Pub/Sub does next:
+      2xx -> done (acked)
+      5xx -> BigQuery write failed; Pub/Sub retries with backoff, and after
+             the max attempts moves the message to the dead-letter topic.
+    Only STORAGE failures are retried. Handler bugs and malformed messages
+    are logged and acked, as the inline path does today: with per-person
+    ordering, a message that can never succeed would otherwise hold up that
+    person's later events until it is dead-lettered.
+    """
+    ok, err = zt_pubsub.verify_push_request(request)
+    if not ok:
+        print(f"[PubSub] Push rejected: {err}")
+        return jsonify({'error': 'unauthorized'}), 403
+
     try:
-        if event == 'meeting.participant_joined':
-            handle_participant_joined(data)
-
-        elif event == 'meeting.participant_left':
-            handle_participant_left(data)
-
-        elif event == 'meeting.participant_joined_breakout_room':
-            handle_breakout_room_join(data)
-
-        elif event == 'meeting.participant_left_breakout_room':
-            handle_breakout_room_leave(data)
-
-        elif event in ['meeting.participant_video_on', 'meeting.participant_video_started']:
-            handle_camera_event(data, camera_on=True)
-
-        elif event in ['meeting.participant_video_off', 'meeting.participant_video_stopped']:
-            handle_camera_event(data, camera_on=False)
-
-        elif event == 'meeting.ended':
-            handle_meeting_ended(data)
-
-        else:
-            print(f"[Webhook] Unhandled event type: {event}")
-
+        message_id, data, attempt = zt_pubsub.decode_push_envelope(request.get_json(silent=True))
     except Exception as e:
-        print(f"[Webhook] ERROR handling {event}: {e}")
-        import traceback
-        traceback.print_exc()
-        # Still return success to Zoom so it doesn't retry
-        return jsonify({'status': 'error logged', 'event': event}), 200
+        print(f"[PubSub] Malformed message, dropping: {e}")
+        return ('', 204)
 
-    return jsonify({'status': 'success'})
+    if zt_pubsub.message_already_processed(message_id):
+        print(f"[PubSub] {message_id} already processed, skipping redelivery")
+        return ('', 204)
+
+    event = data.get('event', '')
+    if attempt and attempt > 1:
+        print(f"[PubSub] {message_id} delivery attempt {attempt}")
+
+    meeting_state.begin_mark_tracking()
+    try:
+        with zt_pubsub.strict_store():
+            _dispatch_webhook_event(event, data)
+    except EventStoreError as e:
+        meeting_state.end_mark_tracking(rollback=True)
+        zt_pubsub.note_push_failure()
+        print(f"[PubSub] {message_id} ({event}) BigQuery write failed, Pub/Sub will retry: {e}")
+        return jsonify({'error': 'store failed, retry'}), 500
+    except Exception as e:
+        meeting_state.end_mark_tracking()
+        print(f"[PubSub] {message_id} ({event}) handler error, acking: {e}")
+        traceback.print_exc()
+        zt_pubsub.mark_message_processed(message_id)
+        return ('', 204)
+
+    meeting_state.end_mark_tracking()
+    zt_pubsub.mark_message_processed(message_id)
+    return ('', 204)
+
+
+@app.route('/pubsub/status', methods=['GET'])
+def pubsub_status():
+    """Counters for the Pub/Sub path (since this instance started)."""
+    return jsonify(zt_pubsub.pubsub_stats())
+
+
+# ==============================================================================
+# PLATFORM HEALTH (review points 8 + 10) — read-only, open like /health
+# ==============================================================================
+
+@app.route('/health/webhook', methods=['GET'])
+def health_webhook():
+    """Is Zoom still talking to us? In-memory, zero BigQuery cost."""
+    result = zt_observability.webhook_health()
+    return jsonify(result), (503 if result['status'] == 'STALE' else 200)
+
+
+@app.route('/health/bigquery', methods=['GET'])
+def health_bigquery():
+    """Can we reach BigQuery right now? (SELECT 1, cached 60s)."""
+    result = zt_observability.bigquery_health(get_bq_client)
+    return jsonify(result), (200 if result.get('status') == 'HEALTHY' else 503)
+
+
+@app.route('/health/summary', methods=['GET'])
+def health_summary():
+    """Data-quality metrics: events, duplicates, unknown-room %, last build,
+    disputed rooms, watchdog check rows. Each metric guarded; cached 60s."""
+    extras = {
+        'pubsub': zt_pubsub.pubsub_stats(),
+        'disputed_rooms_today': zt_mapping.count_disputes_today(get_bq_client, _MAPPING_CFG),
+    }
+    return jsonify(zt_observability.data_quality_summary(
+        get_bq_client, GCP_PROJECT_ID, BQ_DATASET, BQ_EVENTS_TABLE, extras=extras))
+
+
+@app.route('/health/dashboard', methods=['GET'])
+def health_dashboard():
+    """Human-readable System Health page over /health/summary."""
+    return Response(zt_observability.DASHBOARD_HTML, mimetype='text/html')
 
 
 # ==============================================================================
@@ -5102,6 +5272,21 @@ def mapping_sync():
                 if em:
                     room_by_person[('e', em)] = rname
 
+        # Review point 5: witness decisions live in zt_mapping now.
+        # sdk_persons has ONE entry per person (a person with email+name
+        # lookup keys used to count as TWO witnesses, silently bypassing the
+        # 2-witness rule); a display name shared by several no-email
+        # participants identifies nobody and is excluded entirely.
+        sdk_persons, ambiguous_names = zt_mapping.build_sdk_persons(rooms)
+        if ambiguous_names:
+            print(f"[mapping/sync] Ignoring ambiguous shared name(s) as "
+                  f"witnesses: {sorted(ambiguous_names)}")
+
+        # Restore any DISPUTED freezes persisted before a restart (point 5),
+        # so a deploy no longer un-freezes an oscillating room. Memoized to
+        # one BigQuery read per process per IST day; never raises.
+        zt_mapping.hydrate_disputes(get_bq_client, _MAPPING_CFG, meeting_state)
+
         matched = []
         if room_by_person:
             with meeting_state._lock:
@@ -5199,8 +5384,11 @@ def mapping_sync():
                     MAPPING_MIN_WITNESSES = 2
                     claims = {}       # unknown uuid -> {room name: supporter count}
                     corrections = {}  # mapped uuid that DISAGREES -> claims
-                    for (kind, ident), rname in room_by_person.items():
-                        entry = bo_state.get(kind + ':' + ident)
+                    # ONE iteration per PERSON (zt_mapping), not per lookup
+                    # key — email+name no longer double-counts a witness.
+                    for person in sdk_persons:
+                        rname = person['room_name']
+                        entry = zt_mapping.select_witness_entry(person, bo_state)
                         if not entry:
                             continue
                         wu = entry.get('room_uuid')
@@ -5272,6 +5460,12 @@ def mapping_sync():
                                 meeting_state.mapping_disputes[wu] = now_ts
                             print(f"[mapping/sync] DISPUTED (frozen for today): {wu[:20]}... "
                                   f"oscillating between '{rname}' and '{prior.get('new')}'")
+                            # Point 5: freeze survives restarts via BigQuery
+                            zt_mapping.persist_dispute(
+                                get_bq_client, _MAPPING_CFG, wu,
+                                meeting_uuid=current_instance or '',
+                                kept_name=(uuid_names.get(wu) or ''),
+                                rejected_name=rname)
                             continue
                         # BQ first: memory is only corrected once the mapping
                         # row is durably fixed — otherwise the build-time JOIN
