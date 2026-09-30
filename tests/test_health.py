@@ -139,6 +139,16 @@ def test_dashboard_serves_html(client):
     assert 'System Health' in r.get_data(as_text=True)
 
 
+def test_dashboard_embeddable_by_frontend_only(client):
+    """The attendance frontend may iframe /health/dashboard; other pages
+    keep the Zoom-only frame-ancestors policy."""
+    csp = client.get('/health/dashboard').headers['Content-Security-Policy']
+    assert 'attendance-frontend-4e5na4tdha-uc.a.run.app' in csp
+    other = client.get('/health/webhook').headers['Content-Security-Policy']
+    assert 'attendance-frontend' not in other
+    assert 'zoom.us' in other
+
+
 def test_log_json_is_parseable(capsys):
     zt_observability.log_json('WARNING', 'mapping conflict', room_uuid='X', count=2)
     line = capsys.readouterr().out.strip()

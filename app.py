@@ -147,7 +147,15 @@ def add_zoom_headers(response):
     # OWASP Security Headers (required by Zoom Apps)
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['Content-Security-Policy'] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; frame-ancestors https://*.zoom.us https://*.zoom.com"
+    if path == '/health/dashboard':
+        # The attendance frontend embeds ONLY this page (System Health tab).
+        # Everything else keeps the Zoom-only frame-ancestors policy.
+        response.headers['Content-Security-Policy'] = (
+            "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; "
+            "frame-ancestors https://*.zoom.us https://*.zoom.com "
+            "https://attendance-frontend-4e5na4tdha-uc.a.run.app")
+    else:
+        response.headers['Content-Security-Policy'] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; frame-ancestors https://*.zoom.us https://*.zoom.com"
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
 
     return response
