@@ -17,6 +17,7 @@ import EmployeeManager from './components/EmployeeManager';
 import EmployeeSummary from './components/EmployeeSummary';
 import DataEditor from './components/DataEditor';
 import HolidayManager from './components/HolidayManager';
+import SystemHealth from './components/SystemHealth';
 import Chatbot from './components/Chatbot';
 import { FullPageLoader } from './components/LoadingSpinner';
 
@@ -100,6 +101,9 @@ export default function App() {
         )}
         {!isManager && page === 'holidays' && (
           <HolidayManager user={user} />
+        )}
+        {!isManager && page === 'health' && (
+          <SystemHealth />
         )}
 
         {/* Shared pages (all roles) */}

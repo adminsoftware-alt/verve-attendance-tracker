@@ -9,6 +9,7 @@ const ADMIN_NAV = [
   { key: 'teamview', label: 'Team View', icon: '\u{1F4CA}' },
   { key: 'reports', label: 'Reports', icon: '\u{1F4CB}' },
   { key: 'registry', label: 'Registry', icon: '\u{1F4CB}' },
+  { key: 'health', label: 'System Health', icon: '\u{1FA7A}' },
 ];
 
 const SUPERADMIN_EXTRA = [
