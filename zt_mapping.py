@@ -210,16 +210,13 @@ def hydrate_disputes(get_client, cfg, meeting_state):
 # when someone MOVES. Every deploy/restart wiped it, so the Room Mapper panel
 # had nothing to cross-match until people moved again — observed live on
 # 2026-09-30 (Pub/Sub switch-on restart at ~13:20 IST left 40 rooms unnamed).
-# On the first sync after a restart, positions are rebuilt from the last 45
-# minutes of breakout events in BigQuery, stamped with their REAL event time,
-# so the sync's own stability (2 min) and freshness (30 min) guards still
-# apply unchanged.
-
-POSITION_LOOKBACK_MIN = 45
+# On the first sync after a restart, positions are rebuilt from today's
+# breakout events in BigQuery, stamped with their REAL event time, so the
+# sync's own stability / freshness / consensus rules decide what counts.
 
 
 def load_recent_positions(get_client, cfg, events_table):
-    """Latest breakout event per person in the last 45 min (IST today).
+    """Latest breakout event per person for the current IST business day.
     Returns [{keys, room_uuid, ts_epoch, meeting_uuid}] for people whose
     latest event is a JOIN (a leave means: not in any breakout room)."""
     client = get_client()
@@ -230,8 +227,6 @@ def load_recent_positions(get_client, cfg, events_table):
         FROM `{cfg['project']}.{cfg['dataset']}.{events_table}`
         WHERE event_date = '{_ist_today()}'
           AND event_type IN ('breakout_room_joined', 'breakout_room_left')
-          AND event_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),
-                                               INTERVAL {POSITION_LOOKBACK_MIN} MINUTE)
         QUALIFY ROW_NUMBER() OVER (
           PARTITION BY COALESCE(NULLIF(LOWER(TRIM(participant_email)), ''),
                                 LOWER(TRIM(participant_name)))

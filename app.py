@@ -5386,6 +5386,16 @@ def mapping_sync():
                     # worker, 2026-07-21 evening).
                     MAPPING_STABLE_MIN_S = 120
                     MAPPING_FRESH_MAX_S = 1800
+                    # CONSENSUS (2026-09-30): the 30-min freshness cap meant
+                    # a team that sat in one room all morning could never be
+                    # matched — 8-person rooms stayed "Unknown" for 1600+
+                    # minutes. Positions older than the cap now still count
+                    # when 3+ people agree on the SAME room (a lost
+                    # move-webhook strands one person, not three). Fresh
+                    # positions keep the 2-witness rule; corrections of an
+                    # existing name stay fresh-only.
+                    MAPPING_CONSENSUS_WITNESSES = 3
+                    MAPPING_CONSENSUS_MAX_S = 10 * 3600   # within the business day
                     now_ts = time.time()
                     with meeting_state._lock:
                         disputes = dict(meeting_state.mapping_disputes)
@@ -5416,13 +5426,19 @@ def mapping_sync():
                                 and entry['meeting_uuid'] != current_instance):
                             continue
                         age_s = now_ts - (entry.get('ts') or 0)
-                        if age_s < MAPPING_STABLE_MIN_S or age_s > MAPPING_FRESH_MAX_S:
+                        if age_s < MAPPING_STABLE_MIN_S or age_s > MAPPING_CONSENSUS_MAX_S:
                             continue
+                        is_fresh = age_s <= MAPPING_FRESH_MAX_S
                         current = (uuid_names.get(wu) or '').strip()
                         if not current:
-                            by_name = claims.setdefault(wu, {})
-                            by_name[rname] = by_name.get(rname, 0) + 1
+                            # claims[wu][rname] = [fresh witnesses, all witnesses]
+                            c = claims.setdefault(wu, {}).setdefault(rname, [0, 0])
+                            c[1] += 1
+                            if is_fresh:
+                                c[0] += 1
                         elif current != rname.strip():
+                            if not is_fresh:
+                                continue  # overwriting a name needs FRESH evidence
                             if wu in disputes:
                                 continue  # frozen for the day (see below)
                             # VERIFY-AND-CORRECT: existing mapping contradicts
@@ -5435,15 +5451,17 @@ def mapping_sync():
                             print(f"[mapping/sync] State-resolution SKIP {wu[:20]}...: "
                                   f"conflicting rooms {sorted(by_name)}")
                             continue
-                        rname, witnesses = next(iter(by_name.items()))
-                        if witnesses < MAPPING_MIN_WITNESSES:
+                        rname, (fresh, total) = next(iter(by_name.items()))
+                        if (fresh < MAPPING_MIN_WITNESSES
+                                and total < MAPPING_CONSENSUS_WITNESSES):
                             # Held, not discarded: the next sync re-counts, and
                             # a genuinely occupied room reaches two witnesses
                             # within a minute or two. Meanwhile the room stays
                             # unnamed, which counts as WORKING time — the safe
                             # way to be wrong.
                             print(f"[mapping/sync] HELD {wu[:20]}... -> '{rname}': "
-                                  f"only {witnesses} witness, need {MAPPING_MIN_WITNESSES}")
+                                  f"{fresh} fresh / {total} total witnesses, need "
+                                  f"{MAPPING_MIN_WITNESSES} fresh or {MAPPING_CONSENSUS_WITNESSES} total")
                             continue
                         meeting_state.add_webhook_room_mapping(wu, rname)
                         if _persist_mapping(wu, rname):
@@ -5451,7 +5469,7 @@ def mapping_sync():
                                 meeting_state.persisted_webhook_uuids.add(wu)
                         state_resolved += 1
                         print(f"[mapping/sync] State-resolved: {wu[:20]}... -> {rname} "
-                              f"({witnesses} witnesses)")
+                              f"({fresh} fresh / {total} total witnesses)")
 
                     for wu, by_name in corrections.items():
                         if len(by_name) != 1:

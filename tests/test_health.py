@@ -33,6 +33,9 @@ class FakeSummaryBQ:
             rows = [SimpleNamespace(n=1)]
         elif 'INFORMATION_SCHEMA.ROUTINES' in sql:
             rows = [SimpleNamespace(last_altered='2026-09-30 07:15:00')]
+        elif 'STRING_AGG' in sql:   # the unnamed-rooms listing
+            rows = [SimpleNamespace(room_uuid='ROOM-UUID-1', people=8, minutes=1608,
+                                    sample='Vishwa, Payal, Shivani')]
         elif 'presence_intervals' in sql:
             rows = [SimpleNamespace(last_build='2026-09-29 10:00:00', unknown_room_pct=3.4)]
         elif 'HAVING COUNT(*) > 1' in sql:
@@ -99,6 +102,8 @@ def test_summary_reports_all_sections(client, monkeypatch):
     assert body['webhook_events']['events_today'] == 8421
     assert body['webhook_events']['deterministic_id_pct'] == 100.0
     assert body['hours_builder']['last_updated'] == '2026-09-30 07:15:00'
+    assert body['unnamed_rooms'] == [{'room_uuid': 'ROOM-UUID-1', 'people': 8,
+                                      'minutes': 1608, 'who': 'Vishwa, Payal, Shivani'}]
     assert body['duplicates'] == {'duplicate_groups_today': 2, 'extra_rows_today': 3}
     assert body['presence_intervals']['unknown_room_time_pct_today'] == 3.4
     assert body['disputed_rooms_today'] == 1

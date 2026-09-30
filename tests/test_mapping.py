@@ -77,12 +77,12 @@ def sync_env(monkeypatch):
     ms.meeting_id = '123456789'
     ms.meeting_uuid = 'MTG-1'
 
-    def put_person(name, email, room_uuid=WU):
+    def put_person(name, email, room_uuid=WU, age_s=300):
         app_module._track_breakout_state(name, email, room_uuid, 'MTG-1')
         with ms._lock:
             for k in app_module._bo_state_keys(name, email):
                 if k in ms.participant_current_breakout:
-                    ms.participant_current_breakout[k]['ts'] = time.time() - 300
+                    ms.participant_current_breakout[k]['ts'] = time.time() - age_s
     return SimpleNamespace(saved=saved, put_person=put_person, ms=ms,
                            hydrate_positions=real_hydrate_positions)
 
@@ -167,6 +167,45 @@ def test_hydrate_survives_missing_table():
     ms = app_module.meeting_state
     ms.reset()
     assert zt_mapping.hydrate_disputes(boom, _cfg(), ms) == 0   # no raise
+
+
+# ── consensus: teams that sat all morning (positions older than 30 min) ──
+
+STALE = 2 * 3600   # 2 hours: past the 30-min freshness cap
+
+
+def _three_people():
+    return [{'name': 'Ravi Kumar', 'email': 'ravi@x.com'},
+            {'name': 'Priya S', 'email': 'priya@x.com'},
+            {'name': 'Arjun M', 'email': 'arjun@x.com'}]
+
+
+def test_three_stale_people_map_by_consensus(client, sync_env):
+    """The 2026-09-30 case: 8-person team in a room since morning, nobody
+    moved for hours -> the freshness cap kept the room unnamed all day."""
+    for p in _three_people():
+        sync_env.put_person(p['name'], p['email'], age_s=STALE)
+    _sync(client, _three_people())
+    assert sync_env.ms.uuid_to_name.get(WU) == 'Sales Team'
+
+
+def test_two_stale_people_are_still_held(client, sync_env):
+    """Below consensus AND not fresh: a lost move-webhook could strand two
+    people on an old room id, so two stale witnesses are not enough."""
+    for p in _three_people()[:2]:
+        sync_env.put_person(p['name'], p['email'], age_s=STALE)
+    _sync(client, _three_people()[:2])
+    assert WU not in sync_env.ms.uuid_to_name
+
+
+def test_stale_people_cannot_overwrite_an_existing_name(client, sync_env):
+    """Corrections stay fresh-only: three stale witnesses may NAME an unknown
+    room but may not RENAME a room that already has a name."""
+    sync_env.ms.uuid_to_name[WU] = 'Team B'
+    for p in _three_people():
+        sync_env.put_person(p['name'], p['email'], age_s=STALE)
+    _sync(client, _three_people(), room='Sales Team')
+    assert sync_env.ms.uuid_to_name.get(WU) == 'Team B'
 
 
 # ── position rehydration after restart (mapping fix B) ───────────────────

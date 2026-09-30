@@ -186,6 +186,23 @@ def data_quality_summary(get_client, project, dataset, events_table,
                 'unknown_room_time_pct_today': float(r.unknown_room_pct) if r.unknown_room_pct is not None else 0.0}
     guarded('presence_intervals', _presence)
 
+    def _unnamed_rooms():
+        # The rooms HR should look at: still unnamed today, who is in them,
+        # for how long. Single-person rooms can never be auto-named (2-witness
+        # rule) — these get named by hand on the My Day page.
+        rows = get_client().query(f"""
+            SELECT room_uuid, COUNT(DISTINCT participant_key) AS people,
+                   ROUND(SUM(duration_seconds) / 60) AS minutes,
+                   STRING_AGG(DISTINCT participant_name, ', ' LIMIT 4) AS sample
+            FROM {pi}
+            WHERE event_date = '{today}'
+              AND (room_name LIKE 'Room-%' OR room_name = 'Unknown Room')
+              AND room_uuid IS NOT NULL AND room_uuid != ''
+            GROUP BY room_uuid ORDER BY minutes DESC LIMIT 15""").result()
+        return [{'room_uuid': r.room_uuid, 'people': int(r.people),
+                 'minutes': int(r.minutes or 0), 'who': r.sample} for r in rows]
+    guarded('unnamed_rooms', _unnamed_rooms)
+
     def _checks():
         rows = get_client().query(f"""
             SELECT check_id, check_name, severity, metric, detail
@@ -241,6 +258,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <h1>System Health</h1>
 <p class="sub" id="meta">loading…</p>
 <div class="grid" id="tiles"></div>
+<div class="card wide"><div class="k">Unnamed rooms today — who is in them</div>
+  <div id="unnamed" class="s">loading…</div></div>
 <div class="card wide"><div class="k">Pipeline health checks (v_health_latest)</div>
   <div id="checks" class="s">loading…</div></div>
 <script>
@@ -276,6 +295,15 @@ async function load(){
     (we.deterministic_id_pct>=99?'ok':''),
     'dedup-safe event ids today · hours builder updated: '+esc((hb.last_updated||'—').slice(0,16))));
   document.getElementById('tiles').innerHTML=t.join('');
+  const ur=d.unnamed_rooms; const ue=document.getElementById('unnamed');
+  if(Array.isArray(ur)&&ur.length){
+    ue.innerHTML='<table><tr><th>Room id</th><th>People</th><th>Minutes</th><th>Who</th></tr>'+
+      ur.map(r=>'<tr><td title="'+esc(r.room_uuid)+'">'+esc(String(r.room_uuid).slice(0,10))+'…</td><td>'+esc(r.people)+
+      '</td><td>'+esc(r.minutes)+'</td><td>'+esc(r.who)+'</td></tr>').join('')+'</table>'+
+      '<div style="margin-top:6px">Rooms with 3+ people get named automatically on the next Room Mapper run. '+
+      '1–2 person rooms: name them by hand — My Day → the person → the room → set room name (admin).</div>';
+  } else if(Array.isArray(ur)){ ue.innerHTML='<span class="ok">All rooms named today.</span>';
+  } else { ue.textContent='unavailable: '+esc(ur&&ur.error); }
   const hc=d.health_checks;
   const el=document.getElementById('checks');
   if(Array.isArray(hc)&&hc.length){
