@@ -149,13 +149,16 @@ def data_quality_summary(get_client, project, dataset, events_table,
     def _dupes():
         # Same person + type + timestamp arriving more than once = the
         # duplicates the 60s in-memory cache missed (restart / redelivery).
+        # NB: the alias must not be "groups" — reserved keyword in BigQuery
+        # (found in production on 2026-09-30; the fake BQ in tests cannot
+        # catch parser errors).
         r = _one(get_client(), f"""
-            SELECT COUNT(*) AS groups, COALESCE(SUM(c - 1), 0) AS extra_rows FROM (
+            SELECT COUNT(*) AS dup_groups, COALESCE(SUM(c - 1), 0) AS extra_rows FROM (
               SELECT COUNT(*) AS c FROM {ev}
               WHERE event_date = '{today}'
               GROUP BY participant_id, event_type, event_timestamp, room_uuid
               HAVING COUNT(*) > 1)""")
-        return {'duplicate_groups_today': int(r.groups), 'extra_rows_today': int(r.extra_rows)}
+        return {'duplicate_groups_today': int(r.dup_groups), 'extra_rows_today': int(r.extra_rows)}
     guarded('duplicates', _dupes)
 
     def _presence():

@@ -34,7 +34,8 @@ class FakeSummaryBQ:
         elif 'presence_intervals' in sql:
             rows = [SimpleNamespace(last_build='2026-09-29 10:00:00', unknown_room_pct=3.4)]
         elif 'HAVING COUNT(*) > 1' in sql:
-            rows = [SimpleNamespace(groups=2, extra_rows=3)]
+            assert ' AS groups' not in sql, 'reserved BigQuery keyword as alias'
+            rows = [SimpleNamespace(dup_groups=2, extra_rows=3)]
         else:  # events count
             rows = [SimpleNamespace(n=8421, last_inserted_at='2026-09-29 10:29:48')]
         return mock.MagicMock(result=lambda *a, **k: rows)
