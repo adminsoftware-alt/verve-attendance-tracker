@@ -549,3 +549,9 @@ export async function createRoomOverride(payload) {
 export async function retireRoomOverride(overrideId) {
   return apiDelete(`/rooms/override/${overrideId}`);
 }
+
+// Every breakout room name we know (panel's full room list + names seen in
+// BigQuery recently) — the choices for the rename dropdowns.
+export async function fetchRoomCatalog() {
+  return apiFetch('/rooms/catalog');
+}

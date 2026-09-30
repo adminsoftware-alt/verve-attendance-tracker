@@ -69,12 +69,24 @@ def test_webhook_health_no_data_then_healthy(client, monkeypatch):
 
 
 def test_webhook_health_stale_returns_503(client, monkeypatch):
+    monkeypatch.setattr(zt_observability, '_ist_hour', lambda: 14)   # 2 PM IST
     zt_observability.record_webhook('meeting.participant_joined')
     with zt_observability._lock:
         zt_observability._webhook['last_ts'] -= 3600   # an hour ago
     r = client.get('/health/webhook')
     assert r.status_code == 503
     assert r.get_json()['status'] == 'STALE'
+
+
+def test_webhook_health_quiet_at_night_is_not_an_alarm(client, monkeypatch):
+    """The uptime alert must not page anyone at 2 AM for a quiet feed."""
+    monkeypatch.setattr(zt_observability, '_ist_hour', lambda: 2)
+    zt_observability.record_webhook('meeting.participant_joined')
+    with zt_observability._lock:
+        zt_observability._webhook['last_ts'] -= 3600
+    r = client.get('/health/webhook')
+    assert r.status_code == 200
+    assert r.get_json()['status'] == 'QUIET_HOURS'
 
 
 # ── /health/bigquery ──────────────────────────────────────────────────────
@@ -166,6 +178,76 @@ def test_health_summary_allows_frontend_browser_calls(client, monkeypatch):
     origin = 'https://attendance-frontend-4e5na4tdha-uc.a.run.app'
     r = client.get('/health/summary', headers={'Origin': origin})
     assert r.headers.get('Access-Control-Allow-Origin') == origin
+
+
+# ── /health/alert (watchdog ALARM digest email) ───────────────────────────
+
+class FakeAlarmBQ:
+    def __init__(self, alarms):
+        self.alarms = alarms
+
+    def query(self, sql, **kw):
+        assert "severity = 'ALARM'" in sql
+        return mock.MagicMock(result=lambda *a, **k: list(self.alarms))
+
+
+def test_health_alert_emails_digest_when_alarms(client, monkeypatch):
+    rows = [SimpleNamespace(check_id='05', check_name='Unresolved room names',
+                            metric='44', detail='Room-abc, Room-def',
+                            action='Run the Room Mapper panel')]
+    monkeypatch.setattr(app_module, 'get_bq_client', lambda: FakeAlarmBQ(rows))
+    sent = []
+    monkeypatch.setattr(app_module, 'send_email_alert',
+                        lambda subject, html: sent.append((subject, html)) or {'ok': True})
+    r = client.get('/health/alert')
+    body = r.get_json()
+    assert r.status_code == 200 and body['alarm_count'] == 1 and body['alert_sent'] is True
+    assert '1 health alarm' in sent[0][0]
+    assert 'Unresolved room names' in sent[0][1] and 'Run the Room Mapper panel' in sent[0][1]
+
+
+def test_health_alert_check_only_and_quiet_when_clean(client, monkeypatch):
+    monkeypatch.setattr(app_module, 'get_bq_client', lambda: FakeAlarmBQ([]))
+    sent = []
+    monkeypatch.setattr(app_module, 'send_email_alert', lambda *a: sent.append(a))
+    assert client.get('/health/alert').get_json()['alert_sent'] is False
+    rows = [SimpleNamespace(check_id='03', check_name='Webhook ingestion alive',
+                            metric='95', detail='', action='')]
+    monkeypatch.setattr(app_module, 'get_bq_client', lambda: FakeAlarmBQ(rows))
+    body = client.get('/health/alert?alert=false').get_json()
+    assert body['alarm_count'] == 1 and body['alert_sent'] is False
+    assert sent == []
+
+
+# ── /rooms/catalog: choices for the rename dropdowns ──────────────────────
+
+def test_rooms_catalog_merges_panel_list_and_bigquery(client, monkeypatch):
+    ms = app_module.meeting_state
+    ms.last_sync_payload = {'rooms': [{'room_name': '6.0 BREAK TIME'},
+                                      {'room_name': '1.1 Sales Wizard'},
+                                      {'room_name': 'Room-abc12345'}]}   # placeholder: excluded
+    ms.uuid_to_name['sdk:abc'] = '2.0 Vridam'
+    fake = mock.MagicMock()
+    fake.query.return_value.result.return_value = [
+        SimpleNamespace(room_name='1.1 Sales Wizard'),        # duplicate: merged
+        SimpleNamespace(room_name='3.3 Cloud Gunners')]
+    monkeypatch.setattr(app_module, 'get_bq_client', lambda: fake)
+    try:
+        body = client.get('/rooms/catalog').get_json()
+    finally:
+        del ms.last_sync_payload
+        ms.uuid_to_name.pop('sdk:abc', None)
+    assert body['names'] == ['1.1 Sales Wizard', '2.0 Vridam', '3.3 Cloud Gunners', '6.0 BREAK TIME']
+    assert body['from_panel'] == 4 and body['total'] == 4
+
+
+# ── point 9: webhook must fail CLOSED without a secret ────────────────────
+
+def test_webhook_rejected_when_secret_missing(client, monkeypatch):
+    monkeypatch.setattr(app_module, 'ZOOM_WEBHOOK_SECRET', '')
+    r = client.post('/webhook', data=json.dumps(load_fixture('participant_joined')),
+                    content_type='application/json')
+    assert r.status_code == 401
 
 
 def test_log_json_is_parseable(capsys):

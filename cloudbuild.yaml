@@ -1,4 +1,13 @@
 steps:
+  # Run the backend test suite FIRST (review point 12): a failing test
+  # stops the whole pipeline, so broken code never reaches Cloud Run.
+  - name: 'python:3.11-slim'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install --quiet -r requirements.txt pytest && python -m pytest tests/ -q
+
   # Build React Zoom SDK app
   - name: 'node:20'
     dir: 'breakout-calibrator'

@@ -26,6 +26,9 @@ __all__ = [
     'webhook_health',
     'bigquery_health',
     'data_quality_summary',
+    'watchdog_alarms',
+    'alarm_email_html',
+    'room_name_catalog',
     'DASHBOARD_HTML',
 ]
 
@@ -52,6 +55,13 @@ _webhook = {'last_ts': None, 'last_event': None, 'count_date': None, 'count': 0}
 
 # No webhook for 30 min during the workday = the pipe is broken.
 WEBHOOK_STALE_S = 1800
+# Outside these IST hours a quiet feed is normal (few people online), so
+# the uptime alert must not page anyone: report QUIET_HOURS, HTTP 200.
+WORK_HOURS_IST = (8, 21)
+
+
+def _ist_hour():
+    return (datetime.utcnow() + IST_OFFSET).hour
 
 
 def record_webhook(event):
@@ -70,10 +80,11 @@ def webhook_health():
         last_ts = _webhook['last_ts']
         snap = dict(_webhook)
     age = (time.time() - last_ts) if last_ts else None
+    in_work_hours = WORK_HOURS_IST[0] <= _ist_hour() < WORK_HOURS_IST[1]
     if age is None:
         status = 'NO_DATA'      # nothing since this instance started
     elif age > WEBHOOK_STALE_S:
-        status = 'STALE'
+        status = 'STALE' if in_work_hours else 'QUIET_HOURS'
     else:
         status = 'HEALTHY'
     return {
@@ -243,11 +254,71 @@ def data_quality_summary(get_client, project, dataset, events_table,
     return out
 
 
+# ── room-name catalog for the rename dropdowns ────────────────────────────
+# Room NAMES are stable day to day (only the uuids rotate), so every name
+# seen in the last 30 days of mappings / 7 days of hours is a valid choice.
+_catalog_cache = {'at': 0.0, 'names': None}
+CATALOG_TTL_S = 600
+
+
+def room_name_catalog(get_client, project, dataset, ttl_s=CATALOG_TTL_S):
+    now = time.time()
+    with _lock:
+        if _catalog_cache['names'] is not None and now - _catalog_cache['at'] < ttl_s:
+            return list(_catalog_cache['names'])
+    rows = get_client().query(f"""
+        SELECT DISTINCT room_name FROM (
+          SELECT room_name FROM `{project}.{dataset}.room_mappings`
+          WHERE mapping_date >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 30 DAY)
+          UNION ALL
+          SELECT room_name FROM `{project}.{dataset}.presence_intervals`
+          WHERE event_date >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 7 DAY)
+        )
+        WHERE room_name IS NOT NULL AND room_name != ''
+          AND room_name NOT LIKE 'Room-%' AND room_name != 'Unknown Room'
+        ORDER BY room_name""").result()
+    names = [r.room_name for r in rows]
+    with _lock:
+        _catalog_cache['at'] = now
+        _catalog_cache['names'] = list(names)
+    return names
+
+
+def watchdog_alarms(get_client, project, dataset):
+    """ALARM rows from the watchdog view, oldest check id first."""
+    rows = get_client().query(f"""
+        SELECT check_id, check_name, CAST(metric AS STRING) AS metric,
+               detail, action
+        FROM `{project}.{dataset}.v_health_latest`
+        WHERE severity = 'ALARM'
+        ORDER BY check_id""").result()
+    return [{'check_id': r.check_id, 'check_name': r.check_name,
+             'metric': r.metric, 'detail': (r.detail or '')[:300],
+             'action': (r.action or '')[:300]} for r in rows]
+
+
+def alarm_email_html(alarms, dashboard_url):
+    def esc(x):
+        return (str(x or '').replace('&', '&amp;').replace('<', '&lt;')
+                .replace('>', '&gt;'))
+    rows = ''.join(
+        f"<tr><td>{esc(a['check_id'])}</td><td>{esc(a['check_name'])}</td>"
+        f"<td>{esc(a['metric'])}</td><td>{esc(a['detail'])}</td>"
+        f"<td>{esc(a['action'])}</td></tr>" for a in alarms)
+    return (f"<p>{len(alarms)} attendance health check(s) are in ALARM "
+            f"({(datetime.utcnow() + IST_OFFSET).strftime('%Y-%m-%d %H:%M')} IST).</p>"
+            f"<table border='1' cellpadding='6' style='border-collapse:collapse'>"
+            f"<tr><th>ID</th><th>Check</th><th>Metric</th><th>Detail</th><th>What to do</th></tr>"
+            f"{rows}</table>"
+            f"<p><a href='{esc(dashboard_url)}'>Open System Health</a></p>")
+
+
 def reset_for_tests():
     with _lock:
         _webhook.update({'last_ts': None, 'last_event': None, 'count_date': None, 'count': 0})
         _bq_probe.update({'at': 0.0, 'result': None})
         _summary_cache.update({'at': 0.0, 'data': None})
+        _catalog_cache.update({'at': 0.0, 'names': None})
 
 
 # ── System Health page (served by Flask; independent of the React build) ──

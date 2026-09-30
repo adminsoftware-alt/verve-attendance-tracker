@@ -244,7 +244,7 @@ curl "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/mapping/last-sync
 | Hours engine back to Python | env `SQL_BUILDER_CUTOVER_DATE=9999-12-31` |
 | Mapping auto-resolution off | `SYNC_STATE_RESOLUTION_ENABLED = False` (app.py) |
 | Webhooks back to inline processing (no Pub/Sub) | env `WEBHOOK_PUBSUB_ENABLED=false` — see `docs/PUBSUB-ROLLOUT.md` |
-| Builder SQL back to room_uuid-only name matching | re-run `docs/09_break_guard_v14.sql` (v15 = `docs/10_build_presence_intervals_v15.sql`) |
+| Builder SQL back to the pre-v15.1 production text | re-run `docs/09b_deployed_production_2026-09-30.sql` (live = `docs/11_build_presence_intervals_v15_1.sql`; older versions in `docs/archive/`) |
 | Panel back to old bot polling | swap one import in `breakout-calibrator/src/App.js` (MonitorPanel intact) |
 
 ## Known Issues / Current State (2026-07-21)

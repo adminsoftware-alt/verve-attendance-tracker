@@ -25,9 +25,16 @@ export default function SystemHealth() {
       const res = await fetch(`${API}/health/summary`);
       const d = await res.json();
       setRooms(Array.isArray(d.unnamed_rooms) ? d.unnamed_rooms : []);
-      setNames(Array.isArray(d.room_names_today) ? d.room_names_today : []);
       setBizDate(d.business_date_ist || '');
       setLoadError(null);
+      // Dropdown choices: the full room catalog (panel list + BigQuery),
+      // falling back to today's names if the catalog call fails.
+      try {
+        const c = await (await fetch(`${API}/rooms/catalog`)).json();
+        setNames(Array.isArray(c.names) && c.names.length ? c.names : (d.room_names_today || []));
+      } catch {
+        setNames(Array.isArray(d.room_names_today) ? d.room_names_today : []);
+      }
     } catch (e) {
       setLoadError(`Could not load unnamed rooms: ${e.message}`);
     }
@@ -81,7 +88,7 @@ export default function SystemHealth() {
         <div style={s.boxTitle}>Name a room {bizDate ? `— ${bizDate}` : ''}</div>
         <p style={s.sub}>
           Rooms still without a name today. 3+ person rooms get named automatically on the next
-          Room Mapper run; name the small ones here. Type the room name (e.g. BREAK TIME) and Save —
+          Room Mapper run; name the small ones here. Pick the room from the list and Save —
           the whole day is rebuilt with the correct name.
         </p>
         {msg && (
@@ -115,13 +122,14 @@ export default function SystemHealth() {
                   </td>
                   <td style={s.td} title={r.room_uuid}>{r.who}</td>
                   <td style={s.td}>
-                    <input
-                      list="room-name-suggestions"
+                    <select
                       value={draft[r.room_uuid] || ''}
                       onChange={(e) => setDraft({ ...draft, [r.room_uuid]: e.target.value })}
-                      placeholder="e.g. BREAK TIME"
                       style={s.input}
-                    />
+                    >
+                      <option value="">Select the correct room…</option>
+                      {names.map((n) => <option key={n} value={n}>{n}</option>)}
+                    </select>
                   </td>
                   <td style={s.td}>
                     <button
@@ -137,9 +145,6 @@ export default function SystemHealth() {
             </tbody>
           </table>
         )}
-        <datalist id="room-name-suggestions">
-          {names.map((n) => <option key={n} value={n} />)}
-        </datalist>
       </div>
 
       <iframe title="System Health" src={HEALTH_URL} style={s.frame} />

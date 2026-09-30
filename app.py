@@ -274,6 +274,13 @@ from functools import wraps as _wraps
 
 AUTH_TOKEN_SECRET = (os.environ.get('AUTH_TOKEN_SECRET')
                      or ZOOM_WEBHOOK_SECRET or ZOOM_CLIENT_SECRET or '')
+if not os.environ.get('AUTH_TOKEN_SECRET'):
+    # Review point 9: login tokens should not be signed with the Zoom webhook
+    # secret (one secret, two jobs). The fallback is kept so nothing breaks
+    # today; set AUTH_TOKEN_SECRET on the service to separate them (see
+    # docs/SECURITY-2026-09-30.md) and this warning disappears.
+    print("[Auth] WARNING: AUTH_TOKEN_SECRET not set — login tokens are signed "
+          "with the Zoom secret as a fallback. Set a dedicated AUTH_TOKEN_SECRET.")
 AUTH_TOKEN_TTL_SECONDS = int(os.environ.get('AUTH_TOKEN_TTL_SECONDS', str(12 * 3600)))
 
 
@@ -3574,9 +3581,13 @@ def validate_webhook_signature(request_obj):
     Returns (valid, error_message) tuple.
     """
     if not ZOOM_WEBHOOK_SECRET:
-        # If no secret configured, skip validation (dev mode)
-        print("[Webhook] WARNING: ZOOM_WEBHOOK_SECRET not set, skipping signature validation")
-        return True, None
+        # FAIL CLOSED (review point 9). This used to return True — "dev
+        # mode" — which meant one missing env var on a deploy would let
+        # anyone who knew the URL inject fake attendance events. A missing
+        # secret now rejects every webhook and shouts in the logs instead.
+        print("[Webhook] ERROR: ZOOM_WEBHOOK_SECRET not set — rejecting webhook "
+              "(set the env var; signature validation is mandatory)")
+        return False, "Webhook secret not configured"
 
     signature = request_obj.headers.get('x-zm-signature', '')
     timestamp = request_obj.headers.get('x-zm-request-timestamp', '')
@@ -3821,6 +3832,61 @@ def health_summary():
 def health_dashboard():
     """Human-readable System Health page over /health/summary."""
     return Response(zt_observability.DASHBOARD_HTML, mimetype='text/html')
+
+
+@app.route('/rooms/catalog', methods=['GET'])
+def rooms_catalog():
+    """Every breakout room NAME we know, for the rename dropdowns:
+    the Room Mapper panel's last sync (all rooms, occupied or not) merged
+    with names from the last 30 days in BigQuery. Names only — nothing
+    personal — so it is open like the other read-only lookups."""
+    names = set()
+    with meeting_state._lock:
+        payload = getattr(meeting_state, 'last_sync_payload', None) or {}
+        for r in (payload.get('rooms') or []):
+            n = (r.get('room_name') or '').strip()
+            if n:
+                names.add(n)
+        for k, v in meeting_state.uuid_to_name.items():
+            if k.startswith('sdk:') and v and v.strip():
+                names.add(v.strip())
+    from_panel = len(names)
+    try:
+        names.update(zt_observability.room_name_catalog(get_bq_client, GCP_PROJECT_ID, BQ_DATASET))
+    except Exception as e:
+        print(f"[rooms/catalog] BigQuery names unavailable: {e}")
+    names = sorted((n for n in names
+                    if not n.startswith('Room-') and n != 'Unknown Room'), key=str.lower)
+    return jsonify({'success': True, 'names': names,
+                    'from_panel': from_panel, 'total': len(names)})
+
+
+@app.route('/health/alert', methods=['GET', 'POST'])
+def health_alert():
+    """Email a digest of the watchdog's ALARM rows (v_health_latest).
+
+    GET/POST /health/alert              -> check, email if any ALARM
+    GET/POST /health/alert?alert=false  -> check only, never email
+    Called by Cloud Scheduler a couple of times a day (see docs); mirrors
+    /mapping/health, which only covers mappings. Open like the other health
+    endpoints: it reveals aggregate check rows, nothing personal.
+    """
+    send = request.args.get('alert', 'true').lower() != 'false'
+    try:
+        alarms = zt_observability.watchdog_alarms(get_bq_client, GCP_PROJECT_ID, BQ_DATASET)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]}), 500
+    sent = False
+    if send and alarms:
+        html = zt_observability.alarm_email_html(
+            alarms, request.url_root.rstrip('/') + '/health/dashboard')
+        try:
+            sent = bool(send_email_alert(
+                f"[Attendance] {len(alarms)} health alarm(s) need attention", html))
+        except Exception as e:
+            print(f"[HealthAlert] email failed: {e}")
+    return jsonify({'success': True, 'alarm_count': len(alarms),
+                    'alarms': alarms, 'alert_sent': sent})
 
 
 # ==============================================================================

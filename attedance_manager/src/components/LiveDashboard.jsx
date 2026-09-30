@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { fetchLiveRooms, fetchHeatmap, createRoomOverride } from '../utils/zoomApi';
+import { fetchLiveRooms, fetchHeatmap, createRoomOverride, fetchRoomCatalog } from '../utils/zoomApi';
 import { getSession } from '../utils/storage';
 
 const HEAT_COLORS = [
@@ -31,6 +31,12 @@ export default function LiveDashboard() {
   // Admins can rename a room from its card (room_override for that day).
   const sessionUser = getSession();
   const canEdit = sessionUser?.role === 'admin' || sessionUser?.role === 'superadmin';
+  // The rename dropdown lists every known room name (no free text).
+  const [roomNames, setRoomNames] = useState([]);
+  useEffect(() => {
+    if (!canEdit) return;
+    fetchRoomCatalog().then(d => setRoomNames(d.names || [])).catch(() => {});
+  }, [canEdit]);
   const [date, setDate] = useState(istDate);
   const [tab, setTab] = useState('live');
   const [liveData, setLiveData] = useState(null);
@@ -257,7 +263,7 @@ export default function LiveDashboard() {
             {filteredRooms.map((room, i) => (
               <RoomCard key={room.room_name} room={room} idx={i} search={search}
                 expanded={expandedRoom === room.room_name} changed={changedRooms.has(room.room_name)}
-                canEdit={canEdit} date={date} onRenamed={() => loadLive(false)}
+                canEdit={canEdit} date={date} roomNames={roomNames} onRenamed={() => loadLive(false)}
                 onClick={() => setExpandedRoom(expandedRoom === room.room_name ? null : room.room_name)} />
             ))}
           </div>
@@ -354,7 +360,7 @@ function AnimNum({ label, value, color, icon }) {
   );
 }
 
-function RoomCard({ room, idx, search, expanded, changed, onClick, canEdit, date, onRenamed }) {
+function RoomCard({ room, idx, search, expanded, changed, onClick, canEdit, date, roomNames, onRenamed }) {
   const cnt = room.participant_count;
   const col = AVATARS[idx % AVATARS.length];
   const bar = Math.min(cnt / 10 * 100, 100);
@@ -403,14 +409,16 @@ function RoomCard({ room, idx, search, expanded, changed, onClick, canEdit, date
         <div style={{ flex: 1, minWidth: 0 }}>
           {editing ? (
             <div onClick={(e) => e.stopPropagation()} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-              <input
+              <select
                 autoFocus
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') saveName(e); if (e.key === 'Escape') setEditing(false); }}
-                placeholder="Correct room name"
-                style={{ flex: 1, minWidth: 0, fontSize: 12, padding: '3px 6px', border: '1px solid #cbd5e1', borderRadius: 4 }}
-              />
+                onKeyDown={(e) => { if (e.key === 'Escape') setEditing(false); }}
+                style={{ flex: 1, minWidth: 0, fontSize: 12, padding: '3px 6px', border: '1px solid #cbd5e1', borderRadius: 4, background: '#fff' }}
+              >
+                <option value="">{(roomNames || []).length ? 'Select the correct room…' : 'Room list not loaded yet'}</option>
+                {(roomNames || []).map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
               <button onClick={saveName} disabled={saving}
                 style={{ fontSize: 11, padding: '3px 8px', border: 'none', borderRadius: 4, background: '#2563eb', color: '#fff', cursor: 'pointer' }}>
                 {saving ? '…' : 'Save'}
