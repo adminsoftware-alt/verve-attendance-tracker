@@ -205,22 +205,31 @@ def data_quality_summary(get_client, project, dataset, events_table,
         # The rooms HR should look at: still unnamed today, who is in them,
         # for how long. Single-person rooms can never be auto-named (2-witness
         # rule) — these get named by hand on the My Day page.
+        # "live" = occupied as of the latest hours build (same 90-second rule
+        # as /attendance/live); now_in_room = the people in it right now, so
+        # HR can find one of them in Zoom's participant list and read the
+        # room's real name. Rooms everyone already left are still listed
+        # (collapsed in the UI) with everyone who was in them.
         rows = get_client().query(f"""
+            WITH latest AS (SELECT MAX(end_ts) AS m FROM {pi} WHERE event_date = '{today}')
             SELECT room_uuid, COUNT(DISTINCT participant_key) AS people,
                    ROUND(SUM(duration_seconds) / 60) AS minutes,
                    STRING_AGG(DISTINCT participant_name, ', ' LIMIT 4) AS sample,
                    FORMAT_TIMESTAMP('%H:%M', MAX(end_ts), 'Asia/Kolkata') AS last_seen,
-                   TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(end_ts), MINUTE) <= 10 AS live
-            FROM {pi}
+                   TIMESTAMP_DIFF(ANY_VALUE(latest.m), MAX(end_ts), SECOND) <= 90 AS live,
+                   STRING_AGG(DISTINCT IF(TIMESTAMP_DIFF(latest.m, end_ts, SECOND) <= 90,
+                                          participant_name, NULL), ', ' LIMIT 8) AS now_in_room
+            FROM {pi} CROSS JOIN latest
             WHERE event_date = '{today}'
               AND (room_name LIKE 'Room-%' OR room_name = 'Unknown Room')
               AND room_uuid IS NOT NULL AND room_uuid != ''
             GROUP BY room_uuid
             HAVING minutes >= 2            -- a 0-minute pass-through is noise
-            ORDER BY minutes DESC LIMIT 15""").result()
+            ORDER BY live DESC, minutes DESC LIMIT 20""").result()
         return [{'room_uuid': r.room_uuid, 'people': int(r.people),
                  'minutes': int(r.minutes or 0), 'who': r.sample,
-                 'last_seen': r.last_seen, 'live': bool(r.live)} for r in rows]
+                 'last_seen': r.last_seen, 'live': bool(r.live),
+                 'now_in_room': r.now_in_room or ''} for r in rows]
     guarded('unnamed_rooms', _unnamed_rooms)
 
     def _room_names():
@@ -387,10 +396,10 @@ async function load(){
   document.getElementById('tiles').innerHTML=t.join('');
   const ur=d.unnamed_rooms; const ue=document.getElementById('unnamed');
   if(Array.isArray(ur)&&ur.length){
-    ue.innerHTML='<table><tr><th>Room id</th><th>People</th><th>Minutes</th><th>Last seen</th><th>Who</th></tr>'+
+    ue.innerHTML='<table><tr><th>Room id</th><th>People</th><th>Minutes</th><th>Last seen</th><th>Who (live: in the room right now)</th></tr>'+
       ur.map(r=>'<tr><td title="'+esc(r.room_uuid)+'">'+esc(String(r.room_uuid).slice(0,10))+'…</td><td>'+esc(r.people)+
       '</td><td>'+esc(r.minutes)+'</td><td>'+esc(r.last_seen)+(r.live?' <span class="ok">live</span>':' <span class="s">left</span>')+
-      '</td><td>'+esc(r.who)+'</td></tr>').join('')+'</table>'+
+      '</td><td>'+esc(r.live&&r.now_in_room?r.now_in_room:r.who)+'</td></tr>').join('')+'</table>'+
       '<div style="margin-top:6px">Rooms with 3+ people get named automatically on the next Room Mapper run. '+
       'To name one by hand: use the "Name a room" box above this page in the attendance app (admin).</div>';
   } else if(Array.isArray(ur)){ ue.innerHTML='<span class="ok">All rooms named today.</span>';

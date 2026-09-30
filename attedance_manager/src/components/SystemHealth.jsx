@@ -19,6 +19,7 @@ export default function SystemHealth() {
   const [saving, setSaving] = useState(null);  // room_uuid being saved
   const [msg, setMsg] = useState(null);
   const [loadError, setLoadError] = useState(null);
+  const [showLeft, setShowLeft] = useState(false);   // rooms everyone already left
 
   const load = useCallback(async () => {
     try {
@@ -69,6 +70,58 @@ export default function SystemHealth() {
     }
   };
 
+  // One table for live rooms (who is inside NOW) and one for rooms people
+  // already left (everyone who was there today).
+  const renderRows = (list, live) => (
+    list.length === 0 ? (
+      live ? <div style={{ ...s.sub, color: '#166534' }}>No unnamed room is occupied right now.</div> : null
+    ) : (
+      <table style={s.table}>
+        <thead>
+          <tr>
+            <th style={s.th}>People</th>
+            <th style={s.th}>Minutes</th>
+            <th style={s.th}>{live ? 'Seen' : 'Last seen'}</th>
+            <th style={s.th}>{live ? 'In the room right now' : 'Who was there'}</th>
+            <th style={s.th}>Room name</th>
+            <th style={s.th}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {list.map((r) => (
+            <tr key={r.room_uuid}>
+              <td style={s.td}>{r.people}</td>
+              <td style={s.td}>{r.minutes}</td>
+              <td style={s.td}>
+                {r.last_seen} <span style={{ color: live ? '#166534' : '#64748b', fontWeight: live ? 700 : 400 }}>{live ? 'LIVE' : 'left'}</span>
+              </td>
+              <td style={s.td} title={r.room_uuid}>{live && r.now_in_room ? r.now_in_room : r.who}</td>
+              <td style={s.td}>
+                <select
+                  value={draft[r.room_uuid] || ''}
+                  onChange={(e) => setDraft({ ...draft, [r.room_uuid]: e.target.value })}
+                  style={s.input}
+                >
+                  <option value="">Select the correct room…</option>
+                  {names.map((n) => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </td>
+              <td style={s.td}>
+                <button
+                  onClick={() => save(r)}
+                  disabled={saving === r.room_uuid || !(draft[r.room_uuid] || '').trim()}
+                  style={s.btn}
+                >
+                  {saving === r.room_uuid ? 'Saving…' : 'Save'}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )
+  );
+
   return (
     <div style={s.wrap}>
       <div style={s.header}>
@@ -88,8 +141,9 @@ export default function SystemHealth() {
         <div style={s.boxTitle}>Name a room {bizDate ? `— ${bizDate}` : ''}</div>
         <p style={s.sub}>
           Rooms still without a name today. 3+ person rooms get named automatically on the next
-          Room Mapper run; name the small ones here. Pick the room from the list and Save —
-          the whole day is rebuilt with the correct name.
+          Room Mapper run; name the small ones here. <b>Live rooms show who is in them right now</b> —
+          find one of those people in Zoom's participant list, read their room name, pick it here and Save.
+          The whole day is rebuilt with the correct name.
         </p>
         {msg && (
           <div style={{ ...s.msg, color: msg.ok ? '#166534' : '#991b1b', background: msg.ok ? '#f0fdf4' : '#fef2f2' }}>
@@ -101,49 +155,17 @@ export default function SystemHealth() {
         ) : rooms.length === 0 ? (
           <div style={{ ...s.sub, color: '#166534' }}>All rooms are named today.</div>
         ) : (
-          <table style={s.table}>
-            <thead>
-              <tr>
-                <th style={s.th}>People</th>
-                <th style={s.th}>Minutes</th>
-                <th style={s.th}>Last seen</th>
-                <th style={s.th}>Who</th>
-                <th style={s.th}>Room name</th>
-                <th style={s.th}></th>
-              </tr>
-            </thead>
-            <tbody>
-              {rooms.map((r) => (
-                <tr key={r.room_uuid}>
-                  <td style={s.td}>{r.people}</td>
-                  <td style={s.td}>{r.minutes}</td>
-                  <td style={s.td}>
-                    {r.last_seen} <span style={{ color: r.live ? '#166534' : '#64748b' }}>{r.live ? 'live' : 'left'}</span>
-                  </td>
-                  <td style={s.td} title={r.room_uuid}>{r.who}</td>
-                  <td style={s.td}>
-                    <select
-                      value={draft[r.room_uuid] || ''}
-                      onChange={(e) => setDraft({ ...draft, [r.room_uuid]: e.target.value })}
-                      style={s.input}
-                    >
-                      <option value="">Select the correct room…</option>
-                      {names.map((n) => <option key={n} value={n}>{n}</option>)}
-                    </select>
-                  </td>
-                  <td style={s.td}>
-                    <button
-                      onClick={() => save(r)}
-                      disabled={saving === r.room_uuid || !(draft[r.room_uuid] || '').trim()}
-                      style={s.btn}
-                    >
-                      {saving === r.room_uuid ? 'Saving…' : 'Save'}
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <>
+            {renderRows(rooms.filter((r) => r.live), true)}
+            {rooms.some((r) => !r.live) && (
+              <div style={{ marginTop: 8 }}>
+                <button onClick={() => setShowLeft(!showLeft)} style={s.linkBtn}>
+                  {showLeft ? '▾' : '▸'} Rooms everyone already left today ({rooms.filter((r) => !r.live).length}) — cannot be checked in Zoom anymore; name only if you know them
+                </button>
+                {showLeft && renderRows(rooms.filter((r) => !r.live), false)}
+              </div>
+            )}
+          </>
         )}
       </div>
 
@@ -178,6 +200,10 @@ const s = {
   btn: {
     fontSize: 13, padding: '5px 12px', border: 'none', borderRadius: 6,
     background: '#2563eb', color: '#fff', cursor: 'pointer',
+  },
+  linkBtn: {
+    fontSize: 13, color: '#2563eb', background: 'transparent', border: 'none',
+    padding: 0, cursor: 'pointer', textAlign: 'left',
   },
   frame: {
     flex: 1, width: '100%', minHeight: 480,

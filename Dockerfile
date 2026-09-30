@@ -54,6 +54,9 @@ EXPOSE 8080
 #   positions disagreed and mapping corrections PING-PONGED (each worker
 #   "fixing" the other's correct value with its own stale view). One worker
 #   = one consistent memory for tracking, pending queues, and dedup.
-# --threads 8: IO-bound app; threads give the concurrency workers used to
+# --threads 16: IO-bound app; threads give the concurrency workers used to.
+#   Raised from 8 on 2026-09-30: with max-instances=1 the single instance
+#   must absorb Pub/Sub pushes + Live/Health polling + uptime checks in
+#   parallel. Pair with Cloud Run --concurrency=16 (a service setting).
 # --timeout 120: Allow slow webhook processing
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 120 app:app
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 16 --timeout 120 app:app

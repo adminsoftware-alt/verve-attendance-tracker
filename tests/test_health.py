@@ -37,7 +37,8 @@ class FakeSummaryBQ:
             rows = [SimpleNamespace(room_name='BREAK TIME'), SimpleNamespace(room_name='Sales Team')]
         elif 'STRING_AGG' in sql:   # the unnamed-rooms listing
             rows = [SimpleNamespace(room_uuid='ROOM-UUID-1', people=8, minutes=1608,
-                                    sample='Vishwa, Payal, Shivani', last_seen='14:03', live=True)]
+                                    sample='Vishwa, Payal, Shivani', last_seen='14:03', live=True,
+                                    now_in_room='Vishwa, Payal')]
         elif 'presence_intervals' in sql:
             rows = [SimpleNamespace(last_build='2026-09-29 10:00:00', unknown_room_pct=3.4)]
         elif 'HAVING COUNT(*) > 1' in sql:
@@ -118,7 +119,8 @@ def test_summary_reports_all_sections(client, monkeypatch):
     assert body['hours_builder']['last_updated'] == '2026-09-30 07:15:00'
     assert body['unnamed_rooms'] == [{'room_uuid': 'ROOM-UUID-1', 'people': 8,
                                       'minutes': 1608, 'who': 'Vishwa, Payal, Shivani',
-                                      'last_seen': '14:03', 'live': True}]
+                                      'last_seen': '14:03', 'live': True,
+                                      'now_in_room': 'Vishwa, Payal'}]
     assert body['room_names_today'] == ['BREAK TIME', 'Sales Team']
     assert body['generated_at'].endswith('IST')
     assert body['duplicates'] == {'duplicate_groups_today': 2, 'extra_rows_today': 3}
