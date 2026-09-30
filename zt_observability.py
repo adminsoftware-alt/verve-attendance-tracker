@@ -141,10 +141,24 @@ def data_quality_summary(get_client, project, dataset, events_table,
 
     def _events():
         r = _one(get_client(), f"""
-            SELECT COUNT(*) AS n, CAST(MAX(inserted_at) AS STRING) AS last_inserted_at
+            SELECT COUNT(*) AS n, CAST(MAX(inserted_at) AS STRING) AS last_inserted_at,
+                   COUNTIF(STARTS_WITH(event_id, 'e1-')) AS new_ids
             FROM {ev} WHERE event_date = '{today}'""")
-        return {'events_today': int(r.n), 'last_inserted_at': r.last_inserted_at}
+        n, new_ids = int(r.n), int(r.new_ids)
+        return {'events_today': n, 'last_inserted_at': r.last_inserted_at,
+                'deterministic_id_pct': round(100.0 * new_ids / n, 1) if n else 0.0}
     guarded('webhook_events', _events)
+
+    def _builder():
+        # Shows WHICH hours engine is live (v15.1 install date) — makes the
+        # otherwise invisible SQL upgrade checkable from the dashboard.
+        r = _one(get_client(), f"""
+            SELECT CAST(last_altered AS STRING) AS last_altered
+            FROM `{project}.{dataset}.INFORMATION_SCHEMA.ROUTINES`
+            WHERE routine_name = 'sp_build_presence_intervals'""")
+        return {'procedure': 'sp_build_presence_intervals',
+                'last_updated': r.last_altered}
+    guarded('hours_builder', _builder)
 
     def _dupes():
         # Same person + type + timestamp arriving more than once = the
@@ -257,6 +271,10 @@ async function load(){
   const ps=d.pubsub||{};
   t.push(tile('Pub/Sub', ps.active?'ACTIVE':'inline', ps.active?'ok':'',
     ps.active?('published '+esc(ps.published)+' · processed '+esc(ps.push_processed)):'events processed in webhook request'));
+  const hb=d.hours_builder||{};
+  t.push(tile('Pipeline', esc(num(we.deterministic_id_pct))+'% new IDs',
+    (we.deterministic_id_pct>=99?'ok':''),
+    'dedup-safe event ids today · hours builder updated: '+esc((hb.last_updated||'—').slice(0,16))));
   document.getElementById('tiles').innerHTML=t.join('');
   const hc=d.health_checks;
   const el=document.getElementById('checks');

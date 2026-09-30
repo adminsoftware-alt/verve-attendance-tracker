@@ -31,13 +31,16 @@ class FakeSummaryBQ:
                                     severity='OK', metric='512', detail='events flowing')]
         elif 'mapping_disputes' in sql:
             rows = [SimpleNamespace(n=1)]
+        elif 'INFORMATION_SCHEMA.ROUTINES' in sql:
+            rows = [SimpleNamespace(last_altered='2026-09-30 07:15:00')]
         elif 'presence_intervals' in sql:
             rows = [SimpleNamespace(last_build='2026-09-29 10:00:00', unknown_room_pct=3.4)]
         elif 'HAVING COUNT(*) > 1' in sql:
             assert ' AS groups' not in sql, 'reserved BigQuery keyword as alias'
             rows = [SimpleNamespace(dup_groups=2, extra_rows=3)]
         else:  # events count
-            rows = [SimpleNamespace(n=8421, last_inserted_at='2026-09-29 10:29:48')]
+            rows = [SimpleNamespace(n=8421, last_inserted_at='2026-09-29 10:29:48',
+                                    new_ids=8421)]
         return mock.MagicMock(result=lambda *a, **k: rows)
 
 
@@ -94,6 +97,8 @@ def test_summary_reports_all_sections(client, monkeypatch):
     monkeypatch.setattr(app_module, 'get_bq_client', lambda: FakeSummaryBQ())
     body = client.get('/health/summary').get_json()
     assert body['webhook_events']['events_today'] == 8421
+    assert body['webhook_events']['deterministic_id_pct'] == 100.0
+    assert body['hours_builder']['last_updated'] == '2026-09-30 07:15:00'
     assert body['duplicates'] == {'duplicate_groups_today': 2, 'extra_rows_today': 3}
     assert body['presence_intervals']['unknown_room_time_pct_today'] == 3.4
     assert body['disputed_rooms_today'] == 1
