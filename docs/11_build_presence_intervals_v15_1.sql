@@ -1,0 +1,453 @@
+-- ============================================================================
+-- v15.1 — MEETING-SCOPED ROOM NAMES + EVENT DEDUP, built on the DEPLOYED text
+-- INSTALLED IN PRODUCTION 2026-09-30. Verified: rebuilding 2026-09-29 with
+-- this procedure produced IDENTICAL per-person totals to the prior deployed
+-- procedure (0 differing groups, totals 3,814,590s = 3,814,590s).
+--
+-- WHY v15.1 REPLACES docs/10 (v15): the procedure actually deployed in
+-- BigQuery was NOT the docs/09 v14 file — production had been hot-patched
+-- (event-name evidence tiers re-added, event room_name fallback restored,
+-- break-room demotion guard removed). v15 was built from the stale doc file
+-- and silently reverted those patches (caught in verification: 24 break/
+-- breakout category swaps). v15.1 = the REAL deployed text + 3 additive
+-- edits only:
+--   1. raw_events: QUALIFY one row per event_id  (review point 3)
+--   2. resolved_names_scoped + override_names CTEs (review point 6)
+--   3. events_with_rooms: override > same-instance > global chain > stamped
+-- ROLLBACK: run docs/09b_deployed_production_2026-09-30.sql (the exact
+-- pre-v15.1 production text).
+-- LESSON (review point 7): keep ONE live SQL file under version control —
+-- repo and production had silently drifted.
+-- ============================================================================
+CREATE OR REPLACE PROCEDURE `verve-attendance-tracker`.breakout_room_calibrator.sp_build_presence_intervals(target_date DATE)
+BEGIN
+
+  -- The attendance day starts at 05:00 IST, not midnight, because shifts here
+  -- routinely run past midnight. 330 = IST offset in minutes.
+  DECLARE day_boundary_hour INT64 DEFAULT 5;   -- documentation; literals below are authoritative
+
+  DECLARE day_start_utc  TIMESTAMP DEFAULT TIMESTAMP_ADD(
+                           TIMESTAMP_SUB(TIMESTAMP(target_date), INTERVAL 330 MINUTE),
+                           INTERVAL 5 HOUR);                                   -- 05:00 IST on D
+  DECLARE day_end_utc    TIMESTAMP DEFAULT TIMESTAMP_ADD(
+                           TIMESTAMP_SUB(TIMESTAMP(target_date), INTERVAL 330 MINUTE),
+                           INTERVAL 29 HOUR);                                  -- 05:00 IST on D+1
+  DECLARE tail_end_utc   TIMESTAMP DEFAULT TIMESTAMP_ADD(
+                           TIMESTAMP_SUB(TIMESTAMP(target_date), INTERVAL 330 MINUTE),
+                           INTERVAL 35 HOUR);                                  -- 11:00 IST on D+1
+
+  -- tunables
+  DECLARE reconnect_window_ms  INT64 DEFAULT 30000;  -- breakout->pair and join<->left window
+  DECLARE pair_tightness_ms    INT64 DEFAULT  5000;  -- max gap WITHIN the left/join pair
+  DECLARE min_segment_seconds  INT64 DEFAULT     5;  -- drop webhook slivers
+  DECLARE no_leave_cap_minutes   INT64 DEFAULT   10;  -- PAST days: leave webhook lost
+  DECLARE live_open_cap_minutes  INT64 DEFAULT  840;  -- TODAY: 14h ceiling only
+
+  DECLARE is_current_day        BOOL;
+  DECLARE horizon               TIMESTAMP;
+  DECLARE effective_cap_minutes INT64;
+
+  SET is_current_day = (target_date =
+        DATE(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 HOUR), 'Asia/Kolkata'));
+
+  SET horizon = IF(is_current_day, CURRENT_TIMESTAMP(), tail_end_utc);
+
+  SET effective_cap_minutes = IF(is_current_day,
+                                 live_open_cap_minutes,
+                                 no_leave_cap_minutes);
+
+  CREATE TABLE IF NOT EXISTS
+  `verve-attendance-tracker.breakout_room_calibrator.presence_intervals` (
+    interval_id       STRING NOT NULL,
+    event_date        DATE   NOT NULL,
+    meeting_id        STRING,
+    meeting_uuid      STRING,
+    participant_key   STRING NOT NULL,
+    participant_name  STRING,
+    participant_email STRING,
+    room_uuid         STRING,
+    room_name         STRING,
+    room_category     STRING,
+    start_ts          TIMESTAMP NOT NULL,
+    end_ts            TIMESTAMP NOT NULL,
+    duration_seconds  INT64,
+    alone_seconds     INT64,
+    snapshot_count    INT64,
+    source            STRING,
+    confidence        FLOAT64,
+    built_at          TIMESTAMP
+  )
+  PARTITION BY event_date
+  CLUSTER BY meeting_id, participant_key;
+
+  -- Atomic swap. Two overlapping builds otherwise interleave their
+  -- DELETE/INSERT and duplicate every interval.
+  BEGIN TRANSACTION;
+
+  DELETE FROM `verve-attendance-tracker.breakout_room_calibrator.presence_intervals`
+  WHERE event_date = target_date;
+
+  INSERT INTO `verve-attendance-tracker.breakout_room_calibrator.presence_intervals`
+    (interval_id, event_date, meeting_id, meeting_uuid, participant_key,
+     participant_name, participant_email, room_uuid, room_name, room_category,
+     start_ts, end_ts, duration_seconds, alone_seconds, snapshot_count,
+     source, confidence, built_at)
+
+  WITH
+  -- ── 1. raw events: target day +/- 1 partition so midnight crossings survive ──
+  raw_events AS (
+    SELECT
+      pe.event_id,
+      pe.event_type,
+      pe.event_timestamp,
+      CAST(pe.meeting_id AS STRING) AS meeting_id,
+      pe.meeting_uuid,
+      pe.participant_name AS name_original,
+      LOWER(TRIM(REGEXP_REPLACE(pe.participant_name, r'[-_]\d+$', ''))) AS name_normalized,
+      LOWER(TRIM(pe.participant_email)) AS participant_email,
+      pe.room_uuid,
+      pe.room_name
+    FROM `verve-attendance-tracker.breakout_room_calibrator.participant_events_p` pe
+    WHERE pe.event_date BETWEEN DATE_SUB(target_date, INTERVAL 1 DAY)
+                            AND DATE_ADD(target_date, INTERVAL 1 DAY)
+      AND pe.participant_name IS NOT NULL
+      AND TRIM(pe.participant_name) != ''
+      AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+      AND pe.event_type IN (
+        'participant_joined','meeting.participant_joined',
+        'participant_left','meeting.participant_left',
+        'breakout_room_joined','breakout_room_left')
+    -- v15.1 (review point 3): deterministic event_ids (e1-...) make every
+    -- copy of a repeated webhook identical — keep exactly one row per
+    -- event_id. Legacy uuid4 ids are unique anyway, so history is untouched.
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY pe.event_id ORDER BY pe.inserted_at) = 1
+  ),
+
+  -- ── 2. room_uuid -> room_name. Five evidence sources, lowest pri wins. ──
+  --     v13 adds the human-override tier at the top.
+  name_evidence AS (
+    -- (0) OVERRIDE for this room on THIS date — a human said so; it wins
+    SELECT room_uuid, room_name, 0 AS pri, 1000000 AS support, set_at AS seen
+    FROM `verve-attendance-tracker.breakout_room_calibrator.room_overrides`
+    WHERE COALESCE(active, TRUE)
+      AND mapping_date = target_date
+      AND room_uuid IS NOT NULL AND room_uuid != ''
+      AND room_name IS NOT NULL AND room_name != ''
+
+    UNION ALL
+    -- (1) room_mappings saved for THIS date: the deliberate machine record
+    SELECT room_uuid, room_name, 1, COUNT(*), MAX(mapped_at)
+    FROM `verve-attendance-tracker.breakout_room_calibrator.room_mappings`
+    WHERE mapping_date = target_date
+      AND room_uuid IS NOT NULL AND room_uuid != ''
+      AND room_name IS NOT NULL AND room_name != ''
+      AND room_name NOT LIKE 'Room-%'
+    GROUP BY room_uuid, room_name
+
+    UNION ALL
+    -- (2) names seen in TODAY's event stream — MAJORITY wins.
+    --     Zoom never sends a room name; the server guesses it when the
+    --     webhook arrives and freezes the guess. Never let one event decide.
+    SELECT room_uuid, room_name, 2, COUNT(*), MAX(event_timestamp)
+    FROM raw_events
+    WHERE room_uuid IS NOT NULL AND room_uuid != ''
+      AND room_name IS NOT NULL AND room_name != ''
+      AND room_name NOT LIKE 'Room-%' AND room_name != 'Unknown Room'
+      AND event_type IN ('breakout_room_joined','breakout_room_left')
+      AND event_timestamp >= day_start_utc AND event_timestamp < tail_end_utc
+    GROUP BY room_uuid, room_name
+
+    UNION ALL
+    -- (3) room_mappings from ANY date. Rescues a day the Room Mapper missed.
+    SELECT room_uuid, room_name, 3, COUNT(*), MAX(mapped_at)
+    FROM `verve-attendance-tracker.breakout_room_calibrator.room_mappings`
+    WHERE room_uuid IS NOT NULL AND room_uuid != ''
+      AND room_name IS NOT NULL AND room_name != ''
+      AND room_name NOT LIKE 'Room-%'
+    GROUP BY room_uuid, room_name
+
+    UNION ALL
+    -- (4) names seen in the event stream on any recent day
+    SELECT room_uuid, room_name, 4, COUNT(*), MAX(event_timestamp)
+    FROM `verve-attendance-tracker.breakout_room_calibrator.participant_events_p`
+    WHERE event_date BETWEEN DATE_SUB(target_date, INTERVAL 60 DAY)
+                         AND DATE_ADD(target_date, INTERVAL 1 DAY)
+      AND room_uuid IS NOT NULL AND room_uuid != ''
+      AND room_name IS NOT NULL AND room_name != ''
+      AND room_name NOT LIKE 'Room-%' AND room_name != 'Unknown Room'
+      AND event_type IN ('breakout_room_joined','breakout_room_left')
+    GROUP BY room_uuid, room_name
+  ),
+
+  resolved_names AS (
+    SELECT
+      room_uuid,
+      ARRAY_AGG(room_name ORDER BY pri ASC, support DESC, seen DESC LIMIT 1)[OFFSET(0)]
+        AS mapped_room_name
+    FROM name_evidence
+    GROUP BY room_uuid
+  ),
+
+  -- ── 2a-v15.1. names scoped to ONE meeting instance (review point 6) ────
+  -- A mapping saved while THIS meeting_uuid was live can never carry a name
+  -- across a meeting restart, so it outranks the global evidence chain.
+  -- Everything the global chain resolves today stays as the fallback, so
+  -- nothing that named correctly before turns into "Unknown Room".
+  resolved_names_scoped AS (
+    SELECT
+      room_uuid,
+      meeting_uuid,
+      ARRAY_AGG(room_name ORDER BY support DESC, seen DESC LIMIT 1)[OFFSET(0)]
+        AS mapped_room_name
+    FROM (
+      SELECT room_uuid, meeting_uuid, room_name,
+             COUNT(*) AS support, MAX(mapped_at) AS seen
+      FROM `verve-attendance-tracker.breakout_room_calibrator.room_mappings`
+      WHERE meeting_uuid IS NOT NULL AND meeting_uuid != ''
+        AND room_uuid IS NOT NULL AND room_uuid != ''
+        AND room_name IS NOT NULL AND room_name != ''
+        AND room_name NOT LIKE 'Room-%'
+      GROUP BY room_uuid, meeting_uuid, room_name
+    )
+    GROUP BY room_uuid, meeting_uuid
+  ),
+
+  -- Human override for this date, split out so it also outranks the scoped
+  -- tier (inside name_evidence it already outranks the global tiers).
+  override_names AS (
+    SELECT
+      room_uuid,
+      ARRAY_AGG(room_name ORDER BY set_at DESC LIMIT 1)[OFFSET(0)] AS room_name
+    FROM `verve-attendance-tracker.breakout_room_calibrator.room_overrides`
+    WHERE COALESCE(active, TRUE)
+      AND mapping_date = target_date
+      AND room_uuid IS NOT NULL AND room_uuid != ''
+      AND room_name IS NOT NULL AND room_name != ''
+    GROUP BY room_uuid
+  ),
+
+  -- ── 2b. explicit CATEGORY overrides for this date ──────────────────────
+  -- Same match as the name: room_uuid + mapping_date. If the same room was
+  -- corrected twice on one day, the most recent correction stands.
+  category_overrides AS (
+    SELECT
+      room_uuid,
+      ARRAY_AGG(LOWER(TRIM(room_category)) ORDER BY set_at DESC LIMIT 1)[OFFSET(0)]
+        AS forced_category
+    FROM `verve-attendance-tracker.breakout_room_calibrator.room_overrides`
+    WHERE COALESCE(active, TRUE)
+      AND mapping_date = target_date
+      AND room_uuid IS NOT NULL AND room_uuid != ''
+      AND room_category IS NOT NULL AND TRIM(room_category) != ''
+    GROUP BY room_uuid
+  ),
+
+  -- ── 2c. a room's name belongs to the ROOM, not to one webhook ──────────
+  -- v11 let each event's own stamped name win, which is how a single
+  -- mislabelled webhook renamed a three-hour stay. The name is decided once
+  -- per room_uuid and applied to every event for that room.
+  events_with_rooms AS (
+    SELECT
+      e.*,
+      -- v15.1 (point 6): human override > SAME-INSTANCE mapping > the
+      -- production evidence chain > the event's own stamped name.
+      COALESCE(ov.room_name, ms.mapped_room_name, m.mapped_room_name,
+               NULLIF(e.room_name, ''), 'Unknown Room')
+        AS resolved_room_name
+    FROM raw_events e
+    LEFT JOIN override_names ov ON e.room_uuid = ov.room_uuid
+    LEFT JOIN resolved_names_scoped ms
+           ON e.room_uuid = ms.room_uuid AND e.meeting_uuid = ms.meeting_uuid
+    LEFT JOIN resolved_names m ON e.room_uuid = m.room_uuid
+  ),
+
+  -- ── 3. identity: email when a cleaned name maps to exactly one email ──
+  unique_email_per_name AS (
+    SELECT name_normalized, ANY_VALUE(participant_email) AS mapped_email
+    FROM events_with_rooms
+    WHERE participant_email IS NOT NULL AND participant_email != ''
+    GROUP BY name_normalized
+    HAVING COUNT(DISTINCT participant_email) = 1
+  ),
+
+  events_with_key AS (
+    SELECT e.*, COALESCE(u.mapped_email, e.name_normalized) AS participant_key
+    FROM events_with_rooms e
+    LEFT JOIN unique_email_per_name u ON e.name_normalized = u.name_normalized
+  ),
+
+  -- ── 4. classify + flag reconnect artifacts ──
+  events_flagged AS (
+    SELECT
+      e.*,
+      CASE
+        WHEN e.event_type IN ('participant_joined','meeting.participant_joined') THEN '0.Main Room'
+        WHEN e.event_type = 'breakout_room_joined' THEN COALESCE(e.resolved_room_name, 'Unknown Room')
+        WHEN e.event_type = 'breakout_room_left'   THEN '0.Main Room'
+        ELSE NULL
+      END AS current_room,
+
+      -- The room UUID this interval is actually IN. Only a breakout JOIN puts
+      -- someone in a room: a breakout LEAVE carries the UUID of the room being
+      -- left while starting a Main Room stay, so copying it here would tag
+      -- main-room rows with a breakout room's ID.
+      CASE
+        WHEN e.event_type = 'breakout_room_joined' THEN NULLIF(e.room_uuid, '')
+        ELSE NULL
+      END AS current_room_uuid,
+
+      CASE
+        WHEN e.event_type IN ('participant_left','meeting.participant_left',
+                              'participant_joined','meeting.participant_joined')
+             AND EXISTS (
+               SELECT 1 FROM events_with_key b
+               WHERE b.participant_key = e.participant_key
+                 AND b.meeting_id      = e.meeting_id
+                 AND b.event_type      = 'breakout_room_joined'
+                 AND TIMESTAMP_DIFF(e.event_timestamp, b.event_timestamp, MILLISECOND)
+                     BETWEEN 0 AND reconnect_window_ms
+             )
+             AND EXISTS (
+               SELECT 1
+               FROM events_with_key l
+               JOIN events_with_key j
+                 ON  j.participant_key = l.participant_key
+                 AND j.meeting_id      = l.meeting_id
+               WHERE l.participant_key = e.participant_key
+                 AND l.meeting_id      = e.meeting_id
+                 AND l.event_type IN ('participant_left','meeting.participant_left')
+                 AND j.event_type IN ('participant_joined','meeting.participant_joined')
+                 AND ABS(TIMESTAMP_DIFF(j.event_timestamp, l.event_timestamp, MILLISECOND))
+                     <= pair_tightness_ms
+                 AND ABS(TIMESTAMP_DIFF(l.event_timestamp, e.event_timestamp, MILLISECOND))
+                     <= reconnect_window_ms
+                 AND ABS(TIMESTAMP_DIFF(j.event_timestamp, e.event_timestamp, MILLISECOND))
+                     <= reconnect_window_ms
+             )
+        THEN TRUE
+        ELSE FALSE
+      END AS is_reconnect_artifact,
+
+      CASE
+        WHEN e.event_type = 'breakout_room_left'
+             AND EXISTS (
+               SELECT 1 FROM events_with_key l
+               WHERE l.participant_key = e.participant_key
+                 AND l.meeting_id      = e.meeting_id
+                 AND l.event_type IN ('participant_left','meeting.participant_left')
+                 AND ABS(TIMESTAMP_DIFF(l.event_timestamp, e.event_timestamp, MILLISECOND))
+                     <= reconnect_window_ms
+             )
+        THEN TRUE
+        ELSE FALSE
+      END AS is_exit_teardown,
+
+      CASE e.event_type
+        WHEN 'breakout_room_left'         THEN 1
+        WHEN 'breakout_room_joined'       THEN 2
+        WHEN 'participant_joined'         THEN 3
+        WHEN 'meeting.participant_joined' THEN 3
+        ELSE 4
+      END AS ord_class
+    FROM events_with_key e
+  ),
+
+  -- ── 5. deterministic ordering + look-ahead ──
+  events_ordered AS (
+    SELECT
+      e.*,
+      LEAD(e.event_timestamp) OVER (
+        PARTITION BY e.participant_key, e.meeting_id
+        ORDER BY e.event_timestamp, e.ord_class, e.event_id
+      ) AS next_event_ts,
+      LEAD(e.event_type) OVER (
+        PARTITION BY e.participant_key, e.meeting_id
+        ORDER BY e.event_timestamp, e.ord_class, e.event_id
+      ) AS next_event_type,
+      MAX(IF(e.event_type IN ('participant_joined','meeting.participant_joined'),
+             e.event_timestamp, NULL)) OVER (
+        PARTITION BY e.participant_key, e.meeting_id
+        ORDER BY e.event_timestamp, e.ord_class, e.event_id
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) AS session_start_ts
+    FROM events_flagged e
+    WHERE NOT e.is_reconnect_artifact
+      AND e.event_timestamp >= day_start_utc
+      AND e.event_timestamp <  tail_end_utc
+  ),
+
+  -- ── 6. one interval per room-setting event ──
+  intervals_raw AS (
+    SELECT
+      e.participant_key,
+      e.name_original AS participant_name,
+      e.participant_email,
+      e.meeting_id,
+      e.meeting_uuid,
+      e.current_room_uuid AS room_uuid,
+      e.current_room AS room_name,
+      e.event_timestamp AS start_ts,
+      CASE
+        WHEN e.next_event_ts IS NOT NULL
+             AND e.next_event_type NOT IN ('participant_joined','meeting.participant_joined')
+        THEN e.next_event_ts
+        WHEN e.next_event_ts IS NOT NULL
+        THEN e.event_timestamp
+        ELSE LEAST(
+               GREATEST(horizon, e.event_timestamp),
+               TIMESTAMP_ADD(e.event_timestamp, INTERVAL effective_cap_minutes MINUTE))
+      END AS end_ts,
+      (e.next_event_ts IS NULL) AS used_open_end,
+      e.session_start_ts
+    FROM events_ordered e
+    WHERE e.current_room IS NOT NULL
+      AND NOT (e.next_event_ts IS NULL AND e.is_exit_teardown)
+  ),
+
+  -- ── 7. login-date rule: a session belongs to the IST day it started ──
+  intervals_on_date AS (
+    SELECT
+      ir.*,
+      TIMESTAMP_DIFF(ir.end_ts, ir.start_ts, SECOND) AS duration_seconds,
+      -- An explicit category override wins; otherwise the name decides.
+      COALESCE(
+        co.forced_category,
+        CASE
+          WHEN LOWER(ir.room_name) LIKE '%break time%' THEN 'break'
+          WHEN LOWER(ir.room_name) LIKE '%main%' OR ir.room_name = '0.Main Room' THEN 'main'
+          ELSE 'breakout'
+        END
+      ) AS room_category
+    FROM intervals_raw ir
+    LEFT JOIN category_overrides co ON co.room_uuid = ir.room_uuid
+    WHERE ir.session_start_ts IS NOT NULL
+      AND ir.session_start_ts >= day_start_utc
+      AND ir.session_start_ts <  day_end_utc
+      AND ir.end_ts > ir.start_ts
+  )
+
+  SELECT
+    GENERATE_UUID()   AS interval_id,
+    target_date       AS event_date,
+    meeting_id,
+    meeting_uuid,
+    participant_key,
+    participant_name,
+    NULLIF(participant_email, '') AS participant_email,
+    room_uuid,
+    room_name,
+    room_category,
+    start_ts,
+    end_ts,
+    duration_seconds,
+    0 AS alone_seconds,
+    0 AS snapshot_count,
+    IF(room_category = 'main', 'webhook_fill', 'webhook_room') AS source,
+    IF(used_open_end, 0.35, 0.5) AS confidence,
+    CURRENT_TIMESTAMP() AS built_at
+  FROM intervals_on_date
+  WHERE duration_seconds >= min_segment_seconds;
+
+  COMMIT TRANSACTION;
+
+END;
