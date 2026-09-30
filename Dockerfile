@@ -33,6 +33,9 @@ COPY zt_config.py .
 COPY zt_helpers.py .
 COPY zt_zoom_api.py .
 COPY zt_intervals.py .
+COPY zt_pubsub.py .
+COPY zt_mapping.py .
+COPY zt_observability.py .
 COPY report_generator.py .
 COPY chatbot.py .
 
