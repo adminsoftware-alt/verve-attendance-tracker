@@ -131,7 +131,10 @@ def data_quality_summary(get_client, project, dataset, events_table,
     today = _ist_today()
     ev = f"`{project}.{dataset}.{events_table}`"
     pi = f"`{project}.{dataset}.presence_intervals`"
-    out = {'business_date_ist': today, 'generated_at': datetime.utcnow().isoformat() + 'Z'}
+    # Every timestamp on this page is shown in IST — the only clock the
+    # people reading it use.
+    out = {'business_date_ist': today,
+           'generated_at': (datetime.utcnow() + IST_OFFSET).strftime('%Y-%m-%d %H:%M IST')}
 
     def guarded(key, fn):
         try:
@@ -141,7 +144,8 @@ def data_quality_summary(get_client, project, dataset, events_table,
 
     def _events():
         r = _one(get_client(), f"""
-            SELECT COUNT(*) AS n, CAST(MAX(inserted_at) AS STRING) AS last_inserted_at,
+            SELECT COUNT(*) AS n,
+                   FORMAT_TIMESTAMP('%H:%M:%S IST', MAX(inserted_at), 'Asia/Kolkata') AS last_inserted_at,
                    COUNTIF(STARTS_WITH(event_id, 'e1-')) AS new_ids
             FROM {ev} WHERE event_date = '{today}'""")
         n, new_ids = int(r.n), int(r.new_ids)
@@ -153,7 +157,7 @@ def data_quality_summary(get_client, project, dataset, events_table,
         # Shows WHICH hours engine is live (v15.1 install date) — makes the
         # otherwise invisible SQL upgrade checkable from the dashboard.
         r = _one(get_client(), f"""
-            SELECT CAST(last_altered AS STRING) AS last_altered
+            SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M IST', last_altered, 'Asia/Kolkata') AS last_altered
             FROM `{project}.{dataset}.INFORMATION_SCHEMA.ROUTINES`
             WHERE routine_name = 'sp_build_presence_intervals'""")
         return {'procedure': 'sp_build_presence_intervals',
@@ -177,7 +181,7 @@ def data_quality_summary(get_client, project, dataset, events_table,
 
     def _presence():
         r = _one(get_client(), f"""
-            SELECT CAST(MAX(built_at) AS STRING) AS last_build,
+            SELECT FORMAT_TIMESTAMP('%H:%M:%S IST', MAX(built_at), 'Asia/Kolkata') AS last_build,
                    ROUND(100 * SAFE_DIVIDE(
                      SUM(IF(room_name = 'Unknown Room' OR room_name LIKE 'Room-%', duration_seconds, 0)),
                      SUM(duration_seconds)), 1) AS unknown_room_pct
@@ -193,15 +197,30 @@ def data_quality_summary(get_client, project, dataset, events_table,
         rows = get_client().query(f"""
             SELECT room_uuid, COUNT(DISTINCT participant_key) AS people,
                    ROUND(SUM(duration_seconds) / 60) AS minutes,
-                   STRING_AGG(DISTINCT participant_name, ', ' LIMIT 4) AS sample
+                   STRING_AGG(DISTINCT participant_name, ', ' LIMIT 4) AS sample,
+                   FORMAT_TIMESTAMP('%H:%M', MAX(end_ts), 'Asia/Kolkata') AS last_seen,
+                   TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(end_ts), MINUTE) <= 10 AS live
             FROM {pi}
             WHERE event_date = '{today}'
               AND (room_name LIKE 'Room-%' OR room_name = 'Unknown Room')
               AND room_uuid IS NOT NULL AND room_uuid != ''
-            GROUP BY room_uuid ORDER BY minutes DESC LIMIT 15""").result()
+            GROUP BY room_uuid
+            HAVING minutes >= 2            -- a 0-minute pass-through is noise
+            ORDER BY minutes DESC LIMIT 15""").result()
         return [{'room_uuid': r.room_uuid, 'people': int(r.people),
-                 'minutes': int(r.minutes or 0), 'who': r.sample} for r in rows]
+                 'minutes': int(r.minutes or 0), 'who': r.sample,
+                 'last_seen': r.last_seen, 'live': bool(r.live)} for r in rows]
     guarded('unnamed_rooms', _unnamed_rooms)
+
+    def _room_names():
+        # Suggestions for the rename box: names already in use today.
+        rows = get_client().query(f"""
+            SELECT DISTINCT room_name FROM {pi}
+            WHERE event_date = '{today}'
+              AND room_name NOT LIKE 'Room-%' AND room_name != 'Unknown Room'
+            ORDER BY room_name LIMIT 100""").result()
+        return [r.room_name for r in rows]
+    guarded('room_names_today', _room_names)
 
     def _checks():
         rows = get_client().query(f"""
@@ -297,11 +316,12 @@ async function load(){
   document.getElementById('tiles').innerHTML=t.join('');
   const ur=d.unnamed_rooms; const ue=document.getElementById('unnamed');
   if(Array.isArray(ur)&&ur.length){
-    ue.innerHTML='<table><tr><th>Room id</th><th>People</th><th>Minutes</th><th>Who</th></tr>'+
+    ue.innerHTML='<table><tr><th>Room id</th><th>People</th><th>Minutes</th><th>Last seen</th><th>Who</th></tr>'+
       ur.map(r=>'<tr><td title="'+esc(r.room_uuid)+'">'+esc(String(r.room_uuid).slice(0,10))+'…</td><td>'+esc(r.people)+
-      '</td><td>'+esc(r.minutes)+'</td><td>'+esc(r.who)+'</td></tr>').join('')+'</table>'+
+      '</td><td>'+esc(r.minutes)+'</td><td>'+esc(r.last_seen)+(r.live?' <span class="ok">live</span>':' <span class="s">left</span>')+
+      '</td><td>'+esc(r.who)+'</td></tr>').join('')+'</table>'+
       '<div style="margin-top:6px">Rooms with 3+ people get named automatically on the next Room Mapper run. '+
-      '1–2 person rooms: name them by hand — My Day → the person → the room → set room name (admin).</div>';
+      'To name one by hand: use the "Name a room" box above this page in the attendance app (admin).</div>';
   } else if(Array.isArray(ur)){ ue.innerHTML='<span class="ok">All rooms named today.</span>';
   } else { ue.textContent='unavailable: '+esc(ur&&ur.error); }
   const hc=d.health_checks;
