@@ -69,6 +69,8 @@ def sync_env(monkeypatch):
     monkeypatch.setattr(app_module, 'insert_room_mappings',
                         lambda rows: saved.extend(rows) or True)
     monkeypatch.setattr(zt_mapping, 'hydrate_disputes', lambda *a, **k: 0)
+    real_hydrate_positions = zt_mapping.hydrate_positions
+    monkeypatch.setattr(zt_mapping, 'hydrate_positions', lambda *a, **k: 0)
 
     ms = app_module.meeting_state
     ms.reset()
@@ -81,7 +83,8 @@ def sync_env(monkeypatch):
             for k in app_module._bo_state_keys(name, email):
                 if k in ms.participant_current_breakout:
                     ms.participant_current_breakout[k]['ts'] = time.time() - 300
-    return SimpleNamespace(saved=saved, put_person=put_person, ms=ms)
+    return SimpleNamespace(saved=saved, put_person=put_person, ms=ms,
+                           hydrate_positions=real_hydrate_positions)
 
 
 def _sync(client, participants, room='Sales Team'):
@@ -164,6 +167,70 @@ def test_hydrate_survives_missing_table():
     ms = app_module.meeting_state
     ms.reset()
     assert zt_mapping.hydrate_disputes(boom, _cfg(), ms) == 0   # no raise
+
+
+# ── position rehydration after restart (mapping fix B) ───────────────────
+
+def _bq_rows(*rows):
+    fake = mock.MagicMock()
+    fake.query.return_value.result.return_value = list(rows)
+    return fake
+
+
+def _row(name, email, etype, room=WU, ts_ago=300, mtg='MTG-1'):
+    return SimpleNamespace(participant_name=name, participant_email=email,
+                           event_type=etype, room_uuid=room, meeting_uuid=mtg,
+                           ts_epoch=time.time() - ts_ago)
+
+
+def test_positions_restored_with_real_timestamps():
+    ms = app_module.meeting_state
+    ms.reset()
+    fake = _bq_rows(_row('Ravi Kumar', 'ravi@x.com', 'breakout_room_joined', ts_ago=300),
+                    _row('Priya S', '', 'breakout_room_left'))          # left => no entry
+    n = zt_mapping.hydrate_positions(lambda: fake, _cfg(), 'events', ms)
+    assert n == 1
+    entry = ms.participant_current_breakout['e:ravi@x.com']
+    assert entry['room_uuid'] == WU and entry['meeting_uuid'] == 'MTG-1'
+    assert 290 <= time.time() - entry['ts'] <= 310        # real event time kept
+    assert 'n:ravi kumar' in ms.participant_current_breakout
+    assert 'n:priya s' not in ms.participant_current_breakout
+    assert ms.last_breakout_instance_uuid == 'MTG-1'
+
+
+def test_live_memory_wins_over_snapshot():
+    ms = app_module.meeting_state
+    ms.reset()
+    app_module._track_breakout_state('Ravi Kumar', 'ravi@x.com', 'LIVE-ROOM', 'MTG-1')
+    fake = _bq_rows(_row('Ravi Kumar', 'ravi@x.com', 'breakout_room_joined', room='OLD-ROOM'))
+    assert zt_mapping.hydrate_positions(lambda: fake, _cfg(), 'events', ms) == 0
+    assert ms.participant_current_breakout['e:ravi@x.com']['room_uuid'] == 'LIVE-ROOM'
+
+
+def test_position_hydration_runs_once_and_retries_on_error():
+    ms = app_module.meeting_state
+    ms.reset()
+
+    def boom():
+        raise ConnectionError('bq down')
+    assert zt_mapping.hydrate_positions(boom, _cfg(), 'events', ms) == 0
+    fake = _bq_rows(_row('Ravi Kumar', 'ravi@x.com', 'breakout_room_joined'))
+    assert zt_mapping.hydrate_positions(lambda: fake, _cfg(), 'events', ms) == 1  # retried
+    assert zt_mapping.hydrate_positions(lambda: fake, _cfg(), 'events', ms) == 0  # memoized
+    assert fake.query.call_count == 1
+
+
+def test_restart_then_panel_sync_maps_room(client, sync_env):
+    """The 2026-09-30 incident: server restarted, memory empty, panel opens.
+    With rehydration the panel can still map the room from BigQuery-restored
+    positions (2 real people, stable for 5 minutes)."""
+    ms = sync_env.ms                                  # fresh, empty memory
+    fake = _bq_rows(_row('Ravi Kumar', 'ravi@x.com', 'breakout_room_joined'),
+                    _row('Priya S', 'priya@x.com', 'breakout_room_joined'))
+    assert sync_env.hydrate_positions(lambda: fake, _cfg(), 'events', ms) == 2
+    _sync(client, [{'name': 'Ravi Kumar', 'email': 'ravi@x.com'},
+                   {'name': 'Priya S', 'email': 'priya@x.com'}])
+    assert ms.uuid_to_name.get(WU) == 'Sales Team'
 
 
 def test_disputed_freeze_is_persisted_from_sync(client, sync_env, monkeypatch):

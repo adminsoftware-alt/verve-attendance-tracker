@@ -32,6 +32,8 @@ __all__ = [
     'MAPPING_DISPUTES_TABLE',
     'persist_dispute',
     'hydrate_disputes',
+    'hydrate_positions',
+    'load_recent_positions',
     'count_disputes_today',
 ]
 
@@ -201,6 +203,91 @@ def hydrate_disputes(get_client, cfg, meeting_state):
     return merged
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Position rehydration after a restart (mapping fix B)
+# ══════════════════════════════════════════════════════════════════════════
+# "Who is in which room right now" lives in process memory and is filled only
+# when someone MOVES. Every deploy/restart wiped it, so the Room Mapper panel
+# had nothing to cross-match until people moved again — observed live on
+# 2026-09-30 (Pub/Sub switch-on restart at ~13:20 IST left 40 rooms unnamed).
+# On the first sync after a restart, positions are rebuilt from the last 45
+# minutes of breakout events in BigQuery, stamped with their REAL event time,
+# so the sync's own stability (2 min) and freshness (30 min) guards still
+# apply unchanged.
+
+POSITION_LOOKBACK_MIN = 45
+
+
+def load_recent_positions(get_client, cfg, events_table):
+    """Latest breakout event per person in the last 45 min (IST today).
+    Returns [{keys, room_uuid, ts_epoch, meeting_uuid}] for people whose
+    latest event is a JOIN (a leave means: not in any breakout room)."""
+    client = get_client()
+    rows = client.query(f"""
+        SELECT participant_name, participant_email, event_type,
+               room_uuid, meeting_uuid,
+               UNIX_SECONDS(event_timestamp) AS ts_epoch
+        FROM `{cfg['project']}.{cfg['dataset']}.{events_table}`
+        WHERE event_date = '{_ist_today()}'
+          AND event_type IN ('breakout_room_joined', 'breakout_room_left')
+          AND event_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),
+                                               INTERVAL {POSITION_LOOKBACK_MIN} MINUTE)
+        QUALIFY ROW_NUMBER() OVER (
+          PARTITION BY COALESCE(NULLIF(LOWER(TRIM(participant_email)), ''),
+                                LOWER(TRIM(participant_name)))
+          ORDER BY event_timestamp DESC) = 1
+    """).result()
+    out = []
+    for r in rows:
+        if r.event_type != 'breakout_room_joined' or not r.room_uuid:
+            continue
+        em = (r.participant_email or '').strip().lower()
+        nm = norm_pname(r.participant_name)
+        keys = ([f'e:{em}'] if em else []) + ([f'n:{nm}'] if nm else [])
+        if keys:
+            out.append({'keys': keys, 'room_uuid': r.room_uuid,
+                        'ts_epoch': float(r.ts_epoch or 0),
+                        'meeting_uuid': r.meeting_uuid or ''})
+    return out
+
+
+_pos_state = {'done': False}
+
+
+def hydrate_positions(get_client, cfg, events_table, meeting_state):
+    """Once per process: restore webhook positions lost to the restart.
+    Memory always wins — only keys with no live entry are filled. Never
+    raises; a transient error retries on the next sync."""
+    with _state['lock']:
+        if _pos_state['done']:
+            return 0
+        _pos_state['done'] = True
+    try:
+        positions = load_recent_positions(get_client, cfg, events_table)
+    except Exception as e:
+        with _state['lock']:
+            _pos_state['done'] = False   # retry next sync
+        print(f"[mapping] position rehydration skipped: {e}")
+        return 0
+    restored = 0
+    with meeting_state._lock:
+        for p in positions:
+            if any(k in meeting_state.participant_current_breakout for k in p['keys']):
+                continue   # live webhook data is fresher than our snapshot
+            for k in p['keys']:
+                meeting_state.participant_current_breakout[k] = {
+                    'room_uuid': p['room_uuid'], 'ts': p['ts_epoch'],
+                    'meeting_uuid': p['meeting_uuid'],
+                }
+            if p['meeting_uuid'] and not meeting_state.last_breakout_instance_uuid:
+                meeting_state.last_breakout_instance_uuid = p['meeting_uuid']
+            restored += 1
+    if restored:
+        print(f"[mapping] Restored {restored} participant position(s) from "
+              f"BigQuery after restart")
+    return restored
+
+
 def count_disputes_today(get_client, cfg):
     """DISTINCT frozen rooms today, or None when unavailable (no table yet)."""
     try:
@@ -218,3 +305,4 @@ def count_disputes_today(get_client, cfg):
 def reset_for_tests():
     _state['ensured'] = False
     _state['hydrated_date'] = None
+    _pos_state['done'] = False

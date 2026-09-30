@@ -5295,6 +5295,14 @@ def mapping_sync():
         # one BigQuery read per process per IST day; never raises.
         zt_mapping.hydrate_disputes(get_bq_client, _MAPPING_CFG, meeting_state)
 
+        # Mapping fix B: after a restart, reload "who is in which room" from
+        # the last 45 min of BigQuery events (real timestamps, so the 2-min
+        # stability / 30-min freshness guards still apply). Without this the
+        # panel is blind until people move again — 40 rooms went unnamed
+        # after the 2026-09-30 midday restart. Once per process; never raises.
+        zt_mapping.hydrate_positions(get_bq_client, _MAPPING_CFG,
+                                     BQ_EVENTS_TABLE, meeting_state)
+
         matched = []
         if room_by_person:
             with meeting_state._lock:
