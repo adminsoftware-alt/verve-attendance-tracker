@@ -159,6 +159,15 @@ def test_dashboard_embeddable_by_frontend_only(client):
     assert 'zoom.us' in other
 
 
+def test_health_summary_allows_frontend_browser_calls(client, monkeypatch):
+    """The System Health tab fetches /health/summary from the frontend
+    origin; without the CORS header the browser reports 'Failed to fetch'."""
+    monkeypatch.setattr(app_module, 'get_bq_client', lambda: FakeSummaryBQ())
+    origin = 'https://attendance-frontend-4e5na4tdha-uc.a.run.app'
+    r = client.get('/health/summary', headers={'Origin': origin})
+    assert r.headers.get('Access-Control-Allow-Origin') == origin
+
+
 def test_log_json_is_parseable(capsys):
     zt_observability.log_json('WARNING', 'mapping conflict', room_uuid='X', count=2)
     line = capsys.readouterr().out.strip()

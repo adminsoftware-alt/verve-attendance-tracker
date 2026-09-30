@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { fetchLiveRooms, fetchHeatmap } from '../utils/zoomApi';
+import { fetchLiveRooms, fetchHeatmap, createRoomOverride } from '../utils/zoomApi';
+import { getSession } from '../utils/storage';
 
 const HEAT_COLORS = [
   { bg: 'transparent', fg: '#94a3b8' },
@@ -27,6 +28,9 @@ function initials(name) {
 }
 
 export default function LiveDashboard() {
+  // Admins can rename a room from its card (room_override for that day).
+  const sessionUser = getSession();
+  const canEdit = sessionUser?.role === 'admin' || sessionUser?.role === 'superadmin';
   const [date, setDate] = useState(istDate);
   const [tab, setTab] = useState('live');
   const [liveData, setLiveData] = useState(null);
@@ -253,6 +257,7 @@ export default function LiveDashboard() {
             {filteredRooms.map((room, i) => (
               <RoomCard key={room.room_name} room={room} idx={i} search={search}
                 expanded={expandedRoom === room.room_name} changed={changedRooms.has(room.room_name)}
+                canEdit={canEdit} date={date} onRenamed={() => loadLive(false)}
                 onClick={() => setExpandedRoom(expandedRoom === room.room_name ? null : room.room_name)} />
             ))}
           </div>
@@ -349,10 +354,41 @@ function AnimNum({ label, value, color, icon }) {
   );
 }
 
-function RoomCard({ room, idx, search, expanded, changed, onClick }) {
+function RoomCard({ room, idx, search, expanded, changed, onClick, canEdit, date, onRenamed }) {
   const cnt = room.participant_count;
   const col = AVATARS[idx % AVATARS.length];
   const bar = Math.min(cnt / 10 * 100, 100);
+
+  // Rename in place: a room_override for this uuid + this business date.
+  // The backend rebuilds the day before it answers, so the card refreshes
+  // with the corrected name and the hours have already moved.
+  const [editing, setEditing] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [editMsg, setEditMsg] = useState(null);
+  const isPlaceholder = room.room_name.startsWith('Room-') || room.room_name === 'Unknown Room';
+
+  const saveName = async (e) => {
+    e.stopPropagation();
+    const name = newName.trim();
+    if (!name || name === room.room_name) { setEditing(false); return; }
+    setSaving(true);
+    setEditMsg(null);
+    try {
+      await createRoomOverride({
+        room_uuid: room.room_uuid,
+        room_name: name,
+        mapping_date: date,
+        note: 'Renamed from Live Dashboard',
+      });
+      setEditMsg({ ok: true, text: 'Saved — day rebuilt' });
+      setEditing(false);
+      if (onRenamed) onRenamed();
+    } catch (err) {
+      setEditMsg({ ok: false, text: err.message || 'Save failed' });
+    }
+    setSaving(false);
+  };
 
   return (
     <div onClick={onClick} className="interactive-card" style={{
@@ -365,7 +401,43 @@ function RoomCard({ room, idx, search, expanded, changed, onClick }) {
 
       <div style={z.cardHead}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={z.cardName} title={room.room_name}>{search ? hl(room.room_name, search) : room.room_name}</div>
+          {editing ? (
+            <div onClick={(e) => e.stopPropagation()} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <input
+                autoFocus
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') saveName(e); if (e.key === 'Escape') setEditing(false); }}
+                placeholder="Correct room name"
+                style={{ flex: 1, minWidth: 0, fontSize: 12, padding: '3px 6px', border: '1px solid #cbd5e1', borderRadius: 4 }}
+              />
+              <button onClick={saveName} disabled={saving}
+                style={{ fontSize: 11, padding: '3px 8px', border: 'none', borderRadius: 4, background: '#2563eb', color: '#fff', cursor: 'pointer' }}>
+                {saving ? '…' : 'Save'}
+              </button>
+              <button onClick={(e) => { e.stopPropagation(); setEditing(false); }}
+                style={{ fontSize: 11, padding: '3px 6px', border: '1px solid #cbd5e1', borderRadius: 4, background: '#fff', cursor: 'pointer' }}>
+                ✕
+              </button>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+              <div style={{ ...z.cardName, color: isPlaceholder ? '#b45309' : z.cardName.color }} title={room.room_name}>
+                {search ? hl(room.room_name, search) : room.room_name}
+              </div>
+              {canEdit && room.room_uuid && (
+                <button
+                  title="Rename this room (fixes the whole day)"
+                  onClick={(e) => { e.stopPropagation(); setNewName(isPlaceholder ? '' : room.room_name); setEditMsg(null); setEditing(true); }}
+                  style={{ border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 13, color: '#64748b', padding: 0, lineHeight: 1 }}>
+                  {'✎'}
+                </button>
+              )}
+            </div>
+          )}
+          {editMsg && (
+            <div style={{ fontSize: 11, color: editMsg.ok ? '#166534' : '#991b1b', marginTop: 2 }}>{editMsg.text}</div>
+          )}
           <div style={z.cardBar}><div style={{ ...z.cardBarFill, width: bar + '%', background: col, transition: 'width 0.6s ease' }} /></div>
         </div>
         <div style={{

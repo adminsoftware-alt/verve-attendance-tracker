@@ -18,6 +18,7 @@ export default function SystemHealth() {
   const [draft, setDraft] = useState({});      // room_uuid -> typed name
   const [saving, setSaving] = useState(null);  // room_uuid being saved
   const [msg, setMsg] = useState(null);
+  const [loadError, setLoadError] = useState(null);
 
   const load = useCallback(async () => {
     try {
@@ -26,8 +27,9 @@ export default function SystemHealth() {
       setRooms(Array.isArray(d.unnamed_rooms) ? d.unnamed_rooms : []);
       setNames(Array.isArray(d.room_names_today) ? d.room_names_today : []);
       setBizDate(d.business_date_ist || '');
+      setLoadError(null);
     } catch (e) {
-      setMsg({ ok: false, text: `Could not load unnamed rooms: ${e.message}` });
+      setLoadError(`Could not load unnamed rooms: ${e.message}`);
     }
   }, []);
 
@@ -87,7 +89,9 @@ export default function SystemHealth() {
             {msg.text}
           </div>
         )}
-        {rooms.length === 0 ? (
+        {loadError ? (
+          <div style={{ ...s.msg, color: '#991b1b', background: '#fef2f2' }}>{loadError}</div>
+        ) : rooms.length === 0 ? (
           <div style={{ ...s.sub, color: '#166534' }}>All rooms are named today.</div>
         ) : (
           <table style={s.table}>

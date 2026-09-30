@@ -136,7 +136,7 @@ def add_zoom_headers(response):
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    elif origin and (path.startswith('/attendance/') or path.startswith('/dashboard') or path.startswith('/teams') or path.startswith('/auth/') or path.startswith('/data/') or path.startswith('/employees') or path.startswith('/admin/') or path.startswith('/aliases') or path.startswith('/monitor/') or path.startswith('/rooms/') or path == '/chat' or path.startswith('/chat/')):
+    elif origin and (path.startswith('/attendance/') or path.startswith('/dashboard') or path.startswith('/teams') or path.startswith('/auth/') or path.startswith('/data/') or path.startswith('/employees') or path.startswith('/admin/') or path.startswith('/aliases') or path.startswith('/monitor/') or path.startswith('/rooms/') or path.startswith('/health') or path == '/chat' or path.startswith('/chat/')):
         # Allow external apps (attendance manager) to call attendance, team, auth & data APIs.
         # Authorization MUST be allowed here: the frontend attaches the signed
         # login token to every call, which turns them into preflighted requests.
@@ -7081,6 +7081,7 @@ def attendance_live():
                 participant_name,
                 participant_email,
                 room_name,
+                room_uuid,
                 start_ts,
                 end_ts,
                 COALESCE(NULLIF(LOWER(TRIM(participant_email)), ''),
@@ -7091,7 +7092,13 @@ def attendance_live():
                 AND room_name IS NOT NULL AND room_name != ''
             ),
             latest AS (SELECT MAX(end_ts) AS max_time FROM ivs),
-            all_rooms AS (SELECT DISTINCT room_name FROM ivs),
+            -- room_uuid lets the Live Dashboard rename a room in place
+            -- (room_override). Main room rows have no uuid -> ''.
+            all_rooms AS (
+              SELECT room_name,
+                     COALESCE(ARRAY_AGG(room_uuid IGNORE NULLS ORDER BY end_ts DESC LIMIT 1)[SAFE_OFFSET(0)], '') AS room_uuid
+              FROM ivs GROUP BY room_name
+            ),
             current_state AS (
               SELECT
                 room_name,
@@ -7107,6 +7114,7 @@ def attendance_live():
             )
             SELECT
               ar.room_name,
+              ar.room_uuid,
               ARRAY_AGG(
                 STRUCT(cs.participant_name, cs.participant_email, cs.participant_uuid)
               ) as participants,
@@ -7114,7 +7122,7 @@ def attendance_live():
               MAX(cs.snapshot_time) as snapshot_time
             FROM all_rooms ar
             LEFT JOIN current_state cs ON ar.room_name = cs.room_name
-            GROUP BY ar.room_name
+            GROUP BY ar.room_name, ar.room_uuid
             ORDER BY ar.room_name
             """
         results = list(client.query(query).result())
@@ -7128,6 +7136,7 @@ def attendance_live():
             participants = [dict(p) for p in row.get('participants', []) if p.get('participant_name')]
             rooms.append({
                 'room_name': row.get('room_name', ''),
+                'room_uuid': row.get('room_uuid') or '',
                 'participant_count': count,
                 'participants': participants
             })
