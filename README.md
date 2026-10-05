@@ -244,7 +244,8 @@ curl "https://breakout-room-calibrator-4e5na4tdha-uc.a.run.app/mapping/last-sync
 | Hours engine back to Python | env `SQL_BUILDER_CUTOVER_DATE=9999-12-31` |
 | Mapping auto-resolution off | `SYNC_STATE_RESOLUTION_ENABLED = False` (app.py) |
 | Webhooks back to inline processing (no Pub/Sub) | env `WEBHOOK_PUBSUB_ENABLED=false` — see `docs/PUBSUB-ROLLOUT.md` |
-| Builder SQL back to v15.1 (one name per room) | re-run `docs/11_build_presence_intervals_v15_1.sql` (live since 2026-10-05 = `docs/12_build_presence_intervals_v16.sql`: the tested v11 text + additions; `docs/09b_...` = pre-v15.1 text; older versions in `docs/archive/`) |
+| Builder SQL back one step (without the late-leave rule) | re-run `docs/12_build_presence_intervals_v16.sql` (live since 2026-10-05 = `docs/13_build_presence_intervals_v17.sql`: the tested v11 text + additions + late "left old room" rule) |
+| Builder SQL back to v15.1 (one name per room) | re-run `docs/11_build_presence_intervals_v15_1.sql` (`docs/09b_...` = pre-v15.1 text; older versions in `docs/archive/`) |
 | Panel back to old bot polling | swap one import in `breakout-calibrator/src/App.js` (MonitorPanel intact) |
 
 ## Known Issues / Current State (2026-07-21)

@@ -2,12 +2,14 @@
 
 Superseded versions of `sp_build_presence_intervals`, kept for history only.
 
-The ONE live file is `docs/12_build_presence_intervals_v16.sql` (installed
-2026-10-05): the owner's tested v11 text, untouched, plus additions only
-(room_uuid column, event_id dedup, HR name/category override, same-meeting
-mapping). Rollback = `docs/11_build_presence_intervals_v15_1.sql` (live
-2026-09-30 to 2026-10-05); before that,
-`docs/09b_deployed_production_2026-09-30.sql`.
+The ONE live file is `docs/13_build_presence_intervals_v17.sql` (installed
+2026-10-05): v16 plus one rule — a "left room A" event arriving within 120 s
+after "joined room B" is ignored (it used to park people in Main Room).
+`docs/12_build_presence_intervals_v16.sql` = the owner's tested v11 text,
+untouched, plus additions only (room_uuid column, event_id dedup, HR
+name/category override, same-meeting mapping); it is the one-step rollback.
+Earlier: `docs/11_build_presence_intervals_v15_1.sql` (live 2026-09-30 to
+2026-10-05), and before that `docs/09b_deployed_production_2026-09-30.sql`.
 
 Known trade-off of v16, measured before install (5 days, side by side with
 v15.1): total hours identical on every day; the only difference is v11's
