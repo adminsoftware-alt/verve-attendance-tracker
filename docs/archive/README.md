@@ -2,9 +2,12 @@
 
 Superseded versions of `sp_build_presence_intervals`, kept for history only.
 
-The ONE live file is `docs/13_build_presence_intervals_v17.sql` (installed
-2026-10-05): v16 plus one rule — a "left room A" event arriving within 120 s
-after "joined room B" is ignored (it used to park people in Main Room).
+The ONE live file is `docs/14_build_presence_intervals_v18.sql` (installed
+2026-10-06): v17 plus one rule — a "joined meeting" event directly after the
+person's own "joined room" (within 30 s) keeps them in that room.
+`docs/13_build_presence_intervals_v17.sql` (live 2026-10-05): v16 plus one
+rule — a "left room A" event arriving within 120 s after "joined room B" is
+ignored (it used to park people in Main Room).
 `docs/12_build_presence_intervals_v16.sql` = the owner's tested v11 text,
 untouched, plus additions only (room_uuid column, event_id dedup, HR
 name/category override, same-meeting mapping); it is the one-step rollback.
