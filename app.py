@@ -87,6 +87,28 @@ import re as _re
 
 
 
+def split_same_name_rooms(rooms):
+    """One Live card per OCCUPIED room id (rows arrive newest-seen first).
+
+    Several ids under one name (incident 2026-10-06: five rooms named BREAK
+    TIME) used to merge into a single card that hid the problem. Now every
+    occupied id is its own card, labelled '<name> [room 2]' from the second
+    one, so each has its own pencil (rename = room_overrides on that id).
+    Empty ids of a name that also has an occupied id are dropped, e.g. the
+    id a room had before the host recreated it."""
+    by_name = {}
+    for r in rooms:
+        by_name.setdefault(r.get('room_name', ''), []).append(r)
+    out = []
+    for name, lst in by_name.items():
+        if len(lst) > 1:
+            occupied = [r for r in lst if (r.get('participant_count') or 0) > 0]
+            lst = occupied or lst[:1]
+        for i, r in enumerate(lst):
+            out.append(dict(r, room_name=f"{name} [room {i + 1}]") if i else r)
+    return out
+
+
 def merge_live_rooms(rooms):
     """Merge duplicate participants within rooms for /attendance/live.
     Dedup key preference: UUID (stable across renames) → normalized name."""
@@ -1422,9 +1444,26 @@ def insert_room_mappings(mappings):
                         bigquery.ScalarQueryParameter("mapping_date", "STRING", mapping_date),
                     ]
                 )
-                client.query(update_query, job_config=update_config).result()
-                updated_count += 1
-                print(f"[BigQuery] UPDATED: {room_name} (was: {existing_name}, source: {existing_source} -> {source})")
+                try:
+                    client.query(update_query, job_config=update_config).result()
+                    updated_count += 1
+                    print(f"[BigQuery] UPDATED: {room_name} (was: {existing_name}, source: {existing_source} -> {source})")
+                except Exception as upd_err:
+                    # INCIDENT 2026-10-06: BigQuery refuses UPDATE on rows that
+                    # arrived via streaming in the last ~90 min. A correction
+                    # ('BREAK TIME' -> '1.2:Between The Spreadsheet') failed on
+                    # every sync for that reason and the wrong name stuck for
+                    # hours. Fall back to inserting a NEWER row: the builder
+                    # prefers the most recent mapping, and the lookup above
+                    # orders by mapped_at DESC, so the correction takes effect.
+                    errors = client.insert_rows_json(table_id, [mapping])
+                    if errors:
+                        print(f"[BigQuery] UPDATE failed ({str(upd_err)[:80]}) and fallback insert "
+                              f"failed too for {room_name}: {errors}")
+                        return False
+                    inserted_count += 1
+                    print(f"[BigQuery] UPDATE blocked ({str(upd_err)[:60]}) -> inserted newer row: "
+                          f"{room_name} (was: {existing_name})")
             else:
                 # Insert new mapping
                 errors = client.insert_rows_json(table_id, [mapping])
@@ -1901,6 +1940,15 @@ MAPPING_REQUEST_RESERVE_S = 30   # don't re-serve a request handed to the SDK wi
 # the VM to run 24/7. REVERT: set to False — behavior returns to exactly the
 # pending-request-only flow (tracking dict is passive, harmless to leave on).
 SYNC_STATE_RESOLUTION_ENABLED = True
+
+# INCIDENT 2026-10-06: the "pending request" shortcut named a room from ONE
+# person — "P joined webhook room U at 13:52; the panel now sees P in BREAK
+# TIME, so U = BREAK TIME". No second witness, no check that P was still in U.
+# The first panel run of the day happened at lunch, so five team rooms were
+# named BREAK TIME at once and 25 people were shown on break. Every name now
+# has to pass the witness rules in state resolution (2 fresh / 3 total
+# witnesses). Leave this False; it exists only as an emergency switch.
+PENDING_SINGLE_WITNESS_RESOLUTION = False
 
 
 def _bo_state_keys(participant_name, participant_email):
@@ -5399,9 +5447,16 @@ def mapping_sync():
         # (sequential BQ checks, ~1s each) which blew past the panel's 15s
         # request timeout when done inline (seen live 2026-07-21).
         today = get_ist_date()
-        for req, rname in matched:
-            meeting_state.add_webhook_room_mapping(req['webhook_uuid'], rname)
-            print(f"[mapping/sync] Resolved from sync payload: {req['webhook_uuid'][:20]}... -> {rname}")
+        if PENDING_SINGLE_WITNESS_RESOLUTION:
+            for req, rname in matched:
+                meeting_state.add_webhook_room_mapping(req['webhook_uuid'], rname)
+                print(f"[mapping/sync] Resolved from sync payload: {req['webhook_uuid'][:20]}... -> {rname}")
+        elif matched:
+            # Requests are dropped from the queue; the rooms get named by the
+            # witness rules below as soon as enough people agree.
+            print(f"[mapping/sync] {len(matched)} pending request(s) deferred to witness rules "
+                  f"(single-person naming is off)")
+            matched = []
 
         # Snapshot state now; the thread works off this consistent copy.
         with meeting_state._lock:
@@ -5417,7 +5472,11 @@ def mapping_sync():
                     return insert_room_mappings([{
                         'mapping_id': str(uuid_lib.uuid4()),
                         'meeting_id': str(meeting_state.meeting_id or meeting_id or ''),
-                        'meeting_uuid': meeting_state.meeting_uuid or '',
+                        # the instance the webhooks are reporting (set_meeting
+                        # keeps the first uuid when the recurring meeting
+                        # restarts under the same meeting_id)
+                        'meeting_uuid': (meeting_state.last_breakout_instance_uuid
+                                         or meeting_state.meeting_uuid or ''),
                         'room_uuid': wu,
                         'room_name': rname,
                         'room_index': -1,
@@ -5512,6 +5571,47 @@ def mapping_sync():
                             by_name = corrections.setdefault(wu, {})
                             by_name[rname] = by_name.get(rname, 0) + 1
 
+                    # INCIDENT 2026-10-06: ONE ROOM NAME BELONGS TO ONE ROOM.
+                    # Five different webhook rooms were named BREAK TIME in a
+                    # single sync. A name already carried by another live
+                    # room is refused, and when several rooms claim the same
+                    # name in one sync only the best-supported one wins.
+                    # "Taken" = carried by a room that is OCCUPIED right now
+                    # (webhook positions, this meeting instance). An empty
+                    # room's old name never blocks anyone, so when the host
+                    # recreates rooms the new ids take the names normally.
+                    live_uuids = set()
+                    for e in bo_state.values():
+                        if not e.get('room_uuid'):
+                            continue
+                        if (current_instance and e.get('meeting_uuid')
+                                and e['meeting_uuid'] != current_instance):
+                            continue
+                        live_uuids.add(e['room_uuid'])
+                    taken = {}
+                    for u in live_uuids:
+                        n = (uuid_names.get(u) or '').strip()
+                        if n:
+                            taken.setdefault(n, u)
+                    by_room_name = {}
+                    for wu, by_name in claims.items():
+                        if len(by_name) == 1:
+                            rname, (fresh, total) = next(iter(by_name.items()))
+                            by_room_name.setdefault(rname.strip(), []).append((total, fresh, wu))
+                    for rname, lst in by_room_name.items():
+                        if rname in taken:
+                            for _, _, wu in lst:
+                                claims.pop(wu, None)
+                                print(f"[mapping/sync] SKIP {wu[:20]}... -> '{rname}': name already "
+                                      f"belongs to {taken[rname][:20]}... (one name = one room)")
+                            continue
+                        if len(lst) > 1:
+                            lst.sort(reverse=True)
+                            for _, _, wu in lst[1:]:
+                                claims.pop(wu, None)
+                                print(f"[mapping/sync] SKIP {wu[:20]}... -> '{rname}': "
+                                      f"{lst[0][2][:20]}... has more witnesses for the same name")
+
                     for wu, by_name in claims.items():
                         if len(by_name) != 1:
                             print(f"[mapping/sync] State-resolution SKIP {wu[:20]}...: "
@@ -5529,6 +5629,7 @@ def mapping_sync():
                                   f"{fresh} fresh / {total} total witnesses, need "
                                   f"{MAPPING_MIN_WITNESSES} fresh or {MAPPING_CONSENSUS_WITNESSES} total")
                             continue
+                        taken.setdefault(rname.strip(), wu)
                         meeting_state.add_webhook_room_mapping(wu, rname)
                         if _persist_mapping(wu, rname):
                             with meeting_state._lock:
@@ -5548,6 +5649,18 @@ def mapping_sync():
                                   f"only {witnesses} witness")
                             continue
                         old_name = uuid_names.get(wu)
+                        # ONE NAME = ONE ROOM applies to renames too. This is
+                        # what stops a team room turning into BREAK TIME while
+                        # the real break room is occupied (the costly error:
+                        # work hours filed as break). Trade-off: if two
+                        # occupied rooms ever have their names swapped, the
+                        # automatic correction stops here and Live's pencil
+                        # (room_overrides) is the way to fix it.
+                        holder = taken.get(rname.strip())
+                        if holder and holder != wu:
+                            print(f"[mapping/sync] Correction SKIP {wu[:20]}... -> '{rname}': name "
+                                  f"belongs to occupied room {holder[:20]}... (one name = one room)")
+                            continue
                         # ANTI PING-PONG: a correction that REVERSES a recent
                         # one means two participants' webhook states disagree
                         # about this uuid (one is stale). Truth is undecidable
@@ -5735,7 +5848,13 @@ def mapping_resolve():
                 if req['webhook_uuid'] != webhook_uuid
             ]
 
-        if room_name:
+        if room_name and not PENDING_SINGLE_WITNESS_RESOLUTION:
+            # INCIDENT 2026-10-06: one person's current SDK room must not name
+            # a webhook room (see PENDING_SINGLE_WITNESS_RESOLUTION). The
+            # panel's next sync names it once 2-3 people agree.
+            print(f"[mapping/resolve] {webhook_uuid[:20]}... -> '{room_name}' NOT applied: "
+                  f"single-person naming is off; witness rules decide at the next sync")
+        elif room_name:
             # Store the mapping: webhook_uuid -> room_name
             meeting_state.add_webhook_room_mapping(webhook_uuid, room_name)
 
@@ -5752,6 +5871,8 @@ def mapping_resolve():
                 'mapped_at': datetime.utcnow().isoformat(),
                 'source': 'webhook_primary_sdk_lookup'
             }
+            mapping_row['meeting_uuid'] = (meeting_state.last_breakout_instance_uuid
+                                           or meeting_state.meeting_uuid or '')
             saved = insert_room_mappings([mapping_row])
             if saved:
                 with meeting_state._lock:
@@ -7160,14 +7281,17 @@ def attendance_live():
             latest AS (SELECT MAX(end_ts) AS max_time FROM ivs),
             -- room_uuid lets the Live Dashboard rename a room in place
             -- (room_override). Main room rows have no uuid -> ''.
+            -- One card per ROOM (name + id), not per name: two rooms that
+            -- wrongly share a name must stay visible and separately renamable
+            -- (incident 2026-10-06: five rooms merged into one BREAK TIME card).
             all_rooms AS (
-              SELECT room_name,
-                     COALESCE(ARRAY_AGG(room_uuid IGNORE NULLS ORDER BY end_ts DESC LIMIT 1)[SAFE_OFFSET(0)], '') AS room_uuid
-              FROM ivs GROUP BY room_name
+              SELECT room_name, IFNULL(room_uuid, '') AS room_uuid, MAX(end_ts) AS last_seen
+              FROM ivs GROUP BY room_name, room_uuid
             ),
             current_state AS (
               SELECT
                 room_name,
+                IFNULL(room_uuid, '') AS room_uuid,
                 participant_name,
                 participant_email,
                 CAST(NULL AS STRING) AS participant_uuid,
@@ -7187,9 +7311,10 @@ def attendance_live():
               COUNTIF(cs.participant_name IS NOT NULL) as participant_count,
               MAX(cs.snapshot_time) as snapshot_time
             FROM all_rooms ar
-            LEFT JOIN current_state cs ON ar.room_name = cs.room_name
+            LEFT JOIN current_state cs
+                   ON ar.room_name = cs.room_name AND ar.room_uuid = cs.room_uuid
             GROUP BY ar.room_name, ar.room_uuid
-            ORDER BY ar.room_name
+            ORDER BY ar.room_name, MAX(ar.last_seen) DESC
             """
         results = list(client.query(query).result())
 
@@ -7216,6 +7341,8 @@ def attendance_live():
             if st:
                 snapshot_time = str(st)
                 break
+
+        rooms = split_same_name_rooms(rooms)
 
         # Merge duplicate participant names within rooms
         rooms = merge_live_rooms(rooms)

@@ -169,6 +169,140 @@ def test_hydrate_survives_missing_table():
     assert zt_mapping.hydrate_disputes(boom, _cfg(), ms) == 0   # no raise
 
 
+# ── incident 2026-10-06: no single-person naming, one name = one room ────
+
+def test_pending_request_is_not_resolved_by_one_person(client, sync_env):
+    """The shortcut that named five rooms BREAK TIME: one person's current
+    SDK room must not name the webhook room they joined earlier."""
+    ms = sync_env.ms
+    with ms._lock:
+        ms.pending_mapping_requests.append({
+            'request_id': 'r1', 'webhook_uuid': WU, 'participant_name': 'Ravi Kumar',
+            'participant_email': 'ravi@x.com', 'timestamp': time.time()})
+    r = _sync(client, [{'name': 'Ravi Kumar', 'email': 'ravi@x.com'}], room='8.0:BREAK TIME')
+    assert r.status_code == 200
+    assert WU not in ms.uuid_to_name                      # not named from one person
+    assert ms.pending_mapping_requests == []              # request not re-served either
+    assert all(m['room_uuid'] != WU for m in sync_env.saved)
+
+
+def test_resolve_endpoint_does_not_name_from_one_person(client, sync_env):
+    r = client.post('/mapping/resolve', json={
+        'request_id': 'r1', 'webhook_uuid': WU, 'room_name': '8.0:BREAK TIME',
+        'meeting_id': '123456789'})
+    assert r.status_code == 200
+    assert WU not in sync_env.ms.uuid_to_name
+    assert sync_env.saved == []
+
+
+def test_two_rooms_claiming_one_name_keeps_the_better_supported(client, sync_env):
+    """Five rooms were named BREAK TIME in one sync. Now only the room with
+    more witnesses gets the name; the other stays unnamed."""
+    WU2 = 'WEBHOOK-UUID-EEEEFFFFGGGGHHHH'
+    for p in _three_people():
+        sync_env.put_person(p['name'], p['email'], room_uuid=WU)        # 3 in WU
+    sync_env.put_person('Dev K', 'dev@x.com', room_uuid=WU2)             # 2 in WU2
+    sync_env.put_person('Esha P', 'esha@x.com', room_uuid=WU2)
+    _sync(client, _three_people() + [{'name': 'Dev K', 'email': 'dev@x.com'},
+                                     {'name': 'Esha P', 'email': 'esha@x.com'}])
+    assert sync_env.ms.uuid_to_name.get(WU) == 'Sales Team'
+    assert WU2 not in sync_env.ms.uuid_to_name
+
+
+OTHER = 'OTHER-ROOM-UUID-AAAAAAAAAAA'
+
+
+def test_name_already_used_by_an_occupied_room_is_refused(client, sync_env):
+    sync_env.ms.uuid_to_name[OTHER] = 'Sales Team'
+    sync_env.put_person('Zed Q', 'zed@x.com', room_uuid=OTHER)   # OTHER is occupied
+    for p in _three_people():
+        sync_env.put_person(p['name'], p['email'])
+    _sync(client, _three_people())
+    assert WU not in sync_env.ms.uuid_to_name
+    assert sync_env.ms.uuid_to_name[OTHER] == 'Sales Team'
+
+
+def test_empty_rooms_old_name_does_not_block_a_new_room(client, sync_env):
+    """Host recreates the rooms: the old id keeps its name in memory but is
+    empty, so the new id must still get the name."""
+    sync_env.ms.uuid_to_name[OTHER] = 'Sales Team'                  # nobody in it
+    for p in _three_people():
+        sync_env.put_person(p['name'], p['email'])
+    _sync(client, _three_people())
+    assert sync_env.ms.uuid_to_name.get(WU) == 'Sales Team'
+
+
+def test_fresh_witnesses_correct_a_wrong_name(client, sync_env):
+    sync_env.ms.uuid_to_name[WU] = 'Team B'
+    sync_env.put_person('Ravi Kumar', 'ravi@x.com')
+    sync_env.put_person('Priya S', 'priya@x.com')
+    _sync(client, [{'name': 'Ravi Kumar', 'email': 'ravi@x.com'},
+                   {'name': 'Priya S', 'email': 'priya@x.com'}], room='Sales Team')
+    assert sync_env.ms.uuid_to_name.get(WU) == 'Sales Team'
+
+
+def test_correction_into_an_occupied_rooms_name_is_refused(client, sync_env):
+    """The Aug-2026 / 2026-10-06 shape: a team room must not be renamed to
+    BREAK TIME while the real break room is occupied."""
+    ms = sync_env.ms
+    ms.uuid_to_name[WU] = 'Sales Team'
+    ms.uuid_to_name[OTHER] = 'Break Time'
+    sync_env.put_person('Zed Q', 'zed@x.com', room_uuid=OTHER)   # break room occupied
+    sync_env.put_person('Ravi Kumar', 'ravi@x.com')
+    sync_env.put_person('Priya S', 'priya@x.com')
+    _sync(client, [{'name': 'Ravi Kumar', 'email': 'ravi@x.com'},
+                   {'name': 'Priya S', 'email': 'priya@x.com'}], room='Break Time')
+    assert ms.uuid_to_name.get(WU) == 'Sales Team'
+    assert not [m for m in sync_env.saved if m['room_uuid'] == WU and m['room_name'] == 'Break Time']
+
+
+def test_live_shows_one_card_per_occupied_room_id():
+    rooms = [
+        {'room_name': 'BREAK TIME', 'room_uuid': 'A', 'participant_count': 17, 'participants': []},
+        {'room_name': 'BREAK TIME', 'room_uuid': 'B', 'participant_count': 4, 'participants': []},
+        {'room_name': 'BREAK TIME', 'room_uuid': 'C', 'participant_count': 0, 'participants': []},
+        {'room_name': 'Sales Team', 'room_uuid': 'D', 'participant_count': 0, 'participants': []},
+        {'room_name': 'Sales Team', 'room_uuid': 'E', 'participant_count': 0, 'participants': []},
+        {'room_name': 'Main Room', 'room_uuid': '', 'participant_count': 3, 'participants': []},
+    ]
+    out = app_module.split_same_name_rooms(rooms)
+    assert [(r['room_name'], r['room_uuid']) for r in out] == [
+        ('BREAK TIME', 'A'), ('BREAK TIME [room 2]', 'B'),   # both occupied ids shown
+        ('Sales Team', 'D'),                                  # empty duplicates collapse
+        ('Main Room', ''),
+    ]
+
+
+def test_correction_falls_back_to_insert_when_update_is_blocked(monkeypatch):
+    """BigQuery refuses UPDATE on freshly streamed rows for ~90 min; a
+    correction must still land (as a newer row) instead of failing forever."""
+    class FakeClient:
+        def __init__(self):
+            self.inserted = []
+
+        def query(self, sql, job_config=None):
+            if 'UPDATE' in sql:
+                raise RuntimeError('UPDATE or DELETE statement over table would affect '
+                                   'rows in the streaming buffer, which is not supported')
+            row = SimpleNamespace(mapping_id='m1', room_name='8.0:BREAK TIME',
+                                  source='webhook_primary_sdk_lookup')
+            return mock.MagicMock(result=lambda *a, **k: [row])
+
+        def insert_rows_json(self, table_id, rows, **kw):
+            self.inserted.extend(rows)
+            return []
+
+    fake = FakeClient()
+    monkeypatch.setattr(app_module, 'get_bq_client', lambda: fake)
+    ok = app_module.insert_room_mappings([{
+        'mapping_id': 'm2', 'meeting_id': '123', 'meeting_uuid': 'MTG-1',
+        'room_uuid': WU, 'room_name': '1.2:Between The Spreadsheet', 'room_index': -1,
+        'mapping_date': '2026-10-06', 'mapped_at': '2026-10-06T09:00:00',
+        'source': 'webhook_primary_sdk_lookup'}])
+    assert ok is True
+    assert len(fake.inserted) == 1 and fake.inserted[0]['room_name'] == '1.2:Between The Spreadsheet'
+
+
 # ── consensus: teams that sat all morning (positions older than 30 min) ──
 
 STALE = 2 * 3600   # 2 hours: past the 30-min freshness cap
